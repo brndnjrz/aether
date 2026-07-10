@@ -1,0 +1,29 @@
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ── Environment / secrets ─────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+
+# ── Editor ────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+
+# ── Claude Code (personal, machine-specific) ──────────────────────────────────
+.claude/settings.local.json
+
+# ── Runtime data — trained models, prediction logs, and your real trade/activity
+#    history live here. Never push this. ───────────────────────────────────────
+storage/*
+!storage/.gitkeep
