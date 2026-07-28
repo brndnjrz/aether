@@ -12,7 +12,7 @@ import logging
 import streamlit as st
 import plotly.express as px
 import pandas as pd
-from datetime import datetime, time as dt_time
+from datetime import datetime, timedelta
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -63,12 +63,9 @@ def _render_add_fill_form():
         qty = col6.number_input("Contracts", value=1, step=1, min_value=1)
         price = col7.number_input("Price per contract ($)", value=0.0, step=0.01)
 
-        col8, col9, col10 = st.columns(3)
+        col8, col9 = st.columns(2)
         fill_date = col8.date_input("Fill date", value=now_et().date())
-        now = now_et()
-        fill_hour = col9.number_input("Fill hour (0-23, ET)", value=now.hour, min_value=0, max_value=23, step=1)
-        fill_minute = col10.number_input("Fill minute (ET)", value=now.minute, min_value=0, max_value=59, step=1)
-        fill_time = dt_time(int(fill_hour), int(fill_minute))
+        fill_time = col9.time_input("Fill time (ET)", value=now_et().time(), step=timedelta(minutes=1))
 
         notes = st.text_area("Notes (optional)")
         submitted = st.form_submit_button("Log Fill", type="primary")
@@ -94,73 +91,104 @@ def _render_add_fill_form():
         st.rerun()
 
 
-_LEDGER_COL_WIDTHS = [0.8, 0.9, 0.7, 0.7, 1.0, 0.6, 0.8, 1.5, 0.7, 0.7]
-
-
 def _render_fill_ledger(fills: list):
+    """
+    A proper table (sortable, evenly aligned) rather than a hand-built column
+    grid — the fixed relative column widths in the old version drifted out
+    of alignment with real data (tickers/prices of different lengths), which
+    is what made it hard to scan. Edit/Delete move to a picker below instead
+    of two buttons on every row, so the table itself stays purely readable.
+    """
     st.markdown("**Fill ledger**")
     if not fills:
         st.info("No fills logged yet.")
         return
 
-    header = st.columns(_LEDGER_COL_WIDTHS)
-    for col, label in zip(header, ["Side", "Ticker", "Strike", "Type", "Expiry", "Qty", "Price", "Filled (ET)", "", ""]):
-        col.markdown(f"**{label}**")
-
+    rows = []
     for f in fills:
-        st.markdown("---")
-        cols = st.columns(_LEDGER_COL_WIDTHS)
-        side_dot = "🟢" if f["side"] == "buy" else "🔴"
-        cols[0].write(f"{side_dot} {f['side'].upper()}")
-        cols[1].write(f["ticker"])
-        cols[2].write(f"${f['strike']:g}")
-        cols[3].write(f["option_type"])
-        cols[4].write(f["expiry_date"])
-        cols[5].write(str(f["qty"]))
-        cols[6].write(f"${f['price']:.2f}")
-        filled_str = pd.Timestamp(f["filled_at"]).strftime("%m/%d/%y %I:%M %p")
-        cols[7].write(filled_str)
+        rows.append({
+            "Side": f"{'🟢' if f['side'] == 'buy' else '🔴'} {f['side'].upper()}",
+            "Ticker": f["ticker"],
+            "Strike": f["strike"],
+            "Type": f["option_type"].title(),
+            "Expiry": f["expiry_date"],
+            "Qty": f["qty"],
+            "Price": f["price"],
+            # Kept as a real Timestamp (not pre-formatted to a string) so both
+            # the sort below and the interactive column-header sort in the
+            # dataframe are chronological, not lexicographic on "hh:mm AM/PM".
+            "Filled (ET)": pd.Timestamp(f["filled_at"]),
+            "Notes": f.get("notes") or "",
+        })
+    display_df = pd.DataFrame(rows).sort_values("Filled (ET)", ascending=False)
+    st.dataframe(
+        display_df, hide_index=True, width="stretch",
+        column_config={
+            "Strike": st.column_config.NumberColumn(format="$%.2f"),
+            "Price": st.column_config.NumberColumn(format="$%.2f"),
+            "Filled (ET)": st.column_config.DatetimeColumn(format="MM/DD/YY hh:mm A"),
+        },
+    )
 
-        editing = st.session_state.get("editing_fill_id") == f["id"]
-        if cols[8].button("Edit", key=f"edit_fill_{f['id']}"):
-            logger.info(f"[portfolio] 'Edit' fill button pressed for fill #{f['id']} ({f['ticker']})")
-            st.session_state["editing_fill_id"] = None if editing else f["id"]
-            st.rerun()
-        if cols[9].button("Delete", key=f"del_fill_{f['id']}"):
-            logger.info(f"[portfolio] 'Delete' fill button pressed for fill #{f['id']} ({f['ticker']})")
-            remove_fill(f["id"])
-            st.rerun()
+    st.markdown("**Edit or delete a fill**")
+    options = {
+        f"{f['side'].upper()} {f['qty']}x {f['ticker']} ${f['strike']:g} {f['option_type']} "
+        f"{f['expiry_date']} — filled {pd.Timestamp(f['filled_at']).strftime('%m/%d %I:%M %p')}": f
+        for f in sorted(fills, key=lambda x: x["filled_at"], reverse=True)
+    }
+    selected_label = st.selectbox("Fill", ["—"] + list(options.keys()), key="fill_ledger_picker")
+    if selected_label == "—":
+        return
 
-        if f.get("notes"):
-            st.caption(f["notes"])
+    f = options[selected_label]
+    editing = st.session_state.get("editing_fill_id") == f["id"]
+    ecol, dcol = st.columns(2)
+    if ecol.button("Close edit" if editing else "Edit", key=f"edit_fill_{f['id']}"):
+        logger.info(f"[portfolio] 'Edit' fill button pressed for fill #{f['id']} ({f['ticker']})")
+        st.session_state["editing_fill_id"] = None if editing else f["id"]
+        st.rerun()
+    if dcol.button("Delete", key=f"del_fill_{f['id']}"):
+        logger.info(f"[portfolio] 'Delete' fill button pressed for fill #{f['id']} ({f['ticker']})")
+        remove_fill(f["id"])
+        st.session_state["editing_fill_id"] = None
+        st.rerun()
 
-        if editing:
-            _render_edit_fill_form(f)
+    if editing:
+        _render_edit_fill_form(f)
 
 
 def _render_edit_fill_form(f: dict):
+    """
+    Every widget below is keyed on f['id'] explicitly. Streamlit widgets
+    without an explicit key derive one from position/label alone, which is
+    fine while only one fill is ever being edited at a time — but it's the
+    kind of thing that's cheap to get wrong and expensive to debug (a stale
+    value silently surviving from whichever fill was edited previously), so
+    it's pinned here rather than left implicit.
+    """
     filled_ts = pd.Timestamp(f["filled_at"])
+    fid = f["id"]
     with st.container(border=True):
-        st.markdown(f"**Edit fill #{f['id']}**")
-        with st.form(f"edit_fill_form_{f['id']}"):
+        st.markdown(f"**Edit fill #{fid}**")
+        with st.form(f"edit_fill_form_{fid}"):
             col1, col2, col3, col4 = st.columns(4)
-            ticker = col1.text_input("Ticker", value=f["ticker"]).upper().strip()
-            strike = col2.number_input("Strike ($)", value=float(f["strike"]), step=1.0)
-            option_type = col3.selectbox("Type", ["call", "put"], index=["call", "put"].index(f["option_type"]))
-            expiry_date = col4.date_input("Expiry date", value=pd.Timestamp(f["expiry_date"]).date())
+            ticker = col1.text_input("Ticker", value=f["ticker"], key=f"edit_ticker_{fid}").upper().strip()
+            strike = col2.number_input("Strike ($)", value=float(f["strike"]), step=1.0, key=f"edit_strike_{fid}")
+            option_type = col3.selectbox("Type", ["call", "put"], index=["call", "put"].index(f["option_type"]), key=f"edit_type_{fid}")
+            expiry_date = col4.date_input("Expiry date", value=pd.Timestamp(f["expiry_date"]).date(), key=f"edit_expiry_{fid}")
 
             col5, col6, col7 = st.columns(3)
-            side = col5.selectbox("Side", ["buy", "sell"], index=["buy", "sell"].index(f["side"]))
-            qty = col6.number_input("Contracts", value=int(f["qty"]), step=1, min_value=1)
-            price = col7.number_input("Price per contract ($)", value=float(f["price"]), step=0.01)
+            side = col5.selectbox("Side", ["buy", "sell"], index=["buy", "sell"].index(f["side"]), key=f"edit_side_{fid}")
+            qty = col6.number_input("Contracts", value=int(f["qty"]), step=1, min_value=1, key=f"edit_qty_{fid}")
+            price = col7.number_input("Price per contract ($)", value=float(f["price"]), step=0.01, key=f"edit_price_{fid}")
 
-            col8, col9, col10 = st.columns(3)
-            fill_date = col8.date_input("Fill date", value=filled_ts.date())
-            fill_hour = col9.number_input("Fill hour (0-23, ET)", value=int(filled_ts.hour), min_value=0, max_value=23, step=1)
-            fill_minute = col10.number_input("Fill minute (ET)", value=int(filled_ts.minute), min_value=0, max_value=59, step=1)
-            fill_time = dt_time(int(fill_hour), int(fill_minute))
+            col8, col9 = st.columns(2)
+            fill_date = col8.date_input("Fill date", value=filled_ts.date(), key=f"edit_filldate_{fid}")
+            fill_time = col9.time_input(
+                "Fill time (ET)", value=filled_ts.time(), step=timedelta(minutes=1), key=f"edit_filltime_{fid}"
+            )
 
-            notes = st.text_area("Notes (optional)", value=f.get("notes") or "")
+            notes = st.text_area("Notes (optional)", value=f.get("notes") or "", key=f"edit_notes_{fid}")
 
             csave, ccancel = st.columns(2)
             saved = csave.form_submit_button("Save changes", type="primary")
@@ -168,8 +196,8 @@ def _render_edit_fill_form(f: dict):
 
         if saved:
             filled_at = datetime.combine(fill_date, fill_time, tzinfo=MARKET_TZ).isoformat()
-            update_fill(f["id"], ticker, strike, option_type, expiry_date.isoformat(), side, int(qty), price, filled_at, notes)
-            logger.info(f"[portfolio] Fill #{f['id']} ({ticker}) updated")
+            update_fill(fid, ticker, strike, option_type, expiry_date.isoformat(), side, int(qty), price, filled_at, notes)
+            logger.info(f"[portfolio] Fill #{fid} ({ticker}) updated")
             st.session_state["editing_fill_id"] = None
             st.success("Fill updated.")
             st.rerun()
