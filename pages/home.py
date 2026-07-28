@@ -11,6 +11,16 @@ from data.macro_data import get_market_overview, get_sp500_regime, get_sector_pe
 
 logger = logging.getLogger(__name__)
 
+_EVENT_LABELS = {
+    "day_trading_analyze": "Day Trading — Analyze",
+    "options_view": "Options — Chain viewed",
+    "options_expiry_view": "Options — Expiry picked",
+    "prediction_generated": "Predictions — Daily signal",
+    "intraday_prediction_generated": "Predictions — Intraday signal",
+    "strategy_lab_setup": "Strategy Lab — MTF setup logged",
+    "orbc_signal": "Strategy Lab — ORBC signal logged",
+}
+
 
 def render():
     st.markdown("# Market Dashboard")
@@ -55,6 +65,39 @@ def render():
 
     vix_change = vix.get("current", 20) - vix.get("week_ago", 20)
     cols[-1].metric("VIX", f"{vix.get('current', 20):.2f}", f"{vix_change:+.2f}")
+
+    # ── Regime Markov ─────────────────────────────────────────────────────
+    # Reuses the same Markov model Trading Desk runs per-ticker, applied to the
+    # S&P 500 — a probabilistic second opinion on the trend-following regime
+    # banner above, not a replacement for it.
+    st.markdown("---")
+    st.subheader("Market Regime (Markov)")
+    with st.spinner("Fitting regime model..."):
+        from data.price_data import get_price_history
+        from analysis.indicators import calculate_indicators
+        from analysis.regime_markov import analyze_regime_markov
+
+        sp500_df = get_price_history("^GSPC", period="2y", interval="1d")
+        regime_markov = (
+            analyze_regime_markov(calculate_indicators(sp500_df), "S&P 500")
+            if sp500_df is not None and not sp500_df.empty
+            else {"available": False, "reason": "No S&P 500 price history available."}
+        )
+
+    if not regime_markov["available"]:
+        logger.debug(f"[home] Regime Markov unavailable: {regime_markov['reason']}")
+        st.info(regime_markov["reason"])
+    else:
+        st.caption("S&P 500 trend history, discretized into Bear/Neutral/Bull and fit to a first-order transition matrix — a probabilistic read, not a rule-based one.")
+        rm1, rm2, rm3 = st.columns(3)
+        rm1.metric("Current State", regime_markov["current_state"])
+        rm2.metric("Bull − Bear Signal", f"{regime_markov['signal']:+.2f}")
+        rm3.metric("Confidence", f"{regime_markov['confidence'] * 100:.0f}%", help="Scales with how many times the current state has occurred historically (30+ = full confidence).")
+        persist = regime_markov["persistence"]
+        st.caption(
+            f"Persistence — Bear: {persist['Bear'] * 100:.0f}% | Neutral: {persist['Neutral'] * 100:.0f}% | Bull: {persist['Bull'] * 100:.0f}% "
+            f"(probability each regime repeats itself the next day, from {regime_markov['n_bars']} days of history)."
+        )
 
     # ── Sector Performance ────────────────────────────────────────────────
     if sectors:
@@ -113,11 +156,27 @@ def render():
             })
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
         if len(open_positions) > 5:
-            st.caption(f"+ {len(open_positions) - 5} more — see Portfolio page")
+            st.caption(f"+ {len(open_positions) - 5} more logged.")
     else:
         logger.debug("[home] No open positions to display")
         st.markdown("---")
         st.info("No open positions yet.")
+
+    # ── Recent Activity ────────────────────────────────────────────────────
+    from portfolio.activity_log import get_recent_activity
+
+    recent = get_recent_activity(limit=8)
+    if recent:
+        logger.debug(f"[home] {len(recent)} recent activity rows loaded")
+        st.markdown("---")
+        st.subheader("Recent Activity")
+        st.caption("What you've been looking at across Trading Desk and Strategy Lab — a pulse on the week, not a to-do list.")
+        rows = [{
+            "Time": pd.Timestamp(a["logged_at"]).strftime("%m/%d %I:%M %p ET"),
+            "Ticker": a["ticker"],
+            "Event": _EVENT_LABELS.get(a["event_type"], a["event_type"]),
+        } for a in recent]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
     # ── Footer ────────────────────────────────────────────────────────────
     st.markdown("---")
