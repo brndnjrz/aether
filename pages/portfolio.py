@@ -96,16 +96,25 @@ def _render_fill_ledger(fills: list):
     A proper table (sortable, evenly aligned) rather than a hand-built column
     grid — the fixed relative column widths in the old version drifted out
     of alignment with real data (tickers/prices of different lengths), which
-    is what made it hard to scan. Edit/Delete move to a picker below instead
-    of two buttons on every row, so the table itself stays purely readable.
+    is what made it hard to scan.
+
+    Edit/Delete act on whichever row is clicked, via st.dataframe's native
+    row selection, rather than a button in every row — Streamlit's table
+    widget can't embed buttons in cells, so this is the closest equivalent
+    that doesn't reintroduce the alignment problem the grid had. The
+    DataFrame's index is set to each fill's id (hidden from view) so the
+    selected row survives sorting without needing a separate lookup table.
+    The click itself is captured into session_state right away rather than
+    re-read from the widget on every rerun — see the comment below.
     """
     st.markdown("**Fill ledger**")
     if not fills:
         st.info("No fills logged yet.")
         return
 
-    rows = []
+    rows, ids = [], []
     for f in fills:
+        ids.append(f["id"])
         rows.append({
             "Side": f"{'🟢' if f['side'] == 'buy' else '🔴'} {f['side'].upper()}",
             "Ticker": f["ticker"],
@@ -120,9 +129,12 @@ def _render_fill_ledger(fills: list):
             "Filled (ET)": pd.Timestamp(f["filled_at"]),
             "Notes": f.get("notes") or "",
         })
-    display_df = pd.DataFrame(rows).sort_values("Filled (ET)", ascending=False)
-    st.dataframe(
+    display_df = pd.DataFrame(rows, index=ids).sort_values("Filled (ET)", ascending=False)
+
+    st.caption("Click a row to edit or delete it.")
+    state = st.dataframe(
         display_df, hide_index=True, width="stretch",
+        on_select="rerun", selection_mode="single-row", key="fill_ledger_table",
         column_config={
             "Strike": st.column_config.NumberColumn(format="$%.2f"),
             "Price": st.column_config.NumberColumn(format="$%.2f"),
@@ -130,18 +142,24 @@ def _render_fill_ledger(fills: list):
         },
     )
 
-    st.markdown("**Edit or delete a fill**")
-    options = {
-        f"{f['side'].upper()} {f['qty']}x {f['ticker']} ${f['strike']:g} {f['option_type']} "
-        f"{f['expiry_date']} — filled {pd.Timestamp(f['filled_at']).strftime('%m/%d %I:%M %p')}": f
-        for f in sorted(fills, key=lambda x: x["filled_at"], reverse=True)
-    }
-    selected_label = st.selectbox("Fill", ["—"] + list(options.keys()), key="fill_ledger_picker")
-    if selected_label == "—":
+    # The dataframe only reports a selection on the rerun triggered by the
+    # click itself — clicking Edit/Save afterward reruns the script again
+    # without a new click on the table, and that later rerun can come back
+    # with an empty selection. Capture the click into our own session_state
+    # immediately, and use that (not the widget's live selection) for
+    # everything below, so "which fill am I acting on" survives every
+    # subsequent rerun regardless of what the table reports on it.
+    selected_rows = state["selection"]["rows"]
+    if selected_rows:
+        st.session_state["selected_fill_id"] = display_df.index[selected_rows[0]]
+
+    fill_id = st.session_state.get("selected_fill_id")
+    if fill_id is None or fill_id not in display_df.index:
         return
 
-    f = options[selected_label]
+    f = next(fill for fill in fills if fill["id"] == fill_id)
     editing = st.session_state.get("editing_fill_id") == f["id"]
+
     ecol, dcol = st.columns(2)
     if ecol.button("Close edit" if editing else "Edit", key=f"edit_fill_{f['id']}"):
         logger.info(f"[portfolio] 'Edit' fill button pressed for fill #{f['id']} ({f['ticker']})")
@@ -151,6 +169,8 @@ def _render_fill_ledger(fills: list):
         logger.info(f"[portfolio] 'Delete' fill button pressed for fill #{f['id']} ({f['ticker']})")
         remove_fill(f["id"])
         st.session_state["editing_fill_id"] = None
+        st.session_state["selected_fill_id"] = None
+        st.session_state.pop("fill_ledger_table", None)  # clear the now-stale row selection
         st.rerun()
 
     if editing:
@@ -199,6 +219,10 @@ def _render_edit_fill_form(f: dict):
             update_fill(fid, ticker, strike, option_type, expiry_date.isoformat(), side, int(qty), price, filled_at, notes)
             logger.info(f"[portfolio] Fill #{fid} ({ticker}) updated")
             st.session_state["editing_fill_id"] = None
+            # A changed fill time can move this row to a new sort position —
+            # clear the ledger's row selection rather than leave it pointing
+            # at whatever fill now lands in the old position.
+            st.session_state.pop("fill_ledger_table", None)
             st.success("Fill updated.")
             st.rerun()
         if cancelled:
