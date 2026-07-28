@@ -1,6 +1,7 @@
 """
 Trading Desk — Day Trading signals, Options analysis, and ML Predictions in one page.
 """
+import logging
 import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
@@ -27,10 +28,19 @@ from analysis.patterns import detect_candlestick_pattern
 from analysis.trendlines import detect_recent_trendlines, detect_swing_points
 from analysis.flag_pennant_detection import detect_flag_pennant_patterns
 from analysis.backtest import macd_bullish_cross_signal, simulate_trades
-from analysis.ml_prediction import predict, train_model, get_prediction_history, evaluate_model
 from analysis.price_projection import simulate_price_path
 from config.tz import now_et, utc_iso_to_et_str, MARKET_TZ
 from portfolio.activity_log import log_activity
+
+logger = logging.getLogger(__name__)
+
+# ML prediction — optional import so page still works if scikit-learn/xgboost/narwhals not installed
+try:
+    from analysis.ml_prediction import predict, train_model, get_prediction_history, evaluate_model
+    _ML_AVAILABLE = True
+except Exception:
+    _ML_AVAILABLE = False
+    logger.debug("[trading] ML prediction module unavailable — Predictions tab disabled")
 
 # News sentiment — optional import so page still works if feedparser/vaderSentiment not installed
 try:
@@ -39,22 +49,10 @@ try:
     _NEWS_AVAILABLE = True
 except Exception:
     _NEWS_AVAILABLE = False
+    logger.debug("[trading] News sentiment module unavailable — News tab disabled")
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 STORAGE_DIR = _PROJECT_ROOT / "storage"
-
-st.markdown("""
-<style>
-    .signal-card { border-radius: 8px; padding: 14px; margin-bottom: 8px; }
-    .signal-bull { background-color: #0d2b1a; border-left: 4px solid #26a69a; }
-    .signal-bear { background-color: #2b0d0d; border-left: 4px solid #ef5350; }
-    .signal-neutral { background-color: #1a1a2e; border-left: 4px solid #888; }
-    div[data-testid="metric-container"] {
-        background-color: #1a1f2e; border: 1px solid #2d3748;
-        border-radius: 8px; padding: 10px;
-    }
-</style>
-""", unsafe_allow_html=True)
 
 FEATURE_DISPLAY_NAMES = {
     "rsi_norm":        "RSI-14 (Normalized)",
@@ -92,6 +90,8 @@ CONFIDENCE_COLORS = {"HIGH": "#26a69a", "MODERATE": "#ff9800", "LOW": "#9e9e9e"}
 
 def _market_status() -> str:
     now = now_et()
+    if now.weekday() >= 5:
+        return "MARKET CLOSED (WEEKEND)"
     total = now.hour * 60 + now.minute
     if total < 570:
         return "PRE-MARKET"
@@ -106,8 +106,8 @@ def _signal_html(label: str, value: str, interpretation: str, direction: str) ->
     return f"""
 <div class="signal-card {css}">
   <strong>{icon} {label}</strong><br>
-  <span style="font-size:1.15em;">{value}</span><br>
-  <small style="color:#aaa;">{interpretation}</small>
+  <span class="signal-value">{value}</span><br>
+  <span class="signal-note">{interpretation}</span>
 </div>"""
 
 
@@ -115,24 +115,33 @@ def _signal_html(label: str, value: str, interpretation: str, direction: str) ->
 def _load_intraday(ticker: str, interval: str):
     period = "1d" if interval in ("5m", "15m") else "5d"
     df = get_price_history(ticker, period=period, interval=interval)
-    if df is not None and not df.empty:
-        df = calculate_indicators(df)
+    if df is None or df.empty:
+        logger.debug(f"[trading] Intraday load for {ticker} ({interval}) came back empty")
+        return df
+    df = calculate_indicators(df)
+    logger.debug(f"[trading] Intraday load for {ticker} ({interval}) succeeded with {len(df)} rows")
     return df
 
 
 @st.cache_data(ttl=300)
 def _load_daily(ticker: str):
     df = get_price_history(ticker, period="1y", interval="1d")
-    if df is not None and not df.empty:
-        df = calculate_indicators(df)
+    if df is None or df.empty:
+        logger.debug(f"[trading] Daily load for {ticker} came back empty")
+        return df
+    df = calculate_indicators(df)
+    logger.debug(f"[trading] Daily load for {ticker} succeeded with {len(df)} rows")
     return df
 
 
 @st.cache_data(ttl=300)
 def _load_backtest_df(ticker: str):
     df = get_price_history(ticker, period="2y", interval="1d")
-    if df is not None and not df.empty:
-        df = calculate_indicators(df)
+    if df is None or df.empty:
+        logger.debug(f"[trading] Backtest data load for {ticker} came back empty")
+        return df
+    df = calculate_indicators(df)
+    logger.debug(f"[trading] Backtest data load for {ticker} succeeded with {len(df)} rows")
     return df
 
 
@@ -140,7 +149,7 @@ def _render_daytrading():
     st.subheader("Day Trading Dashboard")
 
     status = _market_status()
-    status_color = "#26a69a" if status == "MARKET OPEN" else "#f59e0b"
+    status_class = "aeth-status-open" if status == "MARKET OPEN" else "aeth-status-closed"
     try:
         vix_data = get_vix_data()
         vix_val = vix_data.get("current", 20)
@@ -150,8 +159,8 @@ def _render_daytrading():
         vix_val, vix_regime, sp_regime = 20, "N/A", "N/A"
 
     st.markdown(
-        f'<div style="background:#1a1f2e;padding:8px 16px;border-radius:6px;margin-bottom:12px;">'
-        f'<span style="color:{status_color};font-weight:bold;">{status}</span> &nbsp;|&nbsp; '
+        f'<div class="aeth-status-strip">'
+        f'<span class="{status_class}">{status}</span> &nbsp;|&nbsp; '
         f'VIX {vix_val:.1f} ({vix_regime}) &nbsp;|&nbsp; '
         f'S&P Regime: {sp_regime} &nbsp;|&nbsp; '
         f'⏰ {now_et().strftime("%I:%M %p ET")}'
@@ -178,11 +187,15 @@ def _render_daytrading():
         st.info(f"Click **Analyze** to load {ticker}.")
         return
 
+    if analyze:
+        logger.info(f"[trading] 'Analyze' button pressed for {ticker} ({interval})")
+
     with st.spinner(f"Loading {ticker}…"):
         intraday = _load_intraday(ticker, interval)
         daily = _load_daily(ticker)
 
     if daily is None or daily.empty:
+        logger.warning(f"[trading] Day Trading: no daily data for {ticker} — showing error to user")
         st.error(f"No data for {ticker}. Check ticker symbol.")
         return
 
@@ -409,7 +422,7 @@ def _render_daytrading():
     colors = ["#26a69a" if c >= o else "#ef5350" for c, o in zip(chart_df["Close"], chart_df["Open"])]
     fig.add_trace(go.Bar(x=chart_df.index, y=chart_df["Volume"], name="Volume", marker_color=colors, showlegend=False), row=2, col=1)
 
-    fig.update_layout(template="plotly_dark", height=520, margin=dict(l=0, r=80, t=10, b=0),
+    fig.update_layout(template="plotly_dark" if st.context.theme.type == "dark" else "plotly_white", height=520, margin=dict(l=0, r=80, t=10, b=0),
                       xaxis_rangeslider_visible=False, legend=dict(orientation="h", y=1.02))
     fig.update_yaxes(title_text="Volume", row=2, col=1)
     st.plotly_chart(fig, use_container_width=True)
@@ -430,17 +443,17 @@ def _render_daytrading():
         range_pos = ((current_price - float(last_d["Low"])) / max(float(last_d["High"]) - float(last_d["Low"]), 0.01)) * 100
 
         levels_data = [
-            ("R2", f"${r2:.2f}", "#ef5350"),
-            ("R1", f"${r1:.2f}", "#ff7043"),
-            ("Pivot", f"${pivot:.2f}", "#888"),
-            ("S1", f"${s1:.2f}", "#66bb6a"),
-            ("S2", f"${s2:.2f}", "#26a69a"),
+            ("R2", f"${r2:.2f}", "aeth-badge--bear"),
+            ("R1", f"${r1:.2f}", "aeth-badge--warn"),
+            ("Pivot", f"${pivot:.2f}", "aeth-badge--neutral"),
+            ("S1", f"${s1:.2f}", "aeth-badge--warn"),
+            ("S2", f"${s2:.2f}", "aeth-badge--bull"),
         ]
-        for name, val, color in levels_data:
+        for name, val, badge_class in levels_data:
             arrow = " ← price" if abs(float(val[1:]) - current_price) == min(
                 abs(float(v[1:]) - current_price) for _, v, _ in levels_data
             ) else ""
-            st.markdown(f'<span style="color:{color};font-weight:bold;">{name}</span> &nbsp; {val}{arrow}', unsafe_allow_html=True)
+            st.markdown(f'<span class="aeth-badge {badge_class}">{name}</span> &nbsp; {val}{arrow}', unsafe_allow_html=True)
 
         st.markdown("---")
         st.caption(f"Prev High: ${float(prev_d['High']):.2f} | Prev Low: ${float(prev_d['Low']):.2f} | Prev Close: ${float(prev_d['Close']):.2f}")
@@ -478,8 +491,8 @@ def _render_daytrading():
             st.info("Opening range requires intraday data (5m, 15m, 30m, or 1h interval).")
             gap_pct = (float(daily.iloc[-1]["Open"]) - float(prev_d["Close"])) / float(prev_d["Close"]) * 100
             gap_dir = "▲ Gap Up" if gap_pct > 0 else "▼ Gap Down"
-            gap_color = "#26a69a" if gap_pct > 0 else "#ef5350"
-            st.markdown(f'<span style="color:{gap_color};">{gap_dir} {gap_pct:+.2f}% today\'s open vs prev close</span>', unsafe_allow_html=True)
+            gap_badge_class = "aeth-badge--bull" if gap_pct > 0 else "aeth-badge--bear"
+            st.markdown(f'<span class="aeth-badge {gap_badge_class}">{gap_dir} {gap_pct:+.2f}% today\'s open vs prev close</span>', unsafe_allow_html=True)
             if abs(gap_pct) > 2:
                 st.caption("Large gap (>2%) — watch for gap-fill tendency in first hour.")
             or_note = f"{gap_dir} {gap_pct:+.2f}% today's open vs prev close (no intraday OR available)"
@@ -503,7 +516,7 @@ def _render_daytrading():
         stop_distance = 1.5 * atr
         sug_entry = current_price
         if bull_votes > bear_votes:
-            direction_label, dir_color = "LONG", "#26a69a"
+            direction_label, dir_badge_class = "LONG", "aeth-badge--bull"
             sug_stop = sug_entry - stop_distance
             rr_to_r1 = (r1 - sug_entry) / stop_distance if stop_distance > 0 else 0
             if rr_to_r1 >= 1.5:
@@ -511,7 +524,7 @@ def _render_daytrading():
             else:
                 sug_target, target_source = sug_entry + 2 * stop_distance, "2:1 R:R (R1 too close for a clean target)"
         else:
-            direction_label, dir_color = "SHORT", "#ef5350"
+            direction_label, dir_badge_class = "SHORT", "aeth-badge--bear"
             sug_stop = sug_entry + stop_distance
             rr_to_s1 = (sug_entry - s1) / stop_distance if stop_distance > 0 else 0
             if rr_to_s1 >= 1.5:
@@ -537,7 +550,7 @@ def _render_daytrading():
                 rr = abs(sug_target - sug_entry) / stop_distance if stop_distance > 0 else 0
 
         ec1, ec2, ec3, ec4 = st.columns(4)
-        ec1.markdown(f'<span style="color:{dir_color};font-weight:bold;font-size:1.2em;">{direction_label}</span>', unsafe_allow_html=True)
+        ec1.markdown(f'<span class="aeth-badge {dir_badge_class}">{direction_label}</span>', unsafe_allow_html=True)
         ec1.caption(f"{max(bull_votes, bear_votes)}/{len(directional_signals)} signals agree")
         ec2.metric("Entry", f"${sug_entry:.2f}")
         ec3.metric("Stop", f"${sug_stop:.2f}", f"-{stop_pct:.1f}%" if direction_label == "LONG" else f"+{stop_pct:.1f}%", delta_color="inverse")
@@ -642,7 +655,7 @@ def _render_daytrading():
                 fig2.add_trace(go.Scatter(x=intraday.index, y=intraday["MACD"], name="MACD", line=dict(color="#42a5f5", width=1.2)), row=2, col=1)
                 fig2.add_trace(go.Scatter(x=intraday.index, y=intraday["MACD_signal"], name="Signal", line=dict(color="#ff7043", width=1.2)), row=2, col=1)
 
-            fig2.update_layout(template="plotly_dark", height=350, margin=dict(l=0, r=0, t=10, b=0))
+            fig2.update_layout(template="plotly_dark" if st.context.theme.type == "dark" else "plotly_white", height=350, margin=dict(l=0, r=0, t=10, b=0))
             fig2.update_yaxes(range=[0, 100], row=1, col=1)
             st.plotly_chart(fig2, use_container_width=True)
 
@@ -655,13 +668,19 @@ def _render_daytrading():
             "at a time, long only. Close-to-close approximation, not a live-fill simulation."
         )
         if st.button("Run Backtest", key="dt_run_backtest"):
+            logger.info(f"[trading] 'Run Backtest' button pressed for {ticker} (MACD bullish cross)")
             with st.spinner(f"Loading 2 years of {ticker} history…"):
                 bt_df = _load_backtest_df(ticker)
             if bt_df is None or bt_df.empty or "MACD_hist" not in bt_df.columns:
+                logger.warning(f"[trading] Backtest for {ticker} blocked: not enough history")
                 st.warning("Not enough history to backtest this ticker.")
             else:
                 signal = macd_bullish_cross_signal(bt_df)
                 result = simulate_trades(bt_df, signal)
+                logger.info(
+                    f"[trading] Backtest for {ticker} completed: num_trades={result['num_trades']} "
+                    f"win_rate={result['win_rate']:.1f}% total_return_pct={result['total_return_pct']:+.1f}%"
+                )
                 st.session_state[f"dt_backtest_{ticker}"] = result
 
         result = st.session_state.get(f"dt_backtest_{ticker}")
@@ -682,7 +701,7 @@ def _render_daytrading():
                     x=result["equity_curve"].index, y=result["equity_curve"].values,
                     line=dict(color="#9370DB", width=2), name="Equity",
                 ))
-                eq_fig.update_layout(template="plotly_dark", height=280, margin=dict(l=0, r=0, t=10, b=0),
+                eq_fig.update_layout(template="plotly_dark" if st.context.theme.type == "dark" else "plotly_white", height=280, margin=dict(l=0, r=0, t=10, b=0),
                                       yaxis_title="Portfolio Value ($)")
                 st.plotly_chart(eq_fig, use_container_width=True)
 
@@ -692,6 +711,7 @@ def _render_daytrading():
     st.markdown("---")
     if ai_available():
         if st.button("Generate AI Day Trading Brief", key="dt_ai_brief"):
+            logger.info(f"[trading] 'Generate AI Day Trading Brief' button pressed for {ticker}")
             signals = {
                 "market_status": status,
                 "vix": vix_val,
@@ -707,8 +727,10 @@ def _render_daytrading():
             with st.spinner("Generating AI day trading read..."):
                 brief = generate_daytrading_brief(ticker, current_price, signals, key_levels)
             if brief:
+                logger.info(f"[trading] AI day trading brief generated successfully for {ticker}")
                 st.markdown(format_ai_markdown(brief))
             else:
+                logger.warning(f"[trading] AI day trading brief generation failed for {ticker}")
                 st.error("AI generation failed — check logs (Ollama model may be unreachable or unable to answer within its token budget).")
 
     st.caption("Data from yfinance · Refreshes every 60s · Not financial advice.")
@@ -758,7 +780,7 @@ def _render_options_pnl_diagram(strategy: str, current_price: float):
         fig.add_vline(x=be, line_color="orange", line_dash="dot", annotation_text=f"BE ${be:.0f}")
 
     fig.update_layout(
-        template="plotly_dark", height=350,
+        template="plotly_dark" if st.context.theme.type == "dark" else "plotly_white", height=350,
         title=f"{strategy} — Max Profit: ${result['max_profit']:.0f} | Max Loss: ${result['max_loss']:.0f}",
         xaxis_title="Stock Price at Expiry", yaxis_title="P&L ($)",
         margin=dict(l=0, r=0, t=40, b=0),
@@ -790,6 +812,7 @@ def _render_options():
         atm_greeks = get_atm_greeks(ticker)
 
     if "error" in chain_data:
+        logger.warning(f"[trading] Options tab: options not available for {ticker}: {chain_data.get('error', 'Unknown error')}")
         st.error(f"Options not available: {chain_data.get('error', 'Unknown error')}")
         st.info("Options data is only available for optionable stocks (not ETFs in some cases)")
         return
@@ -798,6 +821,7 @@ def _render_options():
     expirations = chain_data.get("expirations", [])
 
     if st.session_state.get("_last_logged_opt_ticker") != ticker:
+        logger.info(f"[trading] Options tab: ticker changed to {ticker}; logging options_view activity")
         log_activity("options_view", ticker, {
             "iv_rank": iv_metrics.get("iv_rank"),
             "iv_percentile": iv_metrics.get("iv_percentile"),
@@ -842,7 +866,7 @@ def _render_options():
                 fig.add_trace(go.Scatter(x=df.index, y=df["hv_63"], name="HV 63-day", line=dict(color="#ff9800", dash="dash")))
             if iv_metrics.get("atm_iv"):
                 fig.add_hline(y=iv_metrics["atm_iv"], line_color="red", line_dash="dot", annotation_text=f"Current IV {iv_metrics['atm_iv']:.1f}%")
-            fig.update_layout(template="plotly_dark", height=300, yaxis_title="Volatility (%)", margin=dict(l=0, r=0, t=10, b=0))
+            fig.update_layout(template="plotly_dark" if st.context.theme.type == "dark" else "plotly_white", height=300, yaxis_title="Volatility (%)", margin=dict(l=0, r=0, t=10, b=0))
             st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("---")
@@ -924,13 +948,16 @@ def _render_options():
     st.markdown("---")
     if ai_available():
         if st.button("Generate AI Options Strategy Brief", key="opt_ai_brief"):
+            logger.info(f"[trading] 'Generate AI Options Strategy Brief' button pressed for {ticker}")
             df_regime = calculate_indicators(df_price) if df_price is not None else None
             regime = detect_regime(df_regime, ticker) if df_regime is not None else {}
             with st.spinner("Generating AI options analysis..."):
                 brief = generate_options_brief(ticker, current_price, iv_metrics, regime)
             if brief:
+                logger.info(f"[trading] AI options strategy brief generated successfully for {ticker}")
                 st.markdown(format_ai_markdown(brief))
             else:
+                logger.warning(f"[trading] AI options strategy brief generation failed for {ticker}")
                 st.error("AI generation failed — check logs (Ollama model may be unreachable or unable to answer within its token budget).")
 
 
@@ -1051,7 +1078,7 @@ def _render_prediction_card(result: dict):
             "font": {"size": 22, "color": cfg["color"]},
         },
     ))
-    fig_gauge.update_layout(template="plotly_dark", height=320, margin=dict(l=20, r=20, t=20, b=10),
+    fig_gauge.update_layout(template="plotly_dark" if st.context.theme.type == "dark" else "plotly_white", height=320, margin=dict(l=20, r=20, t=20, b=10),
                             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
 
     col_gauge, col_stats = st.columns([1, 1])
@@ -1062,12 +1089,9 @@ def _render_prediction_card(result: dict):
 
     with col_stats:
         st.markdown(f"#### Signal Details")
-        conf_color = CONFIDENCE_COLORS.get(confidence, "#9e9e9e")
+        conf_badge_class = {"HIGH": "aeth-badge--bull", "MODERATE": "aeth-badge--warn", "LOW": "aeth-badge--neutral"}.get(confidence, "aeth-badge--neutral")
         st.markdown(
-            f"<span style='background-color:{conf_color}22;color:{conf_color};"
-            f"padding:4px 12px;border-radius:12px;font-weight:600;"
-            f"font-size:14px;border:1px solid {conf_color}44'>"
-            f"Confidence: {confidence}</span>",
+            f'<span class="aeth-badge {conf_badge_class}">Confidence: {confidence}</span>',
             unsafe_allow_html=True,
         )
         st.markdown("")
@@ -1131,11 +1155,12 @@ def _render_price_path(price_path: dict):
         hovertemplate="Day %{x}<br>Median open: $%{y:.2f}<extra></extra>",
     ))
     fig.update_layout(
-        template="plotly_dark", height=340, margin=dict(l=10, r=10, t=30, b=10),
+        template="plotly_dark" if st.context.theme.type == "dark" else "plotly_white", height=340, margin=dict(l=10, r=10, t=30, b=10),
         xaxis=dict(title="Trading days ahead", dtick=1, gridcolor="rgba(255,255,255,0.07)"),
         yaxis=dict(title="Price ($)", gridcolor="rgba(255,255,255,0.04)"),
         legend=dict(orientation="h", y=1.15, font=dict(size=11)),
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(17,17,27,0.6)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(17,17,27,0.6)" if st.context.theme.type == "dark" else "rgba(255,255,255,0.6)",
     )
     st.plotly_chart(fig, use_container_width=True)
 
@@ -1192,11 +1217,12 @@ def _render_feature_importance(top_features):
     ))
     fig.update_layout(
         title=dict(text="What Drove This Prediction", font=dict(size=16, color="#e0e0e0")),
-        template="plotly_dark", height=max(280, len(df_feat) * 44),
+        template="plotly_dark" if st.context.theme.type == "dark" else "plotly_white", height=max(280, len(df_feat) * 44),
         margin=dict(l=10, r=80, t=50, b=10),
         xaxis=dict(title="Importance Score (XGBoost Gain)", title_font=dict(size=12), gridcolor="rgba(255,255,255,0.07)"),
         yaxis=dict(title="", tickfont=dict(size=12), gridcolor="rgba(255,255,255,0.04)"),
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(17,17,27,0.6)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(17,17,27,0.6)" if st.context.theme.type == "dark" else "rgba(255,255,255,0.6)",
     )
     st.plotly_chart(fig, use_container_width=True)
     st.caption(
@@ -1227,9 +1253,9 @@ def _render_model_performance(eval_result: dict, ticker: str):
     with col1:
         st.markdown("#### Performance Metrics")
         rel_icon = "✅" if reliable else "⚠️"
-        rel_color = "#26a69a" if reliable else "#ff9800"
+        rel_badge_class = "aeth-badge--bull" if reliable else "aeth-badge--warn"
         st.markdown(
-            f"<span style='color:{rel_color};font-weight:600'>{rel_icon} {'Reliable' if reliable else 'Unreliable'}</span>",
+            f'<span class="aeth-badge {rel_badge_class}">{rel_icon} {"Reliable" if reliable else "Unreliable"}</span>',
             unsafe_allow_html=True,
         )
         if reason:
@@ -1341,11 +1367,12 @@ def _render_prediction_history(ticker: str):
         range_end = range_start + pd.DateOffset(months=1 if month_sel != "All Months" else 12) - pd.Timedelta(seconds=1)
 
         fig_hist.update_layout(
-            template="plotly_dark", height=260, margin=dict(l=0, r=0, t=10, b=0),
+            template="plotly_dark" if st.context.theme.type == "dark" else "plotly_white", height=260, margin=dict(l=0, r=0, t=10, b=0),
             yaxis=dict(title="Bull Probability %", range=[33, 67], gridcolor="rgba(255,255,255,0.07)"),
             xaxis=dict(title="", gridcolor="rgba(255,255,255,0.04)", range=[range_start, range_end]),
             legend=dict(orientation="h", y=1.1, font=dict(size=11)),
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(17,17,27,0.6)",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(17,17,27,0.6)" if st.context.theme.type == "dark" else "rgba(255,255,255,0.6)",
         )
         st.plotly_chart(fig_hist, use_container_width=True)
     else:
@@ -1415,14 +1442,8 @@ def _render_predictions_disclaimer():
     st.markdown("---")
     st.markdown(
         """
-        <div style='
-            background-color: rgba(239, 83, 80, 0.08);
-            border: 1px solid rgba(239, 83, 80, 0.25);
-            border-radius: 8px;
-            padding: 14px 18px;
-            margin-top: 8px;
-        '>
-        <b style='color:#ef5350'>IMPORTANT DISCLAIMER</b><br>
+        <div class="aeth-disclaimer">
+        <strong class="aeth-disclaimer__title">Important Disclaimer</strong>
         This ML signal predicts price direction over an automatically-selected horizon
         (3, 5, or 10 trading days, chosen per ticker for the best walk-forward accuracy) with a
         modest edge (typically 52–58% accuracy).
@@ -1440,6 +1461,11 @@ def _render_predictions_disclaimer():
 
 def _render_predictions():
     st.subheader("AI Price Predictions")
+
+    if not _ML_AVAILABLE:
+        st.info("ML predictions require the `scikit-learn`, `xgboost`, and `narwhals` packages. Run `pip install -r requirements.txt`.")
+        return
+
     st.caption("ML ensemble model — XGBoost + Random Forest — trained on 18 technical features derived from historical price action.")
     st.warning("For research only. Not financial advice. Accuracy varies by market conditions.", icon="⚠️")
     st.markdown("")
@@ -1501,15 +1527,18 @@ def _render_predictions():
     st.markdown("---")
 
     if train_btn:
+        logger.info(f"[trading] 'Train / Update Model' button pressed for {ticker}")
         with st.spinner(f"Loading price data for {ticker}..."):
             df = _load_pred_df(ticker, period="2y")
 
         if df is None or df.empty:
+            logger.warning(f"[trading] ML training for {ticker} blocked: could not load price data")
             st.error(f"Could not load price data for **{ticker}**. Check the ticker symbol.")
             return
 
         n_bars = len(df)
         if n_bars < 60:
+            logger.warning(f"[trading] ML training for {ticker} blocked: only {n_bars} bars of history (need 60+)")
             st.error(f"Only {n_bars} bars of history found for {ticker}. ML training requires at least 60 bars (2+ years recommended).")
             return
 
@@ -1520,6 +1549,7 @@ def _render_predictions():
                 train_result = train_model(ticker, df)
 
             if train_result.get("error"):
+                logger.warning(f"[trading] ML training failed for {ticker}: {train_result['error']}")
                 st.error(f"Training failed: {train_result['error']}")
                 return
 
@@ -1527,6 +1557,10 @@ def _render_predictions():
             acc_std = train_result.get("accuracy_std") or 0.0
             reliable = train_result.get("is_reliable", False)
             reliable_icon = "✅" if reliable else "⚠️"
+            logger.info(
+                f"[trading] ML model trained for {ticker}: accuracy={mean_acc * 100:.1f}% "
+                f"± {acc_std * 100:.1f}% reliable={reliable}"
+            )
             st.success(f"Model trained successfully for **{ticker}**. {reliable_icon} Walk-forward accuracy: **{mean_acc * 100:.1f}% ± {acc_std * 100:.1f}%**")
 
             st.session_state.pop(_cache_key(ticker), None)
@@ -1534,20 +1568,25 @@ def _render_predictions():
             st.session_state.pop(_price_path_cache_key(ticker), None)
 
         except ValueError as exc:
+            logger.warning(f"[trading] ML training for {ticker} failed — insufficient data: {exc}")
             st.error(f"Training failed — insufficient data: {exc}")
             return
         except Exception as exc:
+            logger.error(f"[trading] ML training for {ticker} raised an unexpected error: {exc}", exc_info=True)
             st.error(f"Training error: {exc}")
             return
 
     if predict_btn:
+        logger.info(f"[trading] 'Generate Prediction' button pressed for {ticker}")
         if not _model_exists(ticker):
+            logger.warning(f"[trading] Prediction blocked for {ticker}: no trained model found")
             st.warning(f"No trained model found for **{ticker}**. Click **Train / Update Model** first.", icon="⚠️")
         else:
             with st.spinner(f"Loading price data and running inference for {ticker}..."):
                 df = _load_pred_df(ticker, period="2y")
 
             if df is None or df.empty:
+                logger.warning(f"[trading] Prediction for {ticker} blocked: could not load price data")
                 st.error(f"Could not load price data for **{ticker}**.")
             else:
                 try:
@@ -1555,8 +1594,13 @@ def _render_predictions():
                         result = predict(ticker, df)
 
                     if result.get("error"):
+                        logger.warning(f"[trading] Prediction failed for {ticker}: {result['error']}")
                         st.error(f"Prediction failed: {result['error']}")
                     else:
+                        logger.info(
+                            f"[trading] Prediction generated for {ticker}: direction={result.get('direction')} "
+                            f"probability={result.get('probability')} confidence={result.get('confidence')}"
+                        )
                         st.session_state[_cache_key(ticker)] = result
                         log_activity("prediction_generated", ticker, {
                             "direction": result.get("direction"),
@@ -1578,6 +1622,7 @@ def _render_predictions():
                         st.session_state[_price_path_cache_key(ticker)] = price_path
 
                 except Exception as exc:
+                    logger.error(f"[trading] Unexpected prediction error for {ticker}: {exc}", exc_info=True)
                     st.error(f"Unexpected prediction error: {exc}")
 
     cached_result = st.session_state.get(_cache_key(ticker))
@@ -1707,6 +1752,7 @@ def _render_news():
         sentiment = analyze_ticker_sentiment(articles)
 
     if sentiment["n_articles"] == 0:
+        logger.warning(f"[trading] News tab: no recent headlines found for {ticker}")
         st.warning("No recent headlines found for this ticker.")
         return
 
@@ -1735,7 +1781,7 @@ def _render_news():
         color_discrete_map={"Positive": "#26a69a", "Neutral": "#9e9e9e", "Negative": "#ef5350"},
         labels={"x": "", "y": "% of headlines"},
     )
-    fig.update_layout(template="plotly_dark", showlegend=False, height=280, margin=dict(l=0, r=0, t=10, b=0))
+    fig.update_layout(template="plotly_dark" if st.context.theme.type == "dark" else "plotly_white", showlegend=False, height=280, margin=dict(l=0, r=0, t=10, b=0))
     st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("---")

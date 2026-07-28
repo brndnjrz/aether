@@ -5,13 +5,22 @@ multiple times, and a single fill can partially close one lot and open
 another, so matching has to be done generically rather than assuming
 buy/sell pairs line up 1:1.
 """
+import logging
 from collections import deque, defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_dt(value: str) -> datetime:
-    return datetime.fromisoformat(value)
+    # Naive timestamps are legacy datetime.utcnow().isoformat() writes and are
+    # UTC (matching config/tz.py's utc_iso_to_et_str assumption); localize them
+    # so a naive/aware mix in the fill ledger can't raise on subtraction/sort.
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def _hold_bucket(minutes: float) -> str:
@@ -29,10 +38,16 @@ def compute_round_trips(fills: List[Dict]) -> List[Dict]:
     expiry_date) group, sorted by filled_at, and emit one record per matched
     quantity chunk. Unmatched quantity remains an open lot and produces no
     round trip."""
+    if not fills:
+        logger.warning("compute_round_trips: called with empty fills list")
+        return []
+
     groups: Dict[tuple, List[Dict]] = defaultdict(list)
     for f in fills:
         key = (f["ticker"], f["strike"], f["option_type"], f["expiry_date"])
         groups[key].append(f)
+
+    logger.debug(f"compute_round_trips: {len(fills)} fills grouped into {len(groups)} contract keys")
 
     round_trips = []
 
@@ -97,4 +112,5 @@ def compute_round_trips(fills: List[Dict]) -> List[Dict]:
                 same_side.append({"qty": remaining, "price": price, "filled_at": filled_at})
 
     round_trips.sort(key=lambda r: _parse_dt(r["exit_time"]))
+    logger.info(f"compute_round_trips: matched {len(round_trips)} round trips from {len(fills)} fills")
     return round_trips

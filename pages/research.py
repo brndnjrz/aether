@@ -2,6 +2,7 @@
 Stock Research page — single stock deep dive.
 Workflow enforced: Business context → Financials → Technical → AI Brief → Options
 """
+import logging
 import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
@@ -19,6 +20,10 @@ from analysis import (
 )
 from data.options_data import calculate_iv_rank
 from ai.stock_brief import generate_stock_brief, generate_thesis_prompt, format_ai_markdown
+from ai.client import ai_available
+from config.tz import now_et
+
+logger = logging.getLogger(__name__)
 
 # ML prediction — optional import so page still works if xgboost not installed
 try:
@@ -26,6 +31,7 @@ try:
     _ML_AVAILABLE = True
 except Exception:
     _ML_AVAILABLE = False
+    logger.debug("[research] ML prediction module unavailable (xgboost not installed) — ML signal panel disabled")
 
 # News sentiment — optional import so page still works if feedparser/vaderSentiment not installed
 try:
@@ -34,6 +40,7 @@ try:
     _NEWS_AVAILABLE = True
 except Exception:
     _NEWS_AVAILABLE = False
+    logger.debug("[research] News sentiment module unavailable (feedparser/vaderSentiment not installed) — News tab disabled")
 
 
 def render():
@@ -55,15 +62,21 @@ def render():
     if not ticker:
         return
 
+    if st.session_state.get("_research_last_ticker") != (ticker, period):
+        logger.info(f"[research] Ticker/period changed to {ticker} ({period}); loading Research page data")
+        st.session_state["_research_last_ticker"] = (ticker, period)
+
     with st.spinner(f"Loading {ticker}..."):
         df_raw = get_price_history(ticker, period=period)
         info = get_ticker_info(ticker)
         fund_report = full_fundamental_report(ticker)
 
     if df_raw is None or df_raw.empty:
+        logger.warning(f"[research] No price data found for {ticker} ({period}) — showing error to user")
         st.error(f"No data found for {ticker}")
         return
 
+    logger.debug(f"[research] Price history for {ticker} loaded with {len(df_raw)} rows")
     df = calculate_indicators(df_raw)
     signals = get_signal_summary(df)
     regime = detect_regime(df, ticker)
@@ -115,13 +128,15 @@ def render():
 
     # ── ML Direction Signal ───────────────────────────────────────────────────
     if _ML_AVAILABLE:
-        ml_cache_key = f"ml_signal_{ticker}_{period}"
+        ml_cache_key = f"ml_signal_{ticker}_{period}_{now_et().date().isoformat()}"
         if ml_cache_key not in st.session_state:
             with st.spinner("Running ML direction model..."):
                 try:
                     ml_result = ml_predict(ticker, df)
+                    logger.debug(f"[research] ML direction signal computed for {ticker}: {ml_result.get('direction')}")
                     st.session_state[ml_cache_key] = ml_result
                 except Exception as _ml_exc:
+                    logger.warning(f"[research] ML direction signal failed for {ticker}: {_ml_exc}")
                     st.session_state[ml_cache_key] = {"error": str(_ml_exc)}
 
         ml_result = st.session_state.get(ml_cache_key, {})
@@ -281,7 +296,7 @@ def _render_price_chart(df: pd.DataFrame, ticker: str, sr: dict, trendlines: Opt
 
     fig.update_layout(
         height=700,
-        template="plotly_dark",
+        template="plotly_dark" if st.context.theme.type == "dark" else "plotly_white",
         xaxis_rangeslider_visible=False,
         margin=dict(l=0, r=0, t=10, b=0),
         legend=dict(orientation="h", y=1.02),
@@ -393,6 +408,7 @@ def _render_options_tab(ticker: str, price: float, regime: dict):
         iv_metrics = calculate_iv_rank(ticker)
 
     if iv_metrics.get("status") == "insufficient_data":
+        logger.warning(f"[research] Options tab: insufficient price history for IV calculation on {ticker}")
         st.warning("Insufficient price history for IV calculation")
         return
 
@@ -451,6 +467,7 @@ def _render_news_tab(ticker: str, info: dict):
         sentiment = analyze_ticker_sentiment(articles)
 
     if sentiment["n_articles"] == 0:
+        logger.warning(f"[research] News tab: no recent headlines found for {ticker}")
         st.warning("No recent headlines found for this ticker.")
         return
 
@@ -479,24 +496,27 @@ def _render_news_tab(ticker: str, info: dict):
 
 def _render_ai_brief(ticker: str, fund_report: dict, signals: dict, regime: dict):
     st.subheader(f"AI Investment Brief — {ticker}")
-    from config.settings import ANTHROPIC_API_KEY
-    if not ANTHROPIC_API_KEY:
-        st.info("Add your ANTHROPIC_API_KEY to .env to enable AI features")
+    if not ai_available():
+        st.info("Add ANTHROPIC_API_KEY to .env, or run Ollama locally, to enable AI features")
         st.code("ANTHROPIC_API_KEY=sk-ant-...")
         return
 
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Generate Stock Brief", type="primary"):
+            logger.info(f"[research] 'Generate Stock Brief' button pressed for {ticker}")
             with st.spinner("Generating AI analysis..."):
                 brief = generate_stock_brief(ticker, fund_report, signals, regime, fund_report)
             if brief:
+                logger.info(f"[research] Stock brief generated successfully for {ticker}")
                 st.markdown(format_ai_markdown(brief))
             else:
+                logger.warning(f"[research] AI stock brief generation failed for {ticker}")
                 st.error("AI generation failed")
 
     with col2:
         if st.button("Generate Thesis Questions"):
+            logger.info(f"[research] 'Generate Thesis Questions' button pressed for {ticker}")
             name = fund_report.get("name", ticker)
             with st.spinner("Generating thesis prompts..."):
                 questions = generate_thesis_prompt(ticker, name)

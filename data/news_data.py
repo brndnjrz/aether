@@ -3,6 +3,7 @@ News headline fetcher — Google News RSS via feedparser, no API key required.
 Headline/link/published only; sentiment scoring only needs the headline text,
 so the full-article scrape used in the source prototype is intentionally dropped.
 """
+import calendar
 import time
 import logging
 from typing import Any, Dict, List
@@ -36,8 +37,9 @@ def fetch_ticker_news(
     is a display-only signal that should never break page rendering.
     """
     ticker = ticker.upper().strip()
-    key = f"news_{ticker}_{max_articles}"
+    key = f"news_{ticker}_{company_name}_{max_articles}"
     if key in _cache and _fresh(_cache[key], ttl):
+        logger.debug(f"fetch_ticker_news cache hit for {ticker}")
         return _cache[key]["data"]
 
     query = f"{company_name} {ticker} stock".strip() if company_name else f"{ticker} stock"
@@ -53,10 +55,14 @@ def fetch_ticker_news(
                 "title": entry.get("title", ""),
                 "link": entry.get("link", ""),
                 "published": entry.get("published", ""),
-                "published_ts": time.mktime(published_parsed) if published_parsed else None,
+                "published_ts": calendar.timegm(published_parsed) if published_parsed else None,
                 "source": source.get("title", "") if source else "",
             })
         _cache[key] = {"data": articles, "ts": time.time()}
+        if articles:
+            logger.info(f"Fetched {len(articles)} news articles for {ticker}")
+        else:
+            logger.warning(f"No news articles found for {ticker}")
         return articles
     except Exception as e:
         logger.error(f"News fetch error for {ticker}: {e}")

@@ -34,6 +34,7 @@ def get_price_history(
             return None
         df.index = pd.to_datetime(df.index)
         _cache[key] = {"data": df, "ts": time.time()}
+        logger.debug(f"Fetched {ticker} ({interval}, {period}): {len(df)} rows.")
         return df
     except Exception as e:
         logger.error(f"Error fetching price history for {ticker}: {e}")
@@ -68,7 +69,11 @@ def get_multi_price_history(
         )
         result: Dict[str, pd.DataFrame] = {}
         if len(tickers) == 1:
-            result[tickers[0]] = raw
+            t = tickers[0]
+            # group_by="ticker" still returns MultiIndex columns for a
+            # single-element list — slice it the same way the multi-ticker
+            # branch does so callers always get flat OHLCV columns.
+            result[t] = raw[t].dropna(how="all") if t in raw.columns.get_level_values(0) else raw
         else:
             for t in tickers:
                 if t in raw.columns.get_level_values(0):

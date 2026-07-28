@@ -169,7 +169,7 @@ def score_growth(f: dict) -> Dict[str, Any]:
 
     rev_growth = f.get("revenue_growth_yoy") or f.get("revenue_growth")
     if rev_growth is not None:
-        rg = rev_growth * 100 if abs(rev_growth) < 1 else rev_growth
+        rg = rev_growth * 100
         if rg > 25:
             pts = 50
         elif rg > 15:
@@ -187,7 +187,7 @@ def score_growth(f: dict) -> Dict[str, Any]:
 
     eps_growth = f.get("earnings_growth")
     if eps_growth is not None:
-        eg = eps_growth * 100 if abs(eps_growth) < 1 else eps_growth
+        eg = eps_growth * 100
         if eg > 25:
             pts = 50
         elif eg > 15:
@@ -255,7 +255,7 @@ def detect_red_flags(f: dict) -> List[Dict[str, str]]:
     # Revenue growth deceleration
     rev_growth = f.get("revenue_growth_yoy") or f.get("revenue_growth")
     if rev_growth is not None:
-        rg = rev_growth * 100 if abs(rev_growth) < 1 else rev_growth
+        rg = rev_growth * 100
         if rg < -5:
             flags.append({
                 "flag": "Revenue Contraction",
@@ -281,6 +281,7 @@ def detect_red_flags(f: dict) -> List[Dict[str, str]]:
             "detail": f"Short ratio of {short_ratio:.1f} days — significant bearish conviction from market",
         })
 
+    logger.debug(f"detect_red_flags: found {len(flags)} flag(s)")
     return flags
 
 
@@ -291,6 +292,7 @@ def full_fundamental_report(ticker: str) -> Dict[str, Any]:
     """
     f = get_financials(ticker)
     if not f:
+        logger.warning(f"full_fundamental_report: get_financials returned no data for {ticker}")
         return {"error": "Could not fetch fundamental data"}
 
     quality = score_quality(f)
@@ -303,6 +305,8 @@ def full_fundamental_report(ticker: str) -> Dict[str, Any]:
     )
 
     verdict = "Strong" if composite > 70 else ("Solid" if composite > 50 else ("Mixed" if composite > 35 else "Weak"))
+
+    logger.info(f"full_fundamental_report: {ticker} complete — composite_score={composite} verdict={verdict} red_flags={len(flags)}")
 
     return {
         "ticker": ticker,

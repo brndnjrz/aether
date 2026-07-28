@@ -385,7 +385,8 @@ def select_label_scheme(df: pd.DataFrame, ticker: str) -> Dict[str, Any]:
                 df, ticker=ticker,
                 forward_bars=horizon_days, neutral_threshold=neutral_threshold,
             )
-        except ValueError:
+        except ValueError as exc:
+            logger.debug(f"select_label_scheme: {ticker} skipped horizon_days={horizon_days} neutral_threshold={neutral_threshold}: {exc}")
             continue
 
         X_dir, y_dir = _filter_directional(X, y)
@@ -418,6 +419,7 @@ def select_label_scheme(df: pd.DataFrame, ticker: str) -> Dict[str, Any]:
             best = entry
 
     if best is None or best["mean_accuracy"] < _MIN_SEARCH_ACCURACY:
+        logger.warning(f"select_label_scheme: {ticker} no candidate cleared {_MIN_SEARCH_ACCURACY} accuracy — falling back to default label scheme")
         default_horizon, default_threshold = LABEL_SEARCH_GRID[0]
         X, y = build_features(
             df, ticker=ticker,
@@ -486,6 +488,7 @@ def select_hyperparams(
             best = entry
 
     if best is None or best["mean_accuracy"] < _MIN_SEARCH_ACCURACY:
+        logger.warning(f"select_hyperparams: no candidate cleared {_MIN_SEARCH_ACCURACY} accuracy — falling back to default hyperparameters")
         best = {"overrides": HYPERPARAM_SEARCH_GRID[0]}
 
     return {
@@ -561,20 +564,35 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
             from analysis.indicators import calculate_indicators
             df_raw = get_price_history(ticker, period="2y")
             if df_raw is None or df_raw.empty:
+                logger.warning(f"train_model: no price data available for {ticker}")
                 result["error"] = f"No price data available for {ticker}"
                 return result
             df = calculate_indicators(df_raw)
         except Exception as exc:
+            logger.error(f"train_model: data fetch failed for {ticker}: {exc}")
             result["error"] = f"Data fetch failed: {exc}"
             return result
 
     logger.info("train_model: starting for %s (%d bars)", ticker, len(df) if df is not None else 0)
 
     # ── Search for the best label horizon/threshold for this ticker ───────────
+    # Catches both ValueError (raised deliberately by build_features() for
+    # too-few-rows) and KeyError (raised by pandas when df is missing expected
+    # indicator columns, e.g. a caller passed raw OHLCV without ever running
+    # it through calculate_indicators()). Both are caller-input problems, not
+    # bugs in the search itself, so both should degrade to a structured error
+    # dict rather than propagate as an uncaught exception.
     try:
         label_choice = select_label_scheme(df, ticker)
-    except ValueError as exc:
-        result["error"] = str(exc)
+    except (ValueError, KeyError) as exc:
+        logger.warning(f"train_model: label scheme search failed for {ticker}: {exc}")
+        if isinstance(exc, KeyError):
+            result["error"] = (
+                f"Missing expected column {exc}. df must be the output of "
+                "calculate_indicators() — raw OHLCV is not sufficient."
+            )
+        else:
+            result["error"] = str(exc)
         return result
 
     horizon_days = label_choice["horizon_days"]
@@ -583,6 +601,7 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
     y_dir = label_choice["y_dir"]
 
     if len(X_dir_18) < 50:
+        logger.warning(f"train_model: only {len(X_dir_18)} directional samples for {ticker} after neutral-zone removal — need >=50")
         result["error"] = (
             f"Only {len(X_dir_18)} directional samples for {ticker} after neutral-zone removal. "
             "Provide at least 250 bars of price data."
@@ -760,10 +779,12 @@ def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
             from analysis.indicators import calculate_indicators
             df_raw = get_price_history(ticker, period="2y")
             if df_raw is None or df_raw.empty:
+                logger.warning(f"predict: no price data available for {ticker}")
                 result["error"] = f"No price data available for {ticker}"
                 return result
             df = calculate_indicators(df_raw)
         except Exception as exc:
+            logger.error(f"predict: data fetch failed for {ticker}: {exc}")
             result["error"] = f"Data fetch failed: {exc}"
             return result
 
@@ -772,6 +793,7 @@ def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
         logger.info("predict: no saved models for %s — training now", ticker)
         train_result = train_model(ticker, df)
         if train_result.get("error"):
+            logger.error(f"predict: auto-training failed for {ticker}: {train_result['error']}")
             result["error"] = f"Auto-training failed: {train_result['error']}"
             return result
         # Carry accuracy into predict result
@@ -782,8 +804,8 @@ def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
         try:
             mtime = _xgb_path(ticker).stat().st_mtime
             result["last_trained"] = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"predict: could not read model mtime for {ticker}: {exc}")
 
     # ── Load the trained model's metadata (horizon/threshold/hyperparams) ─────
     metadata = _load_model_metadata(ticker)
@@ -798,12 +820,14 @@ def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
         xgb_model = joblib.load(_xgb_path(ticker))
         rf_model = joblib.load(_rf_path(ticker))
     except Exception as exc:
+        logger.error(f"predict: failed to load models for {ticker}: {exc}")
         result["error"] = f"Failed to load models: {exc}"
         return result
 
     # ── Build feature row ─────────────────────────────────────────────────────
     X_row = build_predict_row(df)
     if X_row is None:
+        logger.warning(f"predict: could not build feature row for {ticker} — insufficient bars or missing indicator columns")
         result["error"] = (
             "Could not build feature row — ensure df has >=60 bars and all "
             "required indicator columns are present (RSI, MACD_hist, ADX, etc.)."
@@ -814,6 +838,7 @@ def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     try:
         X_arr = X_row[FEATURE_NAMES].values.astype("float32")
     except KeyError as exc:
+        logger.error(f"predict: feature column mismatch for {ticker}: {exc}")
         result["error"] = f"Feature column mismatch: {exc}. Retrain the model."
         return result
 
@@ -823,6 +848,7 @@ def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
         rf_prob = float(rf_model.predict_proba(X_arr)[0, 1])
         ensemble_prob = 0.65 * xgb_prob + 0.35 * rf_prob
     except Exception as exc:
+        logger.error(f"predict: model inference error for {ticker}: {exc}")
         result["error"] = f"Model inference error: {exc}"
         return result
 
@@ -860,8 +886,8 @@ def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
             for i in sorted_idx
             if i < len(feature_labels)
         }
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug(f"predict: top_features computation skipped for {ticker}: {exc}")
 
     # ── Expected move estimate ────────────────────────────────────────────────
     # Uses the same horizon_days/neutral_threshold this model was trained with,
@@ -887,8 +913,8 @@ def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
             subset_ret = subset_ret[~np.isnan(subset_ret)]
             if len(subset_ret) >= 5:
                 expected_move_pct = round(float(np.median(subset_ret)) * 100, 2)
-    except Exception:
-        pass   # non-critical
+    except Exception as exc:
+        logger.debug(f"predict: expected_move_pct computation skipped for {ticker}: {exc}")   # non-critical
 
     # ── Load accuracy from last training run ──────────────────────────────────
     if result["model_accuracy"] == 0.0:
@@ -906,6 +932,11 @@ def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
 
     # ── Persist prediction ────────────────────────────────────────────────────
     save_prediction(ticker, result)
+
+    logger.info(
+        f"predict: {ticker} complete — direction={direction} probability={result['probability']} "
+        f"confidence={confidence}"
+    )
 
     return result
 
@@ -954,7 +985,12 @@ def get_prediction_history(ticker: str) -> pd.DataFrame:
     if "predicted_at" in df.columns and "date" not in df.columns:
         df = df.rename(columns={"predicted_at": "date"})
     if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
+        # format="mixed" is required: older rows were logged with naive
+        # datetime.utcnow().isoformat() timestamps, newer rows with
+        # tz-aware now_et_iso() timestamps. Without it, pandas infers a
+        # single format from the first row and silently coerces every
+        # later row that doesn't match to NaT (dropped by the caller).
+        df["date"] = pd.to_datetime(df["date"], utc=True, format="mixed", errors="coerce")
         df = df.sort_values("date", ascending=False)
 
     # Ensure all expected columns exist
@@ -1054,6 +1090,7 @@ def resolve_predictions(ticker: str) -> int:
         logger.warning("resolve_predictions: price fetch failed for %s: %s", ticker, exc)
         return 0
     if price_df is None or price_df.empty:
+        logger.warning(f"resolve_predictions: no price data returned for {ticker} — cannot resolve pending predictions")
         return 0
 
     closes = price_df["Close"]
@@ -1089,6 +1126,7 @@ def resolve_predictions(ticker: str) -> int:
         with open(path, "w") as f:
             for r in records:
                 f.write(json.dumps(r) + "\n")
+        logger.debug(f"resolve_predictions: {ticker} resolved {resolved_count} pending prediction(s)")
 
     return resolved_count
 
@@ -1160,10 +1198,12 @@ def evaluate_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, 
             from analysis.indicators import calculate_indicators
             df_raw = get_price_history(ticker, period="2y")
             if df_raw is None or df_raw.empty:
+                logger.warning(f"evaluate_model: no price data available for {ticker}")
                 out["error"] = f"No price data for {ticker}"
                 return out
             df = calculate_indicators(df_raw)
         except Exception as exc:
+            logger.error(f"evaluate_model: data fetch failed for {ticker}: {exc}")
             out["error"] = f"Data fetch failed: {exc}"
             return out
 
@@ -1181,8 +1221,19 @@ def evaluate_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, 
             df, ticker=ticker,
             forward_bars=horizon_days, neutral_threshold=neutral_threshold,
         )
-    except ValueError as exc:
-        out["error"] = str(exc)
+    except (ValueError, KeyError) as exc:
+        # KeyError happens when df is missing expected indicator columns
+        # (e.g. a caller passed raw OHLCV without running calculate_indicators()
+        # first) — same caller-input problem as ValueError, so it should
+        # degrade to a structured error instead of propagating uncaught.
+        logger.warning(f"evaluate_model: build_features failed for {ticker}: {exc}")
+        if isinstance(exc, KeyError):
+            out["error"] = (
+                f"Missing expected column {exc}. df must be the output of "
+                "calculate_indicators() — raw OHLCV is not sufficient."
+            )
+        else:
+            out["error"] = str(exc)
         return out
 
     X_dir, y_dir = _filter_directional(X, y)
@@ -1226,5 +1277,10 @@ def evaluate_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, 
             out["last_n_accuracy"] = round(float(recent["correct"].mean()), 3)
         elif len(resolved) >= 5:
             out["last_n_accuracy"] = round(float(resolved.head(len(resolved))["correct"].mean()), 3)
+
+    logger.info(
+        f"evaluate_model: {ticker} complete — directional_accuracy={out['directional_accuracy']} "
+        f"is_reliable={out['is_reliable']} total_predictions={out['total_predictions']}"
+    )
 
     return out
