@@ -1644,7 +1644,7 @@ def _render_predictions():
     Dispatcher for the Predictions tab. Defaults to Daily, which renders the
     original code path unchanged — the intraday model lives in its own module
     (analysis/intraday_prediction.py) and its own storage files, so selecting it
-    cannot affect daily models or the Research/Watchlist/Screener pages.
+    cannot affect daily models or the Research page.
     """
     st.subheader("AI Price Predictions")
 

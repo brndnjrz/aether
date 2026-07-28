@@ -265,7 +265,6 @@ pg = st.navigation([
     st.Page("pages/home.py", title="Dashboard", icon="📈", default=True),
     st.Page("pages/research.py", title="Research", icon="🔍"),
     st.Page("pages/portfolio.py", title="Options Log", icon="📝"),
-    st.Page("pages/screener.py", title="Screener", icon="🔎"),
     st.Page("pages/trading.py", title="Trading Desk", icon="🎯"),
     st.Page("pages/strategy_lab.py", title="Strategy Lab", icon="🧭"),
 ])

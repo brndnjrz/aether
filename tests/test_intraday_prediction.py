@@ -4,7 +4,7 @@ Tests for analysis/intraday_prediction.py.
 Two priorities:
 
 1. **Isolation.** The whole reason this module exists separately is that
-   ml_prediction.predict() feeds three pages. These tests assert that nothing
+   ml_prediction.predict() feeds two pages. These tests assert that nothing
    here writes to a daily model's files and that the daily module's public
    surface is untouched.
 

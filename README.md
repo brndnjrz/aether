@@ -43,7 +43,6 @@ Not a brokerage. Doesn't execute trades. Not financial advice.
 | **Dashboard** (`pages/home.py`) | Live market overview — index prices, VIX, S&P regime banner, sector performance, open positions summary |
 | **Research** (`pages/research.py`) | Full single-stock deep dive: fundamental scorecard, technical chart, ML direction signal, options IV, news sentiment, and an AI investment brief |
 | **Options Log** (`pages/portfolio.py`) | The trade journal: manual fill entry → automatic FIFO round-trip P&L, hold-time/entry-hour/ticker/option-type/day-of-week win-rate analytics, and a cumulative P&L equity curve |
-| **Screener** (`pages/screener.py`) | Runs empirically-backed screens (Quality + Momentum, Oversold Quality, High IV Rank, Small Account Options, Custom Watchlist) across a ~50-name large-cap sample |
 | **Trading Desk** (`pages/trading.py`) | Four tabs in one page — **Day Trading** (market-status banner, intraday signals, candlestick pattern read, Flag/Pennant continuation-pattern detection with confidence scoring, suggested entry/stop/target, AI brief, MACD backtest), **Options** (chain, IV Rank, GARCH forward-vol forecast, Greeks, P&L diagrams, AI brief), **News** (headline sentiment), **Predictions** (ML direction signal + simulated price path) |
 | **Strategy Lab** (`pages/strategy_lab.py`) | Two intraday strategies, each with a Live Scanner and Backtest sub-tab — **ORBC** first (Opening Range Breakout Confirmation: requires a 2nd consecutive close outside the opening range before signalling, in `analysis/orbc_strategy.py`), then **MTF** (4H trend → 30m pullback into a demand zone → 5m structure shift → tape confirmation, in `analysis/mtf_strategy.py`) |
 
@@ -114,7 +113,7 @@ The Predictions tab (`analysis/ml_prediction.py`) trains an **XGBoost + Random F
 
 `analysis/intraday_prediction.py` is a **separate** model for intraday bars — not the daily model with a different interval.
 
-**Why separate:** `ml_prediction.predict()` feeds three pages (Trading Desk, Research, Screener). Threading an interval parameter through it would put all three at risk. The intraday module imports the daily module's walk-forward runner and model configs **read-only**, and writes only `{TICKER}_{interval}_*` files — a daily `SPY_xgb.pkl` is never touched.
+**Why separate:** `ml_prediction.predict()` feeds two pages (Trading Desk, Research). Threading an interval parameter through it would put both at risk. The intraday module imports the daily module's walk-forward runner and model configs **read-only**, and writes only `{TICKER}_{interval}_*` files — a daily `SPY_xgb.pkl` is never touched.
 
 **Three correctness fixes, not plumbing:**
 
@@ -196,12 +195,6 @@ The trade journal — the only page where you log trades. Enter each options fil
 - **Pattern-finding analytics** — a cumulative P&L equity curve, win rate by hold-time bucket, entry hour, option type, and day of week, and a per-ticker performance breakdown (total/avg P&L, win rate).
 - **Equity positions have no logging UI** — options fills only. Formerly "Portfolio," with Positions / Risk Analytics / Position Sizer tabs; those tracked equity positions with no UI to ever add one, and the Position Sizer duplicated Trading Desk's own Quick Risk Calculator, so all three were cut.
 
-### Screener
-
-Pick a screen — Quality + Momentum, Oversold Quality, High IV Rank, Small Account Options, or a pasted Custom Watchlist — run it against a ~50-stock sample.
-
-- Fetches live data per ticker. Expect 30–60 seconds per run.
-
 ### Trading Desk
 
 Four tabs:
@@ -231,7 +224,7 @@ Full rule set + daily routine: `docs/ORBC_PLAYBOOK.md`.
 
 ## Architecture & Workflow
 
-No central orchestrator. `app.py` sets page config, theme, and the sidebar, then `st.navigation()` routes between six independent pages. Each page:
+No central orchestrator. `app.py` sets page config, theme, and the sidebar, then `st.navigation()` routes between five independent pages. Each page:
 
 1. **Fetches** — price/fundamentals/options/news via `data/*.py`, cached per `config/settings.py` TTLs
 2. **Computes** — indicators, scores, or the ML ensemble via `analysis/*.py`
@@ -259,7 +252,6 @@ aether/
 │   ├── home.py               # Dashboard — market overview, regime Markov, sector performance, positions, recent activity
 │   ├── research.py           # Research page
 │   ├── portfolio.py          # Options Log — the trade journal + pattern-finding analytics
-│   ├── screener.py           # Multi-factor stock screener
 │   ├── strategy_lab.py       # ORBC + MTF setups — each with a live scanner and backtest
 │   └── trading.py            # Trading Desk — Day Trading / Options / News / Predictions tabs
 ├── analysis/
@@ -321,7 +313,6 @@ aether/
 
 - **Add a technical indicator** — implement it in `analysis/indicators.py`'s `calculate_indicators()`, then reference the column wherever it should render.
 - **Add an ML feature** — extend `data/feature_engineering.py`'s feature matrix. The daily ensemble picks up new columns on the next training run.
-- **Add a screener screen** — extend `pages/screener.py`'s `_run_screen()` / `_screen_ticker()` with the new filter logic and a dropdown label.
 - **Add or retune an AI brief** — add a `generate_*` prompt builder in `ai/stock_brief.py`, and give it its own `OLLAMA_MODEL_*` override in `config/settings.py` if it deserves a different model.
 - **Tune scoring or risk thresholds** — `config/settings.py` centralizes fundamental scoring cutoffs (ROIC, FCF yield, margin expansion), options thresholds (IVR high/low, IV/RV premium), and risk defaults (per-trade risk %, max position size).
 

@@ -3,29 +3,17 @@
 This app is a **research tool, not a trading platform**. There's no order execution, no
 brokerage connection, and no equity position-entry workflow — the Dashboard's Open Positions
 summary will show "no open positions" until the app is wired to a real data source. The value is
-in the research, screening, and signal generation, not in logging equity trades. Options fills
+in the research and signal generation, not in logging equity trades. Options fills
 are the exception: the Options Log page is a real, working trade journal.
 
 A natural weekly/daily loop looks like:
 
-**Screener → Research → Trading Desk (Day Trading / Options / Predictions)**, with **Options Log**
+**Research → Trading Desk (Day Trading / Options / Predictions)**, with **Options Log**
 as where you actually record options fills and review your own trading patterns.
 
 ---
 
-## 1. Screener — find candidates
-
-You give it a ticker list (or use a built-in 50-stock S&P sample) and pick one of four filters:
-Quality+Momentum, Oversold Quality (mean reversion), High IV Rank (options premium candidates),
-or a custom watchlist scored by recent returns. Every screen enforces a baseline quality gate
-(ROIC > 6%, or gross margin > 30%, or positive FCF yield) so you're not screening pure junk.
-Output is a ranked table with a composite score.
-
-**Can't do:** no backtested historical returns for the screen, no multi-factor optimization, and
-it loops tickers one at a time — slow past ~100 names. ML signals only show up here if you
-already trained that ticker's model elsewhere; it never trains inline.
-
-## 2. Research — deep dive on one ticker
+## 1. Research — deep dive on one ticker
 
 This is the core analysis page: fundamentals (P/E, PEG, EV/EBITDA, FCF yield, ROIC,
 debt/equity), a 0–100 quality/value/growth scorecard with red-flag detection, full technical
@@ -39,7 +27,7 @@ due-diligence questions.
 filings), and the AI brief is a synthesis of the data already shown — it doesn't add outside
 information or predict a price.
 
-## 3. Options Log — the one place trades actually get logged
+## 2. Options Log — the one place trades actually get logged
 
 A real fill-logging workflow, not a read-only view: log each option fill as your broker reports
 it (ticker, strike, call/put, expiry, buy/sell, qty, price, fill date+time in ET), and
@@ -60,7 +48,7 @@ options, which are fully loggable here. It's also FIFO-only — if your actual f
 multi-lot contract isn't chronological in how you enter it, the matched round trips will be
 wrong; enter fills in true chronological order, not grouped by buy/sell.
 
-## 4. Trading Desk — Day Trading, Options, Predictions
+## 3. Trading Desk — Day Trading, Options, Predictions
 
 One page, four tabs:
 
@@ -145,23 +133,23 @@ of confirmed Flag/Pennant patterns the way the MACD Bullish Cross backtest does 
 
 ## What the whole app fundamentally can't do
 
-- No brokerage connection or order execution, and no UI to log *equity* positions — the equity
-  Positions tab reflects whatever (if anything) is in the local `positions` table. Options fills
-  are the exception — those have a real logging UI (the Options Log page) with automatic
-  FIFO round-trip P&L.
+- No brokerage connection or order execution, and no UI to log *equity* positions — the
+  Dashboard's Open Positions summary reflects whatever (if anything) is in the local `positions`
+  table. Options fills are the exception — those have a real logging UI (the Options Log page)
+  with automatic FIFO round-trip P&L.
 - No real-time data — everything runs on yfinance, which is delayed and occasionally
   rate-limited.
 - Equities only — no crypto, futures, forex, bonds.
-- No backtesting of strategies, screens, or the fundamental scorecard — the one exception is the
+- No backtesting of strategies or the fundamental scorecard — the one exception is the
   Day Trading tab's MACD Bullish Cross backtest, which validates a single rule, not the other
-  signals shown alongside it (including Flag/Pennant detection), and not the screener or
+  signals shown alongside it (including Flag/Pennant detection), and not the
   scorecard.
 - AI features are opt-in and require your own `ANTHROPIC_API_KEY` (or a local Ollama instance)
   — without it, those buttons just don't appear, the rest of the app works fine.
 
 ## Practical use pattern
 
-Run Screener weekly for ideas → Research the shortlist for fundamentals/technicals/AI brief →
+Research a candidate for fundamentals/technicals/AI brief →
 use Trading Desk's Day Trading tab for intraday timing (VWAP/momentum/trend/candlestick/
 Flag-Pennant signals), Options tab for defined-risk structures, and Predictions tab as a
 secondary confirmation signal, never the primary reason to enter → log any options fills in
@@ -353,5 +341,5 @@ entry-hour, by-ticker, and day-of-week analytics build up over time instead of b
 ## What This App Cannot Replace
 
 - **A live broker/data feed** — no real-time quotes, no real-time execution; nothing here should drive split-second decisions.
-- **A backtested strategy** — outside of the single MACD Bullish Cross rule, every other signal (scorecard, screener, IVR strategy map, candlestick patterns, ML predictions) is unvalidated logic, not a proven edge.
+- **A backtested strategy** — outside of the single MACD Bullish Cross rule, every other signal (scorecard, IVR strategy map, candlestick patterns, ML predictions) is unvalidated logic, not a proven edge.
 - **Order execution and position tracking** — there is no way to place a trade or log an equity position from the UI; the Day Trading tab's Quick Risk Calculator is a standalone calculator, not a live book, and there is no portfolio-level stress-test tool.
