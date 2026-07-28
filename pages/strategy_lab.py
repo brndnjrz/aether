@@ -2,17 +2,17 @@
 Strategy Lab — two independent intraday strategies, each with a live scanner
 and a mechanical backtest over recent history.
 
-1. MTF setup — identify trend on the 4-hour chart, wait for a pullback into a
-   demand zone on the 30-minute chart, confirm a market-structure shift on the
-   5-minute chart, read the tape for absorption then buyers taking control,
-   enter targeting the VAP with a stop at the swing low. Logic in
-   analysis/mtf_strategy.py.
-
-2. ORBC (Opening Range Breakout Confirmation) — define the opening range from
+1. ORBC (Opening Range Breakout Confirmation) — define the opening range from
    the first N minutes after the 9:30 ET open, then require a second (or
    third) consecutive close outside that range before signalling, which
    filters the false breakouts common right after the open. Logic in
    analysis/orbc_strategy.py.
+
+2. MTF setup — identify trend on the 4-hour chart, wait for a pullback into a
+   demand zone on the 30-minute chart, confirm a market-structure shift on the
+   5-minute chart, read the tape for absorption then buyers taking control,
+   enter targeting the VAP with a stop at the swing low. Logic in
+   analysis/mtf_strategy.py.
 
 This page is display only — all detection lives in the analysis modules.
 """
@@ -226,6 +226,18 @@ def _render_backtest(ticker: str):
             for t in result["trades"]
         ])
         st.dataframe(trades_df, hide_index=True, width="stretch")
+
+
+def _render_mtf(ticker: str):
+    st.markdown(
+        "4H trend → 30m pullback into a demand zone → 5m structure shift → "
+        "tape confirmation → entry targeting the VAP with a stop at the swing low."
+    )
+    sub_scan, sub_backtest = st.tabs(["Live Scanner", "Backtest"])
+    with sub_scan:
+        _render_scanner(ticker)
+    with sub_backtest:
+        _render_backtest(ticker)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -674,19 +686,11 @@ def render():
         logger.info(f"[strategy_lab] Ticker changed to {ticker}; loading Strategy Lab data")
         st.session_state["_strategy_lab_last_ticker"] = ticker
 
-    tab_mtf, tab_mtf_bt, tab_orbc = st.tabs(
-        ["MTF Scanner", "MTF Backtest", "ORBC (Opening Range)"]
-    )
-    with tab_mtf:
-        st.caption(
-            "4H trend → 30m pullback into a demand zone → 5m structure shift → "
-            "tape confirmation → entry targeting the VAP with a stop at the swing low."
-        )
-        _render_scanner(ticker)
-    with tab_mtf_bt:
-        _render_backtest(ticker)
+    tab_orbc, tab_mtf = st.tabs(["ORBC (Opening Range)", "MTF"])
     with tab_orbc:
         _render_orbc(ticker)
+    with tab_mtf:
+        _render_mtf(ticker)
 
     st.markdown("---")
     st.caption("Aether • Data from yfinance • For personal use only. Not financial advice.")
