@@ -36,6 +36,7 @@ It is not a brokerage, it does not execute trades, and it is not financial advic
 | **Watchlist** (`pages/watchlist.py`) | Persistent weekly shortlist with a plan/thesis note per ticker, plus a Daily Watchlist Check (gap %, relative volume, ATR%, ML bias, today's session price envelope) scoped to just those tickers |
 | **Screener** (`pages/screener.py`) | Runs empirically-backed screens (Quality + Momentum, Oversold Quality, High IV Rank, Small Account Options, Custom Watchlist) across a ~50-name large-cap sample |
 | **Trading Desk** (`pages/trading.py`) | Four tabs in one page — **Day Trading** (market-status banner, intraday signals, candlestick pattern read, Flag/Pennant continuation-pattern detection with confidence scoring, suggested entry/stop/target, AI brief, MACD backtest), **Options** (chain, IV Rank, GARCH forward-vol forecast, Greeks, P&L diagrams, AI brief), **News** (headline sentiment), **Predictions** (ML direction signal + simulated price path) |
+| **Strategy Lab** (`pages/strategy_lab.py`) | Two intraday strategies, each with a live scanner and a mechanical backtest — **MTF** (4H trend → 30m pullback into a demand zone → 5m structure shift → tape confirmation, in `analysis/mtf_strategy.py`) and **ORBC** (Opening Range Breakout Confirmation: requires a 2nd consecutive close outside the opening range before signalling, in `analysis/orbc_strategy.py`) |
 
 Every Analyze click, options view, and prediction on the Trading Desk is written to a local activity log, later surfaced by the Portfolio Options Log's "what were you looking at" picker.
 
@@ -74,7 +75,7 @@ The app runs at **http://localhost:8501**
 | `python-dotenv` | Loads `.env` into `config/settings.py` |
 | `tzdata` | Ensures correct US/Eastern conversions via `zoneinfo` on all platforms |
 
-`fpdf2`, `Pillow`, and `narwhals` are also in `requirements.txt` but are not currently exercised by any page — they're leftover from earlier iteration and can be dropped if you're trimming the dependency footprint.
+`fpdf2` and `Pillow` are also in `requirements.txt` but are not imported by any page — leftover from earlier iteration and safe to drop if trimming the dependency footprint. `narwhals` is listed explicitly even though nothing imports it directly: it's a real transitive dependency of `scikit-learn` and `plotly`, and a prior version mismatch in that chain took down the whole ML Predictions tab for 11 days before anyone noticed (see `tests/test_ml_prediction.py`) — it stays pinned on purpose.
 
 ## AI & ML Model Overview
 
@@ -166,9 +167,27 @@ Four tabs in one page:
 
 For the day-by-day and week-by-week rhythm this app is designed around, see `docs/workflow.md`.
 
+### Strategy Lab
+
+Two independent intraday strategies, each with its own Live Scanner and Backtest.
+
+**MTF Scanner / MTF Backtest** — a single codified setup: 4H trend, pullback into a demand zone on the 30-minute chart, a market-structure shift on the 5-minute chart, then tape confirmation (price/volume proxy, not real order flow), with a target at the volume-profile point of control and a stop at the swing low. Logic in `analysis/mtf_strategy.py`.
+
+**ORBC (Opening Range)** — Opening Range Breakout Confirmation. The first N minutes after the 9:30 ET open define a reference high/low; the strategy then waits for a **second consecutive close** outside that range before signalling, which filters most of the false breakouts that fire right after the open. Logic in `analysis/orbc_strategy.py`.
+
+How the confirmation rule resolves: the signal fires on the Nth consecutive close outside the range (default 2). A close back inside resets the count — a breakout that round-trips starts over. If a filter (volume/VWAP/ATR) blocks the Nth close, later closes can still fire up to `max_confirmation_closes` (default 3). That's the "second OR third candle" rule: exactly one signal per breakout episode, but a filter miss on the second bar doesn't kill a setup that confirms on the third.
+
+Configurable in the **Strategy parameters** panel: bar interval, opening-range duration, confirmation count, entry cutoff time, each of the three filters (volume vs. the 20-bar average, VWAP alignment, opening range vs. ATR), long/short enablement, stop method (opening range / ATR / percent), and target method (risk-reward / ATR / range projection).
+
+The scanner overlays the opening-range band, marks every close outside it, marks filtered-out breakouts with an ✕ (hover for the reason), and draws entry/stop/target for a confirmed signal alongside a 0–100 confidence score built from volume thrust, VWAP alignment, breach decisiveness, range quality vs. ATR, and short-term EMA agreement. A confirmed signal can be written to the activity log with one click, the same way MTF setups are.
+
+Both ORBC directions are supported — `evaluate_orbc_trade()` is direction-aware, unlike the long-only simulators elsewhere in the app. Positions are always flattened at the session close; the strategy never holds overnight. Because intraday bars are capped at ~60 days and ORBC fires at most once per session, the backtest yields a few dozen trades and warns explicitly when the sample is under 30.
+
+See `docs/ORBC_PLAYBOOK.md` for the full rule set, the implementation decisions behind it, and a pre-open-to-weekly-review routine for trading it.
+
 ## Architecture & Workflow
 
-Aether has no central orchestrator — `app.py` sets page config, theme, and the sidebar, then hands off to Streamlit's `st.navigation()` to route between six independent pages. Each page owns its own data flow:
+Aether has no central orchestrator — `app.py` sets page config, theme, and the sidebar, then hands off to Streamlit's `st.navigation()` to route between seven independent pages. Each page owns its own data flow:
 
 1. **Fetch** — pull price/fundamentals/options/news via `data/*.py` (all backed by yfinance or Google News RSS, cached per `config/settings.py` TTLs)
 2. **Compute** — run indicators, scores, or the ML ensemble via `analysis/*.py`
@@ -198,6 +217,7 @@ aether/
 │   ├── portfolio.py          # Portfolio tracking, risk analytics, Options Log
 │   ├── watchlist.py          # Weekly watchlist + daily gap/volume/ATR/ML check
 │   ├── screener.py           # Multi-factor stock screener
+│   ├── strategy_lab.py       # 4H/30m/5m multi-timeframe setup — live scanner + backtest
 │   └── trading.py            # Trading Desk — Day Trading / Options / News / Predictions tabs
 ├── analysis/
 │   ├── indicators.py          # RSI, MACD, ADX, Bollinger Bands, etc.
@@ -206,6 +226,9 @@ aether/
 │   ├── flag_pennant_detection.py  # Flag/Pennant geometry: swing → pole → consolidation → confirmed breakout
 │   ├── flag_pennant_scoring.py    # 0-100 confidence score for a detected pattern
 │   ├── flag_pennant_backtest.py   # Entry/stop/target/R:R/MFE/MAE for a scored pattern
+│   ├── mtf_strategy.py        # Strategy Lab's 4H/30m/5m setup: 4H resample, evaluate_setup, backtest_setup
+│   ├── orbc_strategy.py       # Opening Range Breakout Confirmation: opening range, confirmation state machine, backtest
+│   ├── volume_profile.py      # Volume-by-price profile — POC/value-area proxy used by mtf_strategy.py
 │   ├── backtest.py            # Generic long-only backtest engine + MACD bullish-cross signal
 │   ├── ml_prediction.py       # XGBoost + RF ensemble: train, predict, evaluate
 │   ├── price_projection.py    # Monte Carlo price-path simulation
@@ -213,7 +236,8 @@ aether/
 │   ├── volatility_forecast.py # GARCH(1,1) forward volatility forecast
 │   ├── sentiment.py           # VADER headline sentiment scoring
 │   ├── fundamental_score.py   # Quality/Value/Growth scoring engine
-│   ├── regime.py              # Market regime detection
+│   ├── regime.py              # Market regime detection (trend vs. 200-day MA)
+│   ├── regime_markov.py       # Markov-chain regime model — persistence, forecast, stationary distribution
 │   └── risk.py                # Portfolio risk metrics, position sizing, stress tests
 ├── data/
 │   ├── price_data.py          # Price history and current price via yfinance
@@ -234,9 +258,14 @@ aether/
 │   └── watchlist.py            # Weekly watchlist persistence
 ├── docs/
 │   ├── workflow.md                    # Day-by-day and week-by-week usage workflow
+│   ├── ORBC_PLAYBOOK.md               # ORBC rules, design decisions, and daily trading routine
 │   ├── ML_PREDICTION.md               # Full technical writeup of the ML ensemble
 │   ├── Identifying-Chart-Patterns.md  # Flag/Pennant pattern reference
 │   └── VERIFICATION_CHECKLIST.md      # Manual verification steps for a few past fixes
+├── tests/
+│   ├── conftest.py             # Shared fixtures — synthetic daily + intraday OHLCV, isolated storage dir
+│   ├── test_ml_prediction.py   # Regression suite for analysis/ml_prediction.py (see Reliability & Verification)
+│   └── test_orbc_strategy.py   # ORBC confirmation state machine, filters, stops/targets, direction-aware P&L
 └── storage/                    # Persisted ML models and prediction logs (auto-created)
     ├── {TICKER}_xgb.pkl
     ├── {TICKER}_rf.pkl
@@ -265,12 +294,13 @@ Cache TTLs (`config/settings.py`): price data 5 min, fundamentals 1 hour, option
 
 ## Reliability & Verification
 
-There's no automated test suite yet — reliability currently rests on two mechanisms:
+Reliability rests on three mechanisms:
 
-1. **The ML model self-gates on quality.** Training runs anchored walk-forward validation and only saves a model if it clears a 52% mean directional accuracy floor with std-dev ≤ 8% across folds; a model that doesn't clear the bar is reported as such instead of silently saved.
-2. **Manual verification checklists.** `docs/VERIFICATION_CHECKLIST.md` documents the manual steps used to validate timezone handling, activity logging, and the options FIFO round-trip matcher against real fill data.
+1. **A `pytest` regression suite** (`tests/`, 57 tests) covering two areas. `test_ml_prediction.py` exercises `analysis/ml_prediction.py` end-to-end — module import (the exact failure mode that silently killed the Predictions tab for 11 days when a dependency in the sklearn/xgboost/narwhals chain broke), train/predict/evaluate on synthetic OHLCV data, the reliability gate correctly rejecting a pure random walk, and the predict → save_prediction → get_prediction_history persistence round-trip. `test_orbc_strategy.py` pins the ORBC confirmation state machine against hand-laid-out intraday sessions: that a single breakout close never signals, that a close back inside resets the count, that filters fall through from the 2nd to the 3rd close, and that short P&L carries the correct sign. Run it with `pytest tests/ -q`. No network access required or used.
+2. **The ML model self-gates on quality.** Training runs anchored walk-forward validation and only saves a model if it clears a 52% mean directional accuracy floor with std-dev ≤ 8% across folds; a model that doesn't clear the bar is reported as such instead of silently saved.
+3. **Manual verification checklists.** `docs/VERIFICATION_CHECKLIST.md` documents the manual steps used to validate timezone handling, activity logging, and the options FIFO round-trip matcher against real fill data.
 
-If you're adding `pytest` coverage, `analysis/backtest.py`'s pure functions (no Streamlit dependency) and `portfolio/round_trips.py`'s FIFO matcher are the highest-value places to start.
+`analysis/backtest.py`'s pure functions and `portfolio/round_trips.py`'s FIFO matcher have no Streamlit dependency and are the next-highest-value places to add coverage.
 
 ## Disclaimer & License
 
@@ -294,6 +324,9 @@ ollama pull llama3.2
 
 # Install dependencies
 pip install -r requirements.txt
+
+# Run the regression test suite
+pytest tests/ -q
 
 # Inspect the local database directly
 sqlite3 storage/journal.db "select * from activity_log"

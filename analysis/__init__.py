@@ -6,6 +6,10 @@ from analysis.risk import position_size_from_stop, portfolio_correlation_matrix,
 from analysis.sentiment import score_headline, analyze_ticker_sentiment
 from analysis.trendlines import detect_recent_trendlines, detect_swing_points
 from analysis.flag_pennant_detection import detect_flag_pennant_patterns, find_flags_and_pennants
+from analysis.orbc_strategy import (
+    ORBCConfig, compute_opening_range, detect_orbc_signals, detect_session_signals,
+    evaluate_orbc_trade, latest_session_state, backtest_orbc,
+)
 
 __all__ = [
     "calculate_indicators", "get_signal_summary", "detect_support_resistance", "detect_rsi_divergence",
@@ -17,4 +21,6 @@ __all__ = [
     "score_headline", "analyze_ticker_sentiment",
     "detect_recent_trendlines", "detect_swing_points",
     "detect_flag_pennant_patterns", "find_flags_and_pennants",
+    "ORBCConfig", "compute_opening_range", "detect_orbc_signals", "detect_session_signals",
+    "evaluate_orbc_trade", "latest_session_state", "backtest_orbc",
 ]
