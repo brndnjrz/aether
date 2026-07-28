@@ -42,13 +42,12 @@ Not a brokerage. Doesn't execute trades. Not financial advice.
 |------|--------------|
 | **Dashboard** (`pages/home.py`) | Live market overview — index prices, VIX, S&P regime banner, sector performance, open positions summary |
 | **Research** (`pages/research.py`) | Full single-stock deep dive: fundamental scorecard, technical chart, ML direction signal, options IV, news sentiment, and an AI investment brief |
-| **Portfolio** (`pages/portfolio.py`) | Position tracking, correlation matrix, portfolio-level risk analytics, a risk-first position sizer, and an Options Log (manual fill entry → automatic FIFO round-trip P&L, hold-time/entry-hour win-rate analytics) |
-| **Watchlist** (`pages/watchlist.py`) | Persistent weekly shortlist with a plan/thesis note per ticker, plus a Daily Watchlist Check (gap %, relative volume, ATR%, ML bias, today's session price envelope) scoped to just those tickers |
+| **Options Log** (`pages/portfolio.py`) | The trade journal: manual fill entry → automatic FIFO round-trip P&L, hold-time/entry-hour/ticker/option-type/day-of-week win-rate analytics, and a cumulative P&L equity curve |
 | **Screener** (`pages/screener.py`) | Runs empirically-backed screens (Quality + Momentum, Oversold Quality, High IV Rank, Small Account Options, Custom Watchlist) across a ~50-name large-cap sample |
 | **Trading Desk** (`pages/trading.py`) | Four tabs in one page — **Day Trading** (market-status banner, intraday signals, candlestick pattern read, Flag/Pennant continuation-pattern detection with confidence scoring, suggested entry/stop/target, AI brief, MACD backtest), **Options** (chain, IV Rank, GARCH forward-vol forecast, Greeks, P&L diagrams, AI brief), **News** (headline sentiment), **Predictions** (ML direction signal + simulated price path) |
-| **Strategy Lab** (`pages/strategy_lab.py`) | Two intraday strategies, each with a live scanner and a mechanical backtest — **MTF** (4H trend → 30m pullback into a demand zone → 5m structure shift → tape confirmation, in `analysis/mtf_strategy.py`) and **ORBC** (Opening Range Breakout Confirmation: requires a 2nd consecutive close outside the opening range before signalling, in `analysis/orbc_strategy.py`) |
+| **Strategy Lab** (`pages/strategy_lab.py`) | Two intraday strategies, each with a Live Scanner and Backtest sub-tab — **ORBC** first (Opening Range Breakout Confirmation: requires a 2nd consecutive close outside the opening range before signalling, in `analysis/orbc_strategy.py`), then **MTF** (4H trend → 30m pullback into a demand zone → 5m structure shift → tape confirmation, in `analysis/mtf_strategy.py`) |
 
-Every Analyze click, options view, and prediction on the Trading Desk logs to a local activity log — later surfaced by Portfolio's Options Log "what were you looking at" picker.
+Every Analyze click, options view, and prediction on the Trading Desk logs to a local activity log — later surfaced by Options Log's "what were you looking at" picker and the Dashboard's Recent Activity feed.
 
 ## Quick Start
 
@@ -115,7 +114,7 @@ The Predictions tab (`analysis/ml_prediction.py`) trains an **XGBoost + Random F
 
 `analysis/intraday_prediction.py` is a **separate** model for intraday bars — not the daily model with a different interval.
 
-**Why separate:** `ml_prediction.predict()` feeds four pages (Trading Desk, Research, Watchlist, Screener). Threading an interval parameter through it would put all four at risk. The intraday module imports the daily module's walk-forward runner and model configs **read-only**, and writes only `{TICKER}_{interval}_*` files — a daily `SPY_xgb.pkl` is never touched.
+**Why separate:** `ml_prediction.predict()` feeds three pages (Trading Desk, Research, Screener). Threading an interval parameter through it would put all three at risk. The intraday module imports the daily module's walk-forward runner and model configs **read-only**, and writes only `{TICKER}_{interval}_*` files — a daily `SPY_xgb.pkl` is never touched.
 
 **Three correctness fixes, not plumbing:**
 
@@ -174,8 +173,10 @@ Landing page. No input required.
 
 - Regime banner (Bull/Uptrend/Sideways/Downtrend/Bear vs. the S&P's 200-day MA)
 - Live index cards (SPY/QQQ/IWM/VIX)
+- **Market Regime (Markov)** — a probabilistic second opinion on the same trend, reusing the Markov model Trading Desk runs per-ticker, applied to the S&P 500
 - Sector performance
 - Open positions (empty until logged)
+- **Recent Activity** — the last 8 logged events across Trading Desk and Strategy Lab, newest first
 
 ### Research
 
@@ -188,18 +189,12 @@ Enter a ticker + lookback period — loads automatically.
 - **AI Brief** — one-click investment summary
 - **ML Direction Signal** — runs automatically between the scorecard and the chart
 
-### Portfolio
+### Options Log
 
-Four tabs: **Positions**, **Risk Analytics**, **Position Sizer**, **Options Log**.
+The trade journal — the only page where you log trades. Enter each options fill as your broker reports it; `portfolio/round_trips.py` FIFO-matches buys against sells into round trips with P&L and hold time.
 
-- **Options Log** is the only place you log trades. Enter each fill as your broker reports it; `portfolio/round_trips.py` FIFO-matches buys against sells into round trips with P&L, hold time, and win rate by hold-time bucket / entry hour.
-- Equity positions have no logging UI yet — options fills only, for now.
-
-### Watchlist
-
-Persistent weekly shortlist (ticker + target/stop + plan note).
-
-- **Daily Watchlist Check** — gap %, relative volume, ATR%, ML bias, scoped to just your saved tickers. Fast, since it skips the full screener universe.
+- **Pattern-finding analytics** — a cumulative P&L equity curve, win rate by hold-time bucket, entry hour, option type, and day of week, and a per-ticker performance breakdown (total/avg P&L, win rate).
+- **Equity positions have no logging UI** — options fills only. Formerly "Portfolio," with Positions / Risk Analytics / Position Sizer tabs; those tracked equity positions with no UI to ever add one, and the Position Sizer duplicated Trading Desk's own Quick Risk Calculator, so all three were cut.
 
 ### Screener
 
@@ -220,9 +215,7 @@ Day-by-day, week-by-week rhythm: `docs/workflow.md`.
 
 ### Strategy Lab
 
-Two intraday strategies, each with a Live Scanner and a Backtest.
-
-**MTF** — 4H trend → 30m pullback into a demand zone → 5m structure shift → tape confirmation (price/volume proxy, not real order flow) → target at the volume-profile point of control, stop at the swing low. Logic: `analysis/mtf_strategy.py`.
+Two intraday strategies, each its own tab with a Live Scanner and a Backtest sub-tab, **ORBC first**.
 
 **ORBC (Opening Range)** — the first N minutes after the 9:30 ET open set a reference high/low. Waits for a **second consecutive close** outside that range before signalling — filters most post-open false breakouts. Logic: `analysis/orbc_strategy.py`.
 
@@ -234,9 +227,11 @@ Two intraday strategies, each with a Live Scanner and a Backtest.
 
 Full rule set + daily routine: `docs/ORBC_PLAYBOOK.md`.
 
+**MTF** — 4H trend → 30m pullback into a demand zone → 5m structure shift → tape confirmation (price/volume proxy, not real order flow) → target at the volume-profile point of control, stop at the swing low. Logic: `analysis/mtf_strategy.py`.
+
 ## Architecture & Workflow
 
-No central orchestrator. `app.py` sets page config, theme, and the sidebar, then `st.navigation()` routes between seven independent pages. Each page:
+No central orchestrator. `app.py` sets page config, theme, and the sidebar, then `st.navigation()` routes between six independent pages. Each page:
 
 1. **Fetches** — price/fundamentals/options/news via `data/*.py`, cached per `config/settings.py` TTLs
 2. **Computes** — indicators, scores, or the ML ensemble via `analysis/*.py`
@@ -245,7 +240,7 @@ No central orchestrator. `app.py` sets page config, theme, and the sidebar, then
 
 **Persists across pages and reruns:**
 
-- **`storage/journal.db`** (SQLite, via `portfolio/db.py`) — positions, activity log, options fills, watchlist
+- **`storage/journal.db`** (SQLite, via `portfolio/db.py`) — positions, activity log, options fills
 - **`storage/{TICKER}_*`** — trained models, walk-forward accuracy, prediction history — one set per trained ticker
 
 No request/response API layer — Streamlit's script-rerun model *is* the request cycle. `st.session_state` carries state (e.g. the quick-lookup ticker) across page switches.
@@ -261,12 +256,11 @@ aether/
 │   ├── settings.py          # API keys, AI provider + per-brief model routing, cache TTLs, risk defaults
 │   └── tz.py                # US/Eastern time helpers — all user-facing timestamps are explicit ET
 ├── pages/
-│   ├── home.py               # Dashboard — market overview, sector performance, open positions
+│   ├── home.py               # Dashboard — market overview, regime Markov, sector performance, positions, recent activity
 │   ├── research.py           # Research page
-│   ├── portfolio.py          # Portfolio tracking, risk analytics, Options Log
-│   ├── watchlist.py          # Weekly watchlist + daily gap/volume/ATR/ML check
+│   ├── portfolio.py          # Options Log — the trade journal + pattern-finding analytics
 │   ├── screener.py           # Multi-factor stock screener
-│   ├── strategy_lab.py       # 4H/30m/5m multi-timeframe setup — live scanner + backtest
+│   ├── strategy_lab.py       # ORBC + MTF setups — each with a live scanner and backtest
 │   └── trading.py            # Trading Desk — Day Trading / Options / News / Predictions tabs
 ├── analysis/
 │   ├── indicators.py          # RSI, MACD, ADX, Bollinger Bands, etc.
@@ -304,8 +298,7 @@ aether/
 │   ├── journal.py              # Position read access
 │   ├── activity_log.py         # Records Day Trading / Options / Prediction view events
 │   ├── option_fills.py         # Options fill ledger CRUD
-│   ├── round_trips.py          # FIFO buy/sell matcher → round trips with P&L, hold time
-│   └── watchlist.py            # Weekly watchlist persistence
+│   └── round_trips.py          # FIFO buy/sell matcher → round trips with P&L, hold time
 ├── docs/
 │   ├── workflow.md                    # Day-by-day and week-by-week usage workflow
 │   ├── ORBC_PLAYBOOK.md               # ORBC rules, design decisions, and daily trading routine

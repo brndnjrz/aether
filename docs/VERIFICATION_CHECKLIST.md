@@ -65,7 +65,7 @@ Confirm `event_type` and `detail_json` match what actually happened — e.g.
 
 ## 4. Options Log accuracy — the money-math check
 
-Go to Portfolio → **📝 Options Log** and manually re-enter the 7 real fills from the
+Go to the **Options Log** page and manually re-enter the 7 real fills from the
 screenshots (SPY $754 put buy/sell, SPY $743 call buy/sell x2, SPY $753 put buy/sell) with
 their actual EDT fill times. Confirm the computed round trips match the hand-calculated
 P&L: **+$940, +$1,390, +$1,940**, and the still-open $743 call shows **no round trip**
@@ -73,7 +73,7 @@ P&L: **+$940, +$1,390, +$1,940**, and the still-open $743 call shows **no round 
 
 This validates `portfolio/round_trips.py`'s FIFO matcher:
 
-- The "Log a fill" form (`portfolio.py:265`) stores ticker, strike, call/put, expiry,
+- The "Log a fill" form (`portfolio.py:52`) stores ticker, strike, call/put, expiry,
   buy/sell, contract qty, price per contract, and fill date+time (as ET via `MARKET_TZ`).
 - `compute_round_trips()` groups fills by `(ticker, strike, option_type, expiry_date)`,
   sorts by `filled_at`, and FIFO-matches buys against sells (a deque per side). Each
@@ -90,7 +90,7 @@ This validates `portfolio/round_trips.py`'s FIFO matcher:
 Confirm the hold-time-bucket chart correctly separates the 26-min and 1h43m trades from the
 overnight trade, and the win-rate-by-hour chart renders without error on this small sample.
 
-`_render_round_trip_analytics()` (`portfolio.py:359`) buckets by `hold_bucket` (`<30min`,
+`_render_round_trip_analytics()` (`portfolio.py:222`) buckets by `hold_bucket` (`<30min`,
 `30min-2h`, `2h-24h (overnight)`, `>24h`, computed in `round_trips.py:_hold_bucket`) and
 plots win rate per bucket, plus a second chart grouping by `entry_hour` (ET). With the
 26-min trade (`<30min`), 1h43m trade (`30min-2h`), and overnight trade (`2h-24h`), confirm

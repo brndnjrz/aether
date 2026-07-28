@@ -1,6 +1,6 @@
 # Aether — Claude Code Notes
 
-Streamlit intraday/swing trading research dashboard. Seven pages, all data live
+Streamlit intraday/swing trading research dashboard. Six pages, all data live
 from yfinance, all state on local disk. See `README.md` for what the app *does*
 and how a user drives it — this file is conventions, commands, and traps.
 
@@ -86,7 +86,7 @@ sqlite3 storage/journal.db "select * from activity_log"
 - **Two prediction models, deliberately separate.** `analysis/ml_prediction.py`
   is daily; `analysis/intraday_prediction.py` is intraday. Do **not** merge them
   or add an `interval` param to the daily one — `ml_prediction.predict()` is
-  consumed by four pages (trading, research, watchlist, screener), so changes
+  consumed by three pages (trading, research, screener), so changes
   there have a wide blast radius. The intraday module imports the daily module's
   `_run_walk_forward` / `_xgb_config` / `_rf_config` / `_filter_directional`
   **read-only**; keep it that way. Storage is interval-scoped

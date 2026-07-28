@@ -3,7 +3,7 @@
 Strategy definition, implementation notes, and the practical daily routine for
 Strategy Lab's ORBC tab.
 
-Companion to `workflow.md`, which covers the Screener / Research / Portfolio /
+Companion to `workflow.md`, which covers the Screener / Research / Options Log /
 Trading Desk loop. This doc covers only the intraday ORBC strategy.
 
 - [The idea in plain terms](#the-idea-in-plain-terms)
@@ -137,13 +137,15 @@ if you want it to actually filter.
 
 ### Before the open (9:00–9:25)
 
-**Watchlist page.** You should already have 5–10 tickers saved with a target,
-stop, and one-line thesis. Run **Daily Watchlist Check** — it scans only your
-saved names for gap %, relative volume, ATR%, and ML bias.
+**Your own watchlist.** Aether doesn't maintain one — pull up whatever you use
+externally (Webull or similar) for the 5–10 tickers you're tracking, each with
+a target, stop, and one-line thesis.
 
 You are answering one question: *which of my names is actually in play today?*
-A name gapping 2% on 3× volume deserves attention. A name flat on 0.6× volume
-does not.
+A name gapping 2% on 3× volume deserves attention. A name flat on 0.6% volume
+does not. Aether has no automated gap/volume scan across a saved list — check
+each candidate individually in Research, or use your external watchlist tool's
+own screener for this pass.
 
 **Dashboard.** Ten-second glance. Is the S&P above its 200-day? Where is VIX?
 This sets **position size**, not direction. High VIX means smaller size and
@@ -174,14 +176,15 @@ After 11:00 the scanner stops signalling by design.
 
 ### Sizing — do not skip
 
-Take the entry and stop from the ORBC card to **Portfolio → Position Sizer**. It
-returns the share/contract count that risks 1% of the account *on that specific
-stop distance*. This step decides whether you survive a losing streak — it
-matters more than signal quality.
+Take the entry and stop from the ORBC card to **Trading Desk → Day Trading →
+Quick Risk Calculator** (bottom of the tab). It returns the share/contract
+count that risks 1% of the account *on that specific stop distance*. This step
+decides whether you survive a losing streak — it matters more than signal
+quality.
 
 ### Logging fills
 
-Log every options fill in **Portfolio → Options Log** in chronological order as
+Log every options fill on the **Options Log** page in chronological order as
 the broker reports it. The FIFO matcher builds round trips with P&L, hold time,
 and win rate by hold-time bucket and entry hour.
 
@@ -194,7 +197,7 @@ have one hour of the day where they consistently lose money and don't know it.
 
 Roughly 30 minutes, Sunday.
 
-- **Portfolio → Options Log analytics.** Which hold-time bucket and which entry
+- **Options Log analytics.** Which hold-time bucket and which entry
   hour actually make money? Cut the worst one next week.
 - **Strategy Lab → ORBC → Backtest** on your top 3 tickers. Compare filters on
   vs. off, 15-min vs. 30-min range. Intraday history caps at ~60 days and ORBC
@@ -202,7 +205,7 @@ Roughly 30 minutes, Sunday.
   warns when the sample is under 30. Treat results as *directional, not proof*.
 - **Research page** on any name you're considering adding — fundamental
   scorecard, red flags, ML signal, AI brief.
-- Rebuild next week's watchlist with fresh targets and theses.
+- Rebuild next week's watchlist (external tool) with fresh targets and theses.
 
 ---
 

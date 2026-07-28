@@ -1,14 +1,15 @@
 # Aether — Investing Workflow
 
 This app is a **research tool, not a trading platform**. There's no order execution, no
-brokerage connection, and no position-entry workflow — Portfolio is a read-only view (it will
-show "no open positions" until the app is wired to a real data source). The value is in the
-research, screening, and signal generation, not in logging trades.
+brokerage connection, and no equity position-entry workflow — the Dashboard's Open Positions
+summary will show "no open positions" until the app is wired to a real data source. The value is
+in the research, screening, and signal generation, not in logging equity trades. Options fills
+are the exception: the Options Log page is a real, working trade journal.
 
 A natural weekly/daily loop looks like:
 
-**Screener → Research → Trading Desk (Day Trading / Options / Predictions)**, with **Portfolio**
-available as a (currently empty) risk-analytics view.
+**Screener → Research → Trading Desk (Day Trading / Options / Predictions)**, with **Options Log**
+as where you actually record options fills and review your own trading patterns.
 
 ---
 
@@ -38,32 +39,30 @@ due-diligence questions.
 filings), and the AI brief is a synthesis of the data already shown — it doesn't add outside
 information or predict a price.
 
-## 3. Portfolio — risk view, plus the one place trades actually get logged
+## 3. Options Log — the one place trades actually get logged
 
-Aggregates whatever positions exist in the `positions` table: P&L table, a correlation matrix
-(flags pairs >0.8 correlated — useful for catching hidden concentration), Sharpe/max-
-drawdown/win-rate on the whole book, a stress-test simulator (SPY ±10%, VIX shocks — assumes
-beta≈1, so you adjust manually for high-beta names), and a risk-first position sizer (define
-your stop and risk %, it backs into share count). A fourth tab, **Options Log**, is a real
-fill-logging workflow: log each option fill as your broker reports it (ticker, strike, call/put,
-expiry, buy/sell, qty, price, fill date+time in ET), and `portfolio/round_trips.py` FIFO-matches
-buys against sells per `(ticker, strike, type, expiry)` group into a round-trips table with actual
-P&L, hold time, and win/loss — plus win-rate-by-hold-time and win-rate-by-entry-hour charts, and
-an activity-correlation picker that shows what Day Trading/Options/Predictions signals were on
-screen during a given trade's hold window (fed by the activity log described under Trading Desk
-below).
+A real fill-logging workflow, not a read-only view: log each option fill as your broker reports
+it (ticker, strike, call/put, expiry, buy/sell, qty, price, fill date+time in ET), and
+`portfolio/round_trips.py` FIFO-matches buys against sells per `(ticker, strike, type, expiry)`
+group into a round-trips table with actual P&L, hold time, and win/loss.
 
-**Can't do:** there is no UI to add or close an *equity* position, so the Positions tab shows "no
-open positions" in practice unless something else writes to the database directly — this
-limitation does not apply to options, which are fully loggable via the Options Log tab. Treat the
-position sizer and stress-test tools as standalone calculators — they work fine with hypothetical
-inputs even with an empty equity book. Options Log is also FIFO-only — if your actual fill order
-in a multi-lot contract isn't chronological in how you enter it, the matched round trips will be
+The analytics below that are built specifically to find patterns worth acting on: a cumulative
+P&L equity curve (is this working, overall?), win rate by hold-time bucket and by entry hour,
+win rate by option type (calls vs. puts) and by day of week, and a per-ticker performance
+breakdown (total/avg P&L, win rate) — plus an activity-correlation picker that shows what Day
+Trading/Options/Predictions/Strategy Lab signals were on screen during a given trade's hold
+window (fed by the activity log described under Trading Desk below).
+
+**Can't do:** there is no UI to log an *equity* position at all — that's tracked only by the
+Dashboard's Open Positions summary, which reflects whatever (if anything) is in the local
+`positions` table, with no way to add to it from the app. This limitation does not apply to
+options, which are fully loggable here. It's also FIFO-only — if your actual fill order in a
+multi-lot contract isn't chronological in how you enter it, the matched round trips will be
 wrong; enter fills in true chronological order, not grouped by buy/sell.
 
 ## 4. Trading Desk — Day Trading, Options, Predictions
 
-One page, three tabs:
+One page, four tabs:
 
 - **Day Trading**: a faster loop for intraday work on one ticker, with a market-status banner
   (PRE-MARKET / MARKET OPEN / AFTER-HOURS, ET clock) up top — VWAP deviation, momentum
@@ -92,7 +91,7 @@ One page, three tabs:
   Brief" button synthesizes all the signals into a plain-English intraday read with a session
   bias (works with Ollama or Claude — see AI Setup in the README). Every Analyze click here (and
   every Options tab view/expiry pick and Predictions generate elsewhere on this page) writes to a
-  local activity log (`portfolio/activity_log.py`) that the Portfolio → Options Log tab's
+  local activity log (`portfolio/activity_log.py`) that the Options Log page's
   "what were you looking at during this trade?" picker reads back later.
   A "Backtest: MACD Bullish Cross" expander lets you test one concrete rule (MACD histogram
   turns up while MACD/Signal are still negative and price is above the 200-day average, 2%
@@ -107,6 +106,10 @@ One page, three tabs:
   been. Rule-based
   strategy suggestions (Iron Condor when IV is high and price is sideways, Bull Put Spread when IV
   is high and trend is up, etc.) with a payoff diagram.
+- **News**: recent headlines for the entered ticker, VADER-scored positive/neutral/negative, with
+  an overall tone and compound-score summary. Display-only — headline-level sentiment, not a
+  trading signal on its own, and it doesn't feed the Suggested Entry/Stop/Target card or any
+  other signal on the page.
 - **Predictions**: XGBoost + Random Forest ensemble trained per-ticker on 2 years of daily data.
   Training auto-selects, per ticker, whichever label horizon (3, 5, or 10 trading days) and
   XGBoost hyperparameters the ensemble is most consistently accurate with — a small grid search
@@ -119,7 +122,9 @@ One page, three tabs:
   (Monte Carlo, seeded from the stock's own historical volatility and the model's own
   probability/expected-move as drift, run over the model's auto-selected horizon) reports a
   day-by-day 25th–75th percentile open/close band — a probability range, not a second
-  point-forecast model, and it carries no walk-forward accuracy figure of its own.
+  point-forecast model, and it carries no walk-forward accuracy figure of its own. A **Prediction
+  horizon** toggle switches to a separate, 15-minute-bar model with its own features/labels/
+  storage — expect a much weaker edge there; see `docs/ML_PREDICTION.md`.
 
 **Can't do:** no real-time tick data (intraday is cached 60s, still delayed by yfinance under the
 hood); ATM Greeks (delta/gamma/theta/vega/rho) are computed via Black-Scholes off each option's
@@ -142,7 +147,7 @@ of confirmed Flag/Pennant patterns the way the MACD Bullish Cross backtest does 
 
 - No brokerage connection or order execution, and no UI to log *equity* positions — the equity
   Positions tab reflects whatever (if anything) is in the local `positions` table. Options fills
-  are the exception — those have a real logging UI (Portfolio → Options Log) with automatic
+  are the exception — those have a real logging UI (the Options Log page) with automatic
   FIFO round-trip P&L.
 - No real-time data — everything runs on yfinance, which is delayed and occasionally
   rate-limited.
@@ -160,8 +165,8 @@ Run Screener weekly for ideas → Research the shortlist for fundamentals/techni
 use Trading Desk's Day Trading tab for intraday timing (VWAP/momentum/trend/candlestick/
 Flag-Pennant signals), Options tab for defined-risk structures, and Predictions tab as a
 secondary confirmation signal, never the primary reason to enter → log any options fills in
-Portfolio → Options Log as you take them, so the round-trip P&L and win-rate-by-hold-time/
-entry-hour analytics build up over time instead of being reconstructed from memory later.
+the Options Log page as you take them, so the round-trip P&L and win-rate-by-hold-time/
+entry-hour, by-ticker, and day-of-week analytics build up over time instead of being reconstructed from memory later.
 
 ---
 
@@ -176,6 +181,8 @@ entry-hour analytics build up over time instead of being reconstructed from memo
 1.2 Check the live index cards for SPY, QQQ, IWM, and VIX. A rising VIX alongside a Downtrend/Bear regime means wider, faster intraday swings — expect your stops to get tested more often. A low, flat VIX in a Bull/Uptrend regime means tighter, slower ranges.
 
 1.3 Scan sector performance (1mo/3mo). If your ticker's sector is lagging badly over 1mo while the index is fine, that's a headwind worth noting before you commit to a long.
+
+1.3b Glance at the Market Regime (Markov) panel below the index cards — a probabilistic second opinion on the same trend (persistence odds and a Bull-minus-Bear signal, fit on the S&P's own history). Treat disagreement between it and the rule-based banner in 1.1 as a reason to weight Step 3's intraday signals more heavily, not as a tie-breaker to resolve on its own.
 
 1.4 **Decision point:**
 
@@ -240,11 +247,11 @@ entry-hour analytics build up over time instead of being reconstructed from memo
 
 7.1 If available, run it and compare its stated bias and invalidation risk against your own conclusions from Steps 3-6. Use it to catch anything you missed, not as a new independent signal.
 
-### Step 8 — Size the trade (Portfolio page risk sizer)
+### Step 8 — Size the trade (Quick Risk Calculator, same Day Trading tab)
 
-8.1 Enter the stop price from Step 4.3/4.4 and your risk % per trade into the position sizer.
+8.1 Open the "Quick Risk Calculator" expander at the bottom of the Day Trading tab — it's on the same page, no navigation needed. Enter the stop price from Step 4.3/4.4 and your risk % per trade.
 
-8.2 Take the resulting share count as your position size. If this is an equity trade, Portfolio positions still cannot be logged from the UI — record it manually outside the app (spreadsheet, journal), the app will not track it for you. If this is an options trade, log the fill in Portfolio → Options Log right after you're filled instead — that one persists, feeds the FIFO round-trip P&L, and lets the win-rate-by-hold-time/entry-hour analytics build up over time.
+8.2 Take the resulting share count as your position size. If this is an equity trade, positions still cannot be logged from the UI — record it manually outside the app (spreadsheet, journal), the app will not track it for you. If this is an options trade, log the fill on the Options Log page right after you're filled instead — that one persists, feeds the FIFO round-trip P&L, and lets the win-rate-by-hold-time/entry-hour analytics build up over time.
 
 ### Step 9 — Pre-trade checklist: Day Trading (final gate, run immediately before entry)
 
@@ -324,13 +331,13 @@ entry-hour analytics build up over time instead of being reconstructed from memo
 
 7.2 If available, run the AI Options Brief and compare its read against your own conclusions from Steps 2-6.
 
-### Step 8 — Size and stress-test (Portfolio page)
+### Step 8 — Size the trade (Quick Risk Calculator, Day Trading tab)
 
-8.1 Run the risk-first position sizer for defined-risk structures to determine contract count relative to account risk %.
+8.1 There's no options-specific sizer — use the same "Quick Risk Calculator" on the Day Trading tab, treating the option's entry/stop premium as the price inputs, to get a contract count relative to account risk %.
 
-8.2 Run the stress-test simulator (SPY ±10%, VIX shocks) to see how this position behaves under a broad market move, keeping in mind it assumes beta≈1 — a single-name gap (earnings, news) will not be reflected here.
+8.2 There is no built-in stress-test tool anymore. Manually sanity-check the position against a SPY ±10% / VIX-shock scenario yourself before sizing up, especially for undefined-risk structures.
 
-8.3 Once filled, log the trade in Portfolio → Options Log (ticker, strike, type, expiry, side, qty, price, fill time) rather than tracking it outside the app — this is what feeds the FIFO round-trip P&L matching and the win-rate-by-hold-time/entry-hour analytics on that same tab.
+8.3 Once filled, log the trade on the Options Log page (ticker, strike, type, expiry, side, qty, price, fill time) rather than tracking it outside the app — this is what feeds the FIFO round-trip P&L matching and the win-rate-by-hold-time/entry-hour analytics there.
 
 ### Step 9 — Pre-trade checklist: Options Trading (final gate, run immediately before entry)
 
@@ -347,4 +354,4 @@ entry-hour analytics build up over time instead of being reconstructed from memo
 
 - **A live broker/data feed** — no real-time quotes, no real-time execution; nothing here should drive split-second decisions.
 - **A backtested strategy** — outside of the single MACD Bullish Cross rule, every other signal (scorecard, screener, IVR strategy map, candlestick patterns, ML predictions) is unvalidated logic, not a proven edge.
-- **Order execution and position tracking** — there is no way to place a trade or log a position from the UI; the Portfolio page's sizer and stress-test are standalone calculators, not a live book.
+- **Order execution and position tracking** — there is no way to place a trade or log an equity position from the UI; the Day Trading tab's Quick Risk Calculator is a standalone calculator, not a live book, and there is no portfolio-level stress-test tool.
