@@ -38,3 +38,15 @@ def get_activity_in_window(start_iso: str, end_iso: str, ticker: Optional[str] =
             ).fetchall()
         logger.debug(f"get_activity_in_window({start_iso} to {end_iso}, ticker={ticker}): {len(rows)} rows")
         return [dict(r) for r in rows]
+
+
+def get_recent_activity(limit: int = 10) -> List[Dict]:
+    """Most recent activity rows across all tickers/event types, newest first."""
+    init_db()
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM activity_log ORDER BY logged_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        logger.debug(f"get_recent_activity(limit={limit}): {len(rows)} rows")
+        return [dict(r) for r in rows]
