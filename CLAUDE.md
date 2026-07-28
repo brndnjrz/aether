@@ -83,6 +83,19 @@ sqlite3 storage/journal.db "select * from activity_log"
 
 ## Gotchas
 
+- **Two prediction models, deliberately separate.** `analysis/ml_prediction.py`
+  is daily; `analysis/intraday_prediction.py` is intraday. Do **not** merge them
+  or add an `interval` param to the daily one — `ml_prediction.predict()` is
+  consumed by four pages (trading, research, watchlist, screener), so changes
+  there have a wide blast radius. The intraday module imports the daily module's
+  `_run_walk_forward` / `_xgb_config` / `_rf_config` / `_filter_directional`
+  **read-only**; keep it that way. Storage is interval-scoped
+  (`SPY_15m_xgb.pkl`) so the two never collide.
+- **Intraday labels need two guards.** Forward returns must not cross a session
+  boundary, and the neutral band must scale with *trailing* volatility (a
+  full-series sigma makes each label depend on future bars). A fixed percentage
+  band calibrated for daily bars labels 66-93% of 15m bars neutral, and neutral
+  rows are dropped before training. See `build_intraday_labels()`.
 - **`st.session_state` cache keys need a date component** or they serve stale
   results for the whole browser session while the rest of the page refreshes.
 - **`st.cache_data(ttl=...)`** — pick a TTL that matches the bar size; a 60s TTL

@@ -1459,13 +1459,221 @@ def _render_predictions_disclaimer():
     )
 
 
+def _render_intraday_predictions():
+    """
+    Intraday (15-min) direction model. Entirely separate from the daily model:
+    its own module, its own feature set, its own {TICKER}_{interval}_* storage
+    files. Nothing here reads or writes a daily model.
+    """
+    try:
+        from analysis.intraday_prediction import (
+            INTERVAL_SPECS,
+            get_intraday_prediction_history,
+            load_metadata,
+            model_exists as intraday_model_exists,
+            predict_intraday,
+            train_intraday_model,
+        )
+    except Exception as exc:
+        logger.warning(f"[trading] intraday prediction module unavailable: {exc}")
+        st.info("Intraday predictions require the ML dependencies. Run `pip install -r requirements.txt`.")
+        return
+
+    st.caption(
+        "Separate model from the daily predictor — intraday features (time of day, "
+        "distance from session VWAP, position in the opening range), volatility-scaled "
+        "labels, and forward returns that never cross the overnight gap."
+    )
+    st.warning("For research only. Not financial advice.", icon="⚠️")
+
+    c_ticker, c_interval, c_train, c_predict = st.columns([2, 1, 1, 1])
+    with c_ticker:
+        ticker = st.text_input(
+            "Ticker Symbol",
+            value=st.session_state.get("intraday_pred_ticker", "SPY"),
+            key="intraday_pred_ticker_input",
+        ).upper().strip()
+    with c_interval:
+        intervals = list(INTERVAL_SPECS)
+        interval = st.selectbox(
+            "Bar interval", intervals, index=intervals.index("15m"),
+            key="intraday_pred_interval",
+        )
+    with c_train:
+        train_btn = st.button(
+            "Train / Update", type="secondary", width="stretch", key="intraday_train_btn",
+            help="Search label horizon and threshold, then validate with 10-fold walk-forward.",
+        )
+    with c_predict:
+        predict_btn = st.button(
+            "Generate Prediction", type="primary", width="stretch", key="intraday_predict_btn",
+        )
+
+    if not ticker:
+        st.info("Enter a ticker symbol to get started.")
+        return
+    st.session_state["intraday_pred_ticker"] = ticker
+
+    meta = load_metadata(ticker, interval)
+    has_model = intraday_model_exists(ticker, interval)
+
+    s1, s2 = st.columns(2)
+    with s1:
+        if has_model:
+            st.markdown(f"✅ **Model status:** Trained ({interval})")
+        else:
+            st.markdown(f"❌ **Model status:** Not trained for {interval}")
+    with s2:
+        if meta.get("trained_at"):
+            try:
+                st.caption(f"Last trained: **{utc_iso_to_et_str(meta['trained_at'], '%Y-%m-%d %I:%M %p ET')}**")
+            except Exception:
+                pass
+        if meta.get("horizon_minutes"):
+            st.caption(f"Horizon: **{meta['horizon_bars']} bars ({meta['horizon_minutes']} min)**")
+
+    st.info(
+        f"Intraday history is capped at ~{INTERVAL_SPECS[interval]['max_period']} by the data "
+        "provider, so this model sees far less regime variety than the daily one and goes "
+        "stale faster. Retrain every few days.",
+        icon="ℹ️",
+    )
+    st.markdown("---")
+
+    if train_btn:
+        logger.info(f"[trading] intraday train pressed for {ticker} {interval}")
+        with st.spinner(f"Training {interval} model for {ticker}..."):
+            result = train_intraday_model(ticker, interval)
+
+        if result.get("error"):
+            logger.warning(f"[trading] intraday training failed for {ticker} {interval}: {result['error']}")
+            st.error(f"Training failed: {result['error']}")
+            return
+
+        acc = result["directional_accuracy"]
+        trade = result["tradeability"]
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Directional Accuracy", f"{acc * 100:.1f}%", f"±{result['accuracy_std'] * 100:.1f}%")
+        m2.metric("Horizon", f"{result['horizon_bars']} bars", f"{result['horizon_minutes']} min")
+        m3.metric("Neutral Band", f"±{result['threshold_pct']:.3f}%")
+        m4.metric("Training Samples", f"{result['n_train']:,}")
+
+        if result["is_reliable"]:
+            st.success(f"Walk-forward: {result['reliability_reason']}")
+        else:
+            st.warning(f"Walk-forward: {result['reliability_reason']}")
+
+        # Accuracy alone is misleading at intraday horizons — show the cost math.
+        if trade["is_tradeable"]:
+            st.success(
+                f"**After costs:** net edge {trade['net_edge_pct']:+.4f}% per trade "
+                f"(avg move {trade['avg_move_pct']:.3f}%, breakeven accuracy "
+                f"{trade['breakeven_accuracy'] * 100:.1f}%)."
+            )
+        else:
+            st.error(
+                f"**Not tradeable after costs.** Net edge {trade['net_edge_pct']:+.4f}% per trade. "
+                f"This model needs {trade['breakeven_accuracy'] * 100:.1f}% accuracy to break even "
+                f"against a {trade['round_trip_cost_pct']:.2f}% round trip, and it scores "
+                f"{acc * 100:.1f}%. A statistically real edge can still lose money."
+            )
+
+        if result.get("session_mask_dropped"):
+            st.caption(
+                f"{result['session_mask_dropped']:,} bars excluded because their forward "
+                "window crossed the session close."
+            )
+        with st.expander("Label search results", expanded=False):
+            st.dataframe(pd.DataFrame(result["label_search"]), hide_index=True, width="stretch")
+
+    if predict_btn:
+        logger.info(f"[trading] intraday predict pressed for {ticker} {interval}")
+        with st.spinner(f"Predicting {interval} direction for {ticker}..."):
+            result = predict_intraday(ticker, interval)
+
+        if result.get("error"):
+            logger.warning(f"[trading] intraday predict failed for {ticker} {interval}: {result['error']}")
+            st.error(result["error"])
+            return
+
+        direction = result["direction"]
+        icon = {"bullish": "🟢", "bearish": "🔴"}.get(direction, "⚪")
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric(f"{icon} Direction", direction.upper(), f"Confidence: {result['confidence'].title()}")
+        p2.metric("Bull Probability", f"{result['probability'] * 100:.0f}%", "Neutral zone: 45–55%")
+        p3.metric("Horizon", f"{result['horizon_minutes']} min", f"{result['horizon_bars']} bars")
+        p4.metric("Model Accuracy", f"{result['model_accuracy'] * 100:.1f}%")
+
+        trade = result["tradeability"]
+        if not trade["is_tradeable"]:
+            st.warning(
+                f"This model's edge does not survive costs (net {trade['net_edge_pct']:+.4f}% "
+                f"per trade). Treat the signal as information, not a trade.",
+                icon="⚠️",
+            )
+        st.caption(
+            f"Signal from the {result['bar_timestamp']} bar at "
+            f"{result['price_at_prediction']:.2f} · neutral band ±{result['threshold_pct']:.3f}%"
+        )
+        log_activity("intraday_prediction_generated", ticker, result)
+
+    st.markdown("---")
+    st.markdown(f"#### Prediction History — {ticker} ({interval})")
+    hist = get_intraday_prediction_history(ticker, interval)
+    if hist.empty:
+        st.info("No intraday predictions logged yet for this ticker and interval.")
+    else:
+        resolved = hist[hist["correct"].notna()]
+        if not resolved.empty:
+            hit_rate = resolved["correct"].astype(bool).mean() * 100
+            h1, h2 = st.columns(2)
+            h1.metric("Logged Predictions", len(hist))
+            h2.metric("Resolved Hit Rate", f"{hit_rate:.1f}%", f"{len(resolved)} resolved")
+        else:
+            st.caption(
+                f"{len(hist)} logged · none resolved yet — a prediction resolves once its "
+                "horizon elapses within the same session."
+            )
+        display = hist.copy()
+        display["date"] = display["date"].dt.tz_convert(MARKET_TZ).dt.strftime("%Y-%m-%d %I:%M %p ET")
+        st.dataframe(display, hide_index=True, width="stretch")
+
+
 def _render_predictions():
+    """
+    Dispatcher for the Predictions tab. Defaults to Daily, which renders the
+    original code path unchanged — the intraday model lives in its own module
+    (analysis/intraday_prediction.py) and its own storage files, so selecting it
+    cannot affect daily models or the Research/Watchlist/Screener pages.
+    """
     st.subheader("AI Price Predictions")
 
     if not _ML_AVAILABLE:
         st.info("ML predictions require the `scikit-learn`, `xgboost`, and `narwhals` packages. Run `pip install -r requirements.txt`.")
         return
 
+    horizon_mode = st.radio(
+        "Prediction horizon",
+        ["Daily (swing)", "Intraday (15-min bars)"],
+        index=0,
+        horizontal=True,
+        key="pred_horizon_mode",
+        help=(
+            "Daily predicts direction several trading days out. Intraday predicts "
+            "direction a few bars (minutes) out using a separate model with its own "
+            "features, labels, and stored files."
+        ),
+    )
+
+    if horizon_mode.startswith("Daily"):
+        _render_daily_predictions()
+    else:
+        _render_intraday_predictions()
+
+
+def _render_daily_predictions():
+    if not _ML_AVAILABLE:
+        return
     st.caption("ML ensemble model — XGBoost + Random Forest — trained on 18 technical features derived from historical price action.")
     st.warning("For research only. Not financial advice. Accuracy varies by market conditions.", icon="⚠️")
     st.markdown("")

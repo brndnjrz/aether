@@ -95,6 +95,20 @@ The Predictions tab (`analysis/ml_prediction.py`) trains an **XGBoost + Random F
 
 A model is only accepted if its mean walk-forward directional accuracy is ≥ 52% with a std-dev across folds ≤ 8%; otherwise training reports the shortfall instead of saving a model that hasn't earned trust.
 
+### Intraday direction model (15-min)
+
+`analysis/intraday_prediction.py` is a **separate** model for intraday bars, not the daily model with a different interval. It is separate on purpose: `ml_prediction.predict()` is consumed by four pages (Trading Desk, Research, Watchlist, Screener), so an interval parameter threaded through it would put all four at risk. The intraday module instead imports the daily module's walk-forward runner and model configs read-only, and writes only `{TICKER}_{interval}_*` files — a daily `SPY_xgb.pkl` and its prediction history are never opened for writing.
+
+Three things differ from the daily model, all correctness rather than plumbing:
+
+- **Volatility-scaled labels.** A fixed ±0.5% neutral band calibrated for daily bars labels 66–93% of 15m bars neutral, and neutral rows are dropped before training — leaving a small sample drawn only from high-volatility windows. The band is instead `k × σ × √horizon`, where σ is a *trailing* estimate over five sessions (a full-series σ would make each label depend on future bars).
+- **Session-boundary masking.** `pct_change(n).shift(-n)` on an intraday index silently spans the overnight gap for the last n bars of every session. Those rows are dropped rather than training the model to predict a gap it cannot see. σ likewise excludes the gap return, which would otherwise inflate the band.
+- **Cost-aware reporting.** At a 75-minute horizon the average move is ~0.35%, so spread plus commission consumes much of any edge. The UI reports net edge after costs and the breakeven accuracy alongside raw accuracy — a 53%-accurate intraday model can be statistically real and still lose money.
+
+Intraday features drop `day_of_week` (near-useless inside a 60-day window) and add time of day, distance from session VWAP in ATRs, position in the session range, and position relative to the opening range.
+
+Caveat worth stating plainly: intraday direction prediction is a much harder problem than daily, attacked elsewhere with order-flow data this app does not have. Expect accuracy nearer 50–53% and expect costs to consume most of it.
+
 ## Setup Environment Using Anaconda
 
 1. Download and install [Anaconda](https://www.anaconda.com/download) or [Miniconda](https://docs.conda.io/en/latest/miniconda.html)
@@ -163,7 +177,7 @@ Four tabs in one page:
 - **Day Trading** — VWAP deviation, momentum, volume ratio, trend alignment (all interval-aware except Trend Alignment, which stays on daily SMA20/50/200 + EMA50 by design), candlestick pattern detection, and Flag/Pennant continuation-pattern detection (`analysis/flag_pennant_detection.py` + `flag_pennant_scoring.py`) drawn directly on the chart with a 0–100 confidence score. Signals combine into a Suggested Entry/Stop/Target card via majority vote, plus an AI Day Trading Brief and a MACD-cross backtest.
 - **Options** — IV Rank/Percentile, a GARCH(1,1) forward volatility forecast compared against ATM IV, the full chain, P&L diagrams, Black-Scholes Greeks, and an AI Options Brief.
 - **News** — headline sentiment for the entered ticker, same VADER scoring as Research.
-- **Predictions** — train/retrain the ML ensemble and generate a direction signal with a simulated price path. See [AI & ML Model Overview](#ai--ml-model-overview) and `docs/ML_PREDICTION.md` for the full technical writeup.
+- **Predictions** — train/retrain the ML ensemble and generate a direction signal with a simulated price path. A **Prediction horizon** toggle switches between **Daily (swing)** — the original model, unchanged — and **Intraday (15-min bars)**, a separate model in `analysis/intraday_prediction.py` with its own features, labels, and storage files. See [AI & ML Model Overview](#ai--ml-model-overview) and `docs/ML_PREDICTION.md` for the full technical writeup.
 
 For the day-by-day and week-by-week rhythm this app is designed around, see `docs/workflow.md`.
 
@@ -230,7 +244,8 @@ aether/
 │   ├── orbc_strategy.py       # Opening Range Breakout Confirmation: opening range, confirmation state machine, backtest
 │   ├── volume_profile.py      # Volume-by-price profile — POC/value-area proxy used by mtf_strategy.py
 │   ├── backtest.py            # Generic long-only backtest engine + MACD bullish-cross signal
-│   ├── ml_prediction.py       # XGBoost + RF ensemble: train, predict, evaluate
+│   ├── ml_prediction.py       # XGBoost + RF ensemble (daily): train, predict, evaluate
+│   ├── intraday_prediction.py # Separate intraday (15m) direction model — own features/labels/storage
 │   ├── price_projection.py    # Monte Carlo price-path simulation
 │   ├── options_pricing.py     # Black-Scholes pricing, Greeks, implied-vol solver
 │   ├── volatility_forecast.py # GARCH(1,1) forward volatility forecast
@@ -265,7 +280,8 @@ aether/
 ├── tests/
 │   ├── conftest.py             # Shared fixtures — synthetic daily + intraday OHLCV, isolated storage dir
 │   ├── test_ml_prediction.py   # Regression suite for analysis/ml_prediction.py (see Reliability & Verification)
-│   └── test_orbc_strategy.py   # ORBC confirmation state machine, filters, stops/targets, direction-aware P&L
+│   ├── test_orbc_strategy.py   # ORBC confirmation state machine, filters, stops/targets, direction-aware P&L
+│   └── test_intraday_prediction.py  # Intraday label masking, vol-scaled bands, storage isolation from daily
 └── storage/                    # Persisted ML models and prediction logs (auto-created)
     ├── {TICKER}_xgb.pkl
     ├── {TICKER}_rf.pkl
@@ -296,7 +312,7 @@ Cache TTLs (`config/settings.py`): price data 5 min, fundamentals 1 hour, option
 
 Reliability rests on three mechanisms:
 
-1. **A `pytest` regression suite** (`tests/`, 57 tests) covering two areas. `test_ml_prediction.py` exercises `analysis/ml_prediction.py` end-to-end — module import (the exact failure mode that silently killed the Predictions tab for 11 days when a dependency in the sklearn/xgboost/narwhals chain broke), train/predict/evaluate on synthetic OHLCV data, the reliability gate correctly rejecting a pure random walk, and the predict → save_prediction → get_prediction_history persistence round-trip. `test_orbc_strategy.py` pins the ORBC confirmation state machine against hand-laid-out intraday sessions: that a single breakout close never signals, that a close back inside resets the count, that filters fall through from the 2nd to the 3rd close, and that short P&L carries the correct sign. Run it with `pytest tests/ -q`. No network access required or used.
+1. **A `pytest` regression suite** (`tests/`, 91 tests) covering two areas. `test_ml_prediction.py` exercises `analysis/ml_prediction.py` end-to-end — module import (the exact failure mode that silently killed the Predictions tab for 11 days when a dependency in the sklearn/xgboost/narwhals chain broke), train/predict/evaluate on synthetic OHLCV data, the reliability gate correctly rejecting a pure random walk, and the predict → save_prediction → get_prediction_history persistence round-trip. `test_orbc_strategy.py` pins the ORBC confirmation state machine against hand-laid-out intraday sessions: that a single breakout close never signals, that a close back inside resets the count, that filters fall through from the 2nd to the 3rd close, and that short P&L carries the correct sign. Run it with `pytest tests/ -q`. No network access required or used.
 2. **The ML model self-gates on quality.** Training runs anchored walk-forward validation and only saves a model if it clears a 52% mean directional accuracy floor with std-dev ≤ 8% across folds; a model that doesn't clear the bar is reported as such instead of silently saved.
 3. **Manual verification checklists.** `docs/VERIFICATION_CHECKLIST.md` documents the manual steps used to validate timezone handling, activity logging, and the options FIFO round-trip matcher against real fill data.
 

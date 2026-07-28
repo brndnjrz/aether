@@ -118,3 +118,75 @@ def make_intraday_session(
 def intraday_session_factory():
     """Exposes make_intraday_session() to tests as a fixture."""
     return make_intraday_session
+
+
+def make_intraday_history(
+    n_sessions: int = 40,
+    bars_per_session: int = 26,
+    interval_minutes: int = 15,
+    start_date: str = "2026-05-04",
+    seed: int = 11,
+    daily_vol: float = 0.010,
+    overnight_gap_vol: float = 0.006,
+    tz: str = "America/New_York",
+) -> pd.DataFrame:
+    """
+    Multi-session intraday OHLCV on a realistic bar grid, with a deliberate
+    overnight gap between sessions.
+
+    The gap matters: it is what makes session-boundary label masking testable.
+    Bars run 09:30 onward for `bars_per_session` bars per weekday, so the index
+    has real discontinuities rather than being one continuous series.
+    """
+    rng = np.random.default_rng(seed)
+    per_bar_vol = daily_vol / np.sqrt(bars_per_session)
+
+    frames = []
+    price = 500.0
+    for day in pd.bdate_range(start_date, periods=n_sessions):
+        rets = rng.normal(0.0, per_bar_vol, bars_per_session)
+        close = price * np.cumprod(1 + rets)
+        idx = pd.date_range(
+            pd.Timestamp(f"{day.date()} 09:30", tz=tz),
+            periods=bars_per_session,
+            freq=f"{interval_minutes}min",
+        )
+        open_ = np.concatenate([[close[0]], close[:-1]])
+        frames.append(pd.DataFrame(
+            {
+                "Open": open_,
+                "High": np.maximum(open_, close) * (1 + np.abs(rng.normal(0, 0.0004, bars_per_session))),
+                "Low": np.minimum(open_, close) * (1 - np.abs(rng.normal(0, 0.0004, bars_per_session))),
+                "Close": close,
+                "Volume": rng.integers(200_000, 2_000_000, bars_per_session),
+            },
+            index=idx,
+        ))
+        # Jump overnight so the gap is not just a continuation of the walk.
+        price = close[-1] * (1 + rng.normal(0.0, overnight_gap_vol))
+
+    return pd.concat(frames)
+
+
+@pytest.fixture
+def intraday_indicators_df():
+    """
+    40 sessions of synthetic 15m bars through the real calculate_indicators() —
+    the shape train_intraday_model()/predict_intraday() expect as `df`.
+    """
+    from analysis.indicators import calculate_indicators
+
+    return calculate_indicators(make_intraday_history())
+
+
+@pytest.fixture
+def isolated_intraday_storage(tmp_path, monkeypatch):
+    """
+    Point analysis.intraday_prediction's storage at a temp dir so tests never
+    read or write the real storage/ directory, which holds live daily models
+    and real prediction history.
+    """
+    import analysis.intraday_prediction as ip
+
+    monkeypatch.setattr(ip, "_STORAGE_DIR", tmp_path)
+    return tmp_path
