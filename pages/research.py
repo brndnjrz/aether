@@ -100,31 +100,47 @@ def render():
     # ── Scorecard ─────────────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("Fundamental Scorecard")
-    sc1, sc2, sc3, sc4 = st.columns(4)
-    q = fund_report.get("quality", {}).get("score", 0)
-    v = fund_report.get("value", {}).get("score", 0)
-    g = fund_report.get("growth", {}).get("score", 0)
-    comp = fund_report.get("composite_score", 0)
-    verdict = fund_report.get("verdict", "")
 
-    def score_color(s):
-        if s >= 70: return "🟢"
-        if s >= 50: return "🟡"
-        if s >= 35: return "🟠"
-        return "🔴"
+    if fund_report.get("error"):
+        logger.warning(f"[research] Scorecard: no fundamental data for {ticker} — {fund_report['error']}")
+        st.info(
+            f"No fundamental data available for **{ticker}**. This is normal for ETFs and "
+            "funds (SPY, QQQ, IWM, ...) — they don't file company financials, so there's no "
+            "revenue, margin, or earnings data to score. Try an individual stock ticker "
+            "(e.g. AAPL, MSFT) to see this section populated."
+        )
+    else:
+        sc1, sc2, sc3, sc4 = st.columns(4)
+        q = fund_report.get("quality", {}).get("score", 0)
+        v = fund_report.get("value", {}).get("score", 0)
+        g = fund_report.get("growth", {}).get("score", 0)
+        comp = fund_report.get("composite_score", 0)
+        verdict = fund_report.get("verdict", "")
 
-    sc1.metric(f"{score_color(q)} Quality", f"{q}/100")
-    sc2.metric(f"{score_color(v)} Value", f"{v}/100")
-    sc3.metric(f"{score_color(g)} Growth", f"{g}/100")
-    sc4.metric(f"{'🟢' if comp >= 60 else '🟡' if comp >= 40 else '🔴'} Composite", f"{comp}/100 — {verdict}")
+        def score_color(s):
+            if s >= 70: return "🟢"
+            if s >= 50: return "🟡"
+            if s >= 35: return "🟠"
+            return "🔴"
 
-    # Red flags
-    flags = fund_report.get("red_flags", [])
-    if flags:
-        with st.expander(f"⚠️ {len(flags)} Red Flag(s) Detected", expanded=True):
-            for flag in flags:
-                color = "🔴" if flag["severity"] == "danger" else "🟡"
-                st.markdown(f"{color} **{flag['flag']}** — {flag['detail']}")
+        sc1.metric(f"{score_color(q)} Quality", f"{q}/100")
+        sc2.metric(f"{score_color(v)} Value", f"{v}/100")
+        sc3.metric(f"{score_color(g)} Growth", f"{g}/100")
+        sc4.metric(f"{'🟢' if comp >= 60 else '🟡' if comp >= 40 else '🔴'} Composite", f"{comp}/100 — {verdict}")
+        st.caption(
+            "Quality = profitability & returns on capital. Value = price relative to "
+            "earnings/cash flow. Growth = revenue & earnings trajectory. These are built "
+            "from quarterly financial filings, so day to day they'll barely move — expect "
+            "a visible change only after earnings, not every session."
+        )
+
+        # Red flags
+        flags = fund_report.get("red_flags", [])
+        if flags:
+            with st.expander(f"⚠️ {len(flags)} Red Flag(s) Detected", expanded=True):
+                for flag in flags:
+                    color = "🔴" if flag["severity"] == "danger" else "🟡"
+                    st.markdown(f"{color} **{flag['flag']}** — {flag['detail']}")
 
     # ── ML Direction Signal ───────────────────────────────────────────────────
     if _ML_AVAILABLE:
@@ -210,7 +226,7 @@ def render():
         _render_indicator_panel(df, signals, regime)
 
     with fund_tab:
-        _render_fundamentals(fund_report, df_raw)
+        _render_fundamentals(fund_report, df_raw, ticker)
 
     with options_tab:
         _render_options_tab(ticker, current_price, regime)
@@ -352,7 +368,19 @@ def _render_indicator_panel(df: pd.DataFrame, signals: dict, regime: dict):
             st.write(f"OBV Trend: **{obv_trend}**")
 
 
-def _render_fundamentals(report: dict, df: pd.DataFrame):
+def _render_fundamentals(report: dict, df: pd.DataFrame, ticker: str = ""):
+    if report.get("error"):
+        st.info(
+            f"No fundamental data available for **{ticker or 'this ticker'}** — likely an ETF "
+            "or fund with no company financials to report. Try an individual stock ticker instead."
+        )
+        return
+
+    st.caption(
+        "The raw numbers behind the Fundamental Scorecard above, plus the points breakdown "
+        "for each score — use this when you want to see *why* a score is what it is, not just the number."
+    )
+
     f = report.get("raw", {})
 
     col1, col2, col3 = st.columns(3)
@@ -404,6 +432,14 @@ def _render_fundamentals(report: dict, df: pd.DataFrame):
 
 def _render_options_tab(ticker: str, price: float, regime: dict):
     st.subheader(f"Options Analysis — {ticker}")
+    st.caption(
+        "**How to read this:** IV Rank tells you whether options are currently expensive or "
+        "cheap relative to the past year — above 60 means expensive (favor selling premium), "
+        "below 30 means cheap (favor buying premium). The Strategy Recommendation below "
+        "combines that reading with the current trend into one starting idea — a prompt for "
+        "your own analysis, not a signal to trade automatically. Hover the ⓘ on any metric "
+        "below for what it specifically means."
+    )
     with st.spinner("Fetching real options data..."):
         iv_metrics = calculate_iv_rank(ticker)
 
@@ -500,6 +536,17 @@ def _render_ai_brief(ticker: str, fund_report: dict, signals: dict, regime: dict
         st.info("Add ANTHROPIC_API_KEY to .env, or run Ollama locally, to enable AI features")
         st.code("ANTHROPIC_API_KEY=sk-ant-...")
         return
+
+    st.caption(
+        "**Generate Stock Brief** — a plain-English read on everything already computed above "
+        "(fundamentals, technicals, market regime), written as one investment case. Best used "
+        "*after* you've formed your own view, to pressure-test it or catch something you "
+        "missed — not as a first opinion.  \n"
+        "**Generate Thesis Questions** — a set of questions meant to challenge your own thesis "
+        "before you size a trade, not a summary."
+    )
+    if fund_report.get("error"):
+        st.caption("Note: no fundamental data for this ticker (likely an ETF) — the brief below will lean on technicals and regime only.")
 
     col1, col2 = st.columns(2)
     with col1:
