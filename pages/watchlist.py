@@ -4,6 +4,7 @@ those tickers (gap %, relative volume, ATR%, ML bias, and a today's-session
 price envelope), so the weekly plan and the day-of check live in one place
 instead of re-running the Screener or re-typing tickers every morning.
 """
+import logging
 import streamlit as st
 import pandas as pd
 import sys, os
@@ -14,6 +15,8 @@ from analysis.indicators import calculate_indicators
 from analysis.price_projection import simulate_intraday_path
 from portfolio.watchlist import add_to_watchlist, get_watchlist, remove_from_watchlist
 
+logger = logging.getLogger(__name__)
+
 try:
     from analysis.ml_prediction import predict as ml_predict
     from pathlib import Path
@@ -21,6 +24,7 @@ try:
     _ML_AVAILABLE = True
 except Exception:
     _ML_AVAILABLE = False
+    logger.debug("[watchlist] ML prediction module unavailable — ML Signal column will show placeholders")
 
 
 def render():
@@ -46,14 +50,18 @@ def _render_add_form():
         submitted = st.form_submit_button("Add to Watchlist", type="primary")
 
     if submitted:
+        logger.info("[watchlist] 'Add to Watchlist' form submitted")
         if not ticker:
+            logger.warning("[watchlist] Add-to-watchlist blocked: no ticker entered")
             st.warning("Enter a ticker first.")
             return
         existing = {i["ticker"] for i in get_watchlist()}
         if ticker in existing:
+            logger.warning(f"[watchlist] Add-to-watchlist blocked: {ticker} already on watchlist")
             st.warning(f"{ticker} is already on your watchlist.")
             return
         add_to_watchlist(ticker, notes, target or None, stop or None)
+        logger.info(f"[watchlist] Added {ticker} to watchlist")
         st.success(f"Added {ticker} to your watchlist.")
         st.rerun()
 
@@ -77,9 +85,11 @@ def _render_list(items: list):
                 st.write(item["plan_notes"] or "—")
             with c3:
                 if st.button("Open in Trading Desk", key=f"open_{item['id']}"):
+                    logger.info(f"[watchlist] 'Open in Trading Desk' pressed for {item['ticker']}")
                     st.session_state["dt_lookup_ticker"] = item["ticker"]
                     st.switch_page("pages/trading.py")
                 if st.button("Remove", key=f"remove_{item['id']}"):
+                    logger.info(f"[watchlist] 'Remove' pressed for {item['ticker']}")
                     remove_from_watchlist(item["id"])
                     st.rerun()
 
@@ -95,6 +105,7 @@ def _render_daily_check(items: list):
     if not st.button("Run Daily Check", type="primary"):
         return
 
+    logger.info(f"[watchlist] 'Run Daily Check' button pressed for {len(items)} tickers")
     rows = []
     progress = st.progress(0)
     tickers = [i["ticker"] for i in items]
@@ -104,14 +115,19 @@ def _render_daily_check(items: list):
             row = _check_ticker(ticker)
             if row:
                 rows.append(row)
-        except Exception:
+            else:
+                logger.debug(f"[watchlist] Daily check for {ticker} came back empty (insufficient history)")
+        except Exception as exc:
+            logger.debug(f"[watchlist] Daily check for {ticker} raised an exception: {exc}")
             continue
     progress.empty()
 
     if not rows:
+        logger.warning(f"[watchlist] Daily check completed: no data fetched for any of {len(tickers)} tickers")
         st.warning("Couldn't fetch data for any watchlist ticker right now.")
         return
 
+    logger.info(f"[watchlist] Daily check completed: {len(rows)}/{len(tickers)} tickers returned data")
     df = pd.DataFrame(rows).sort_values("Vol Ratio", ascending=False)
     st.dataframe(df, hide_index=True, width="stretch")
     st.caption("""

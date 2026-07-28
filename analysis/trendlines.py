@@ -89,6 +89,9 @@ def fit_trendlines(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> Dict
 
     support = _optimize_slope(True, lower_pivot, coefs[0], low)
     resistance = _optimize_slope(False, upper_pivot, coefs[0], high)
+    logger.debug(
+        f"fit_trendlines: support_slope={round(support[0], 6)} resistance_slope={round(resistance[0], 6)}"
+    )
     return {"support": support, "resistance": resistance}
 
 
@@ -109,6 +112,9 @@ def detect_recent_trendlines(df: pd.DataFrame, lookback: int = TRENDLINE_LOOKBAC
                          a line it was not part of fitting
     """
     if df is None or len(df) < lookback + 1:
+        logger.debug(
+            f"detect_recent_trendlines: insufficient history — have {0 if df is None else len(df)}, need {lookback + 1}."
+        )
         return None
 
     window = df.iloc[-(lookback + 1):-1]
@@ -136,6 +142,10 @@ def detect_recent_trendlines(df: pd.DataFrame, lookback: int = TRENDLINE_LOOKBAC
     elif current_close < support_line[-1]:
         breakout = "down"
 
+    logger.debug(
+        f"detect_recent_trendlines: lookback={lookback} breakout={breakout} "
+        f"projected_support={float(support_line[-1]):.4f} projected_resistance={float(resist_line[-1]):.4f}"
+    )
     return {
         "index": df.index[-(lookback + 1):],
         "support_line": support_line,
@@ -160,6 +170,9 @@ def detect_swing_points(df: pd.DataFrame, atr_lookback: int = SWING_ATR_LOOKBACK
     "confirmed_index", "confirmed_timestamp"} in chronological order.
     """
     if df is None or len(df) < atr_lookback + 2:
+        logger.debug(
+            f"detect_swing_points: insufficient history — have {0 if df is None else len(df)}, need {atr_lookback + 2}."
+        )
         return []
 
     high = df["High"].to_numpy()
@@ -219,4 +232,5 @@ def detect_swing_points(df: pd.DataFrame, atr_lookback: int = SWING_ATR_LOOKBACK
                 up_move = True
                 pend_max, pend_max_i = high[i], i
 
+    logger.debug(f"detect_swing_points: found {len(extremes)} confirmed swing points (atr_lookback={atr_lookback}).")
     return extremes

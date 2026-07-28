@@ -16,13 +16,17 @@ from the breakout price (Edwards & Magee convention for flag/pennant
 continuation). A secondary fixed 2R target is also recorded so the two
 conventions can be compared empirically once enough trades accumulate.
 """
+import logging
 from typing import Any, Dict
 
 import pandas as pd
 
+logger = logging.getLogger(__name__)
+
 
 def _col(df: pd.DataFrame, name: str, index: int, default: float = float("nan")) -> float:
     if name not in df.columns:
+        logger.warning(f"_col: column '{name}' missing from df — falling back to default={default}.")
         return default
     val = df[name].iloc[index]
     return float(val) if pd.notna(val) else default
@@ -58,6 +62,11 @@ def evaluate_pattern_trade(
     risk = abs(entry_price - stop_price)
     reward = abs(target_price - entry_price)
     target_2r = entry_price + 2 * risk if bullish else entry_price - 2 * risk
+
+    logger.debug(
+        f"evaluate_pattern_trade: entry_price={entry_price:.4f} stop_price={stop_price:.4f} "
+        f"target_price={target_price:.4f} bullish={bullish}"
+    )
 
     exit_price = None
     exit_reason = "open"
@@ -106,4 +115,8 @@ def evaluate_pattern_trade(
         "holding_period_bars": holding_period_bars,
         "exit_reason": exit_reason,
     })
+    logger.info(
+        f"evaluate_pattern_trade: complete — exit_reason={exit_reason} "
+        f"holding_period_bars={holding_period_bars} return_pct={pattern['return_pct']}"
+    )
     return pattern

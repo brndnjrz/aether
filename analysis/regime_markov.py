@@ -131,6 +131,7 @@ def analyze_regime_markov(df: pd.DataFrame, ticker: str = "", forecast_steps: in
     — needs SMA_200, ADX, Close.
     """
     if df is None or df.empty or len(df) < MIN_BARS:
+        logger.warning(f"analyze_regime_markov: insufficient history for {ticker or 'unknown ticker'} — need >={MIN_BARS} bars, got {0 if df is None else len(df)}")
         return {"available": False, "reason": f"Need at least {MIN_BARS} bars of history, got {len(df) if df is not None else 0}."}
 
     states = label_trend_states(df)
@@ -143,6 +144,11 @@ def analyze_regime_markov(df: pd.DataFrame, ticker: str = "", forecast_steps: in
     persistence = regime_persistence(matrix)
     stationary = stationary_distribution(matrix)
     forecast = forecast_regime_path(matrix, current_state, steps=forecast_steps)
+
+    logger.info(
+        f"analyze_regime_markov: {ticker or 'unknown ticker'} complete — current_state={current_state} "
+        f"signal={signal_info['signal']} confidence={signal_info['confidence']}"
+    )
 
     return {
         "available": True,

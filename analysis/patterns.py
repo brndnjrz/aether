@@ -4,8 +4,12 @@ Ported from docs/Identifying-Chart-Patterns.md (Fidelity/Kirkpatrick reference).
 No ML, no external data — pure price-action geometry, same category as the
 app's other rule-based signals (VWAP deviation, momentum count, trend alignment).
 """
-import pandas as pd
+import logging
 from typing import Any, Dict, Optional
+
+import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 DOJI_BODY_RATIO = 0.1
 
@@ -50,6 +54,7 @@ def detect_candlestick_pattern(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     else {"name": str, "direction": "bull"|"bear"|"neutral", "note": str}.
     """
     if df is None or len(df) < 4:
+        logger.warning(f"detect_candlestick_pattern: not enough bars to detect a pattern (len={0 if df is None else len(df)}).")
         return None
 
     last = df.iloc[-1]
@@ -60,33 +65,44 @@ def detect_candlestick_pattern(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     ph, pl = float(prev["High"]), float(prev["Low"])
 
     if _is_bullish_engulfing(po, pc, o, c):
-        return {
+        pattern = {
             "name": "Bullish Engulfing", "direction": "bull",
             "note": "Prior bearish candle fully engulfed by today's bullish candle — buyers took control",
         }
+        logger.debug(f"detect_candlestick_pattern: found {pattern['name']} ({pattern['direction']})")
+        return pattern
     if _is_bearish_engulfing(po, pc, o, c):
-        return {
+        pattern = {
             "name": "Bearish Engulfing", "direction": "bear",
             "note": "Prior bullish candle fully engulfed by today's bearish candle — sellers took control",
         }
+        logger.debug(f"detect_candlestick_pattern: found {pattern['name']} ({pattern['direction']})")
+        return pattern
 
     if _is_doji(o, h, l, c):
-        return {
+        pattern = {
             "name": "Doji", "direction": "neutral",
             "note": "Open ≈ close — indecision, possible warning of a trend change",
         }
+        logger.debug(f"detect_candlestick_pattern: found {pattern['name']} ({pattern['direction']})")
+        return pattern
 
     if _is_inside_bar(ph, pl, h, l):
-        return {
+        pattern = {
             "name": "Inside Bar", "direction": "neutral",
             "note": "Today's range is inside yesterday's — volatility contraction, watch for a breakout",
         }
+        logger.debug(f"detect_candlestick_pattern: found {pattern['name']} ({pattern['direction']})")
+        return pattern
 
     ranges = (df["High"] - df["Low"]).tail(4).tolist()
     if _is_nr4(ranges):
-        return {
+        pattern = {
             "name": "NR4", "direction": "neutral",
             "note": "Narrowest range of the last 4 bars — coiling before a potential breakout",
         }
+        logger.debug(f"detect_candlestick_pattern: found {pattern['name']} ({pattern['direction']})")
+        return pattern
 
+    logger.debug("detect_candlestick_pattern: no pattern matched on the latest bar.")
     return None

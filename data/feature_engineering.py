@@ -361,6 +361,7 @@ def build_predict_row(df: pd.DataFrame) -> Optional[pd.DataFrame]:
             logger.warning("build_predict_row: NaN in feature row — insufficient warm-up data")
             return None
 
+        logger.debug("build_predict_row: built 1-row feature vector for inference")
         return result
 
     except Exception as exc:

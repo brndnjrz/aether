@@ -79,7 +79,12 @@ Please produce a structured brief with:
 
 Be direct. No fluff. If the data is weak, say so."""
 
-    return ask_claude(prompt, system=BRIEF_SYSTEM, max_tokens=600, ollama_model=OLLAMA_MODEL_STOCK_BRIEF)
+    result = ask_claude(prompt, system=BRIEF_SYSTEM, max_tokens=600, ollama_model=OLLAMA_MODEL_STOCK_BRIEF)
+    if result:
+        logger.info(f"Stock brief generated for {ticker} ({len(result)} chars)")
+    else:
+        logger.warning(f"Stock brief generation returned no result for {ticker}")
+    return result
 
 
 def generate_options_brief(
@@ -115,7 +120,12 @@ Provide:
 
 Be specific and concise."""
 
-    return ask_claude(prompt, system=BRIEF_SYSTEM, max_tokens=400, ollama_model=OLLAMA_MODEL_OPTIONS_BRIEF)
+    result = ask_claude(prompt, system=BRIEF_SYSTEM, max_tokens=400, ollama_model=OLLAMA_MODEL_OPTIONS_BRIEF)
+    if result:
+        logger.info(f"Options brief generated for {ticker} ({len(result)} chars)")
+    else:
+        logger.warning(f"Options brief generation returned no result for {ticker}")
+    return result
 
 
 def generate_daytrading_brief(
@@ -147,7 +157,12 @@ Provide:
 
 Be direct and concise. This is intraday context, not a multi-day thesis."""
 
-    return ask_claude(prompt, system=BRIEF_SYSTEM, max_tokens=350, ollama_model=OLLAMA_MODEL_DAYTRADING_BRIEF)
+    result = ask_claude(prompt, system=BRIEF_SYSTEM, max_tokens=350, ollama_model=OLLAMA_MODEL_DAYTRADING_BRIEF)
+    if result:
+        logger.info(f"Day trading brief generated for {ticker} ({len(result)} chars)")
+    else:
+        logger.warning(f"Day trading brief generation returned no result for {ticker}")
+    return result
 
 
 def generate_thesis_prompt(ticker: str, name: str) -> Optional[str]:
@@ -163,7 +178,12 @@ Format as a numbered list. Each question should:
 
 Also include: What is the ONE number to watch quarterly that would confirm or invalidate a bull thesis?"""
 
-    return ask_claude(prompt, system=BRIEF_SYSTEM, max_tokens=350, ollama_model=OLLAMA_MODEL_THESIS)
+    result = ask_claude(prompt, system=BRIEF_SYSTEM, max_tokens=350, ollama_model=OLLAMA_MODEL_THESIS)
+    if result:
+        logger.info(f"Thesis prompt generated for {ticker} ({len(result)} chars)")
+    else:
+        logger.warning(f"Thesis prompt generation returned no result for {ticker}")
+    return result
 
 
 def format_ai_markdown(text: str) -> str:

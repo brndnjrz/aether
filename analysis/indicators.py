@@ -24,6 +24,7 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     Output: Same DataFrame with indicator columns appended.
     """
     if df is None or df.empty or len(df) < 14:
+        logger.warning(f"calculate_indicators: insufficient input — {0 if df is None else len(df)} rows (need 14).")
         return df
 
     out = df.copy()
@@ -128,6 +129,8 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["above_200ma"] = out["Close"] > out["SMA_200"]
     out["above_50ma"] = out["Close"] > out["SMA_50"]
 
+    logger.debug(f"calculate_indicators: added indicators — {len(out)} rows, {len(out.columns) - len(df.columns)} new columns")
+
     return out
 
 
@@ -159,13 +162,15 @@ def detect_rsi_divergence(df: pd.DataFrame, lookback: int = 14) -> Optional[str]
         price_higher = recent["Close"].max() > prev["Close"].max()
         rsi_lower = recent["RSI"].max() < prev["RSI"].max()
         if price_higher and rsi_lower:
+            logger.debug("detect_rsi_divergence: found bearish_divergence")
             return "bearish_divergence"
         price_lower = recent["Close"].min() < prev["Close"].min()
         rsi_higher = recent["RSI"].min() > prev["RSI"].min()
         if price_lower and rsi_higher:
+            logger.debug("detect_rsi_divergence: found bullish_divergence")
             return "bullish_divergence"
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"detect_rsi_divergence: {e}")
     return None
 
 
@@ -173,6 +178,7 @@ def detect_support_resistance(df: pd.DataFrame, window: int = 20, tolerance: flo
     """Local minima/maxima support & resistance detection."""
     supports, resistances = [], []
     if df is None or len(df) < window * 2:
+        logger.debug(f"detect_support_resistance: insufficient bars — {0 if df is None else len(df)} (need {window * 2}).")
         return {"support": [], "resistance": []}
 
     for i in range(window, len(df) - window):

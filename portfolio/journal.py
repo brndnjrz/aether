@@ -12,6 +12,7 @@ def get_open_positions() -> List[Dict]:
     init_db()
     with get_conn() as conn:
         rows = conn.execute("SELECT * FROM positions WHERE status='open' ORDER BY entry_date DESC").fetchall()
+        logger.debug(f"get_open_positions: {len(rows)} open positions")
         return [dict(r) for r in rows]
 
 
@@ -24,6 +25,7 @@ def get_closed_performance() -> Dict[str, Any]:
         ).fetchall()
 
     if not rows:
+        logger.info("get_closed_performance: no closed positions with exit price found")
         return {"trades": 0}
 
     returns = []
@@ -33,12 +35,13 @@ def get_closed_performance() -> Dict[str, Any]:
             returns.append(ret)
 
     if not returns:
+        logger.warning(f"get_closed_performance: {len(rows)} closed rows but zero valid returns computed")
         return {"trades": len(rows)}
 
     wins = [r for r in returns if r > 0]
     losses = [r for r in returns if r <= 0]
 
-    return {
+    result = {
         "trades": len(returns),
         "win_rate": round(len(wins) / len(returns) * 100, 1),
         "avg_win": round(sum(wins) / len(wins) * 100, 2) if wins else 0,
@@ -49,3 +52,5 @@ def get_closed_performance() -> Dict[str, Any]:
         "expectancy": round((sum(wins) / len(wins) if wins else 0) * (len(wins) / len(returns)) +
                             (sum(losses) / len(losses) if losses else 0) * (len(losses) / len(returns)), 4),
     }
+    logger.info(f"get_closed_performance: {result['trades']} trades, win_rate={result['win_rate']}%")
+    return result

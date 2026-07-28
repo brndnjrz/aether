@@ -1,6 +1,7 @@
 """
 Market Dashboard — landing page with market overview, sector performance, and open positions.
 """
+import logging
 import streamlit as st
 import pandas as pd
 import sys, os
@@ -8,15 +9,25 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from data.macro_data import get_market_overview, get_sp500_regime, get_sector_performance, get_vix_data
 
+logger = logging.getLogger(__name__)
+
 
 def render():
     st.markdown("# Market Dashboard")
+    logger.debug("[home] Rendering Market Dashboard")
 
     with st.spinner("Loading market data..."):
         overview = get_market_overview()
         regime = get_sp500_regime()
         vix = get_vix_data()
         sectors = get_sector_performance()
+
+    if not overview:
+        logger.warning("[home] Market overview data came back empty")
+    else:
+        logger.debug(f"[home] Market overview loaded with {len(overview)} indices")
+    if not sectors:
+        logger.debug("[home] Sector performance data came back empty")
 
     # Regime banner
     regime_label = regime.get("regime", "Unknown")
@@ -67,7 +78,8 @@ def render():
                 marker_color=["rgba(38,166,154,0.4)" if r > 0 else "rgba(239,83,80,0.4)" for r in m3_returns],
             ))
             fig.update_layout(
-                template="plotly_dark", height=300, barmode="group",
+                template="plotly_dark" if st.context.theme.type == "dark" else "plotly_white",
+                height=300, barmode="group",
                 margin=dict(l=0, r=0, t=10, b=0),
                 legend=dict(orientation="h", y=1.02),
             )
@@ -85,6 +97,7 @@ def render():
     from portfolio.journal import get_open_positions
     open_positions = get_open_positions()
     if open_positions:
+        logger.debug(f"[home] {len(open_positions)} open positions loaded for summary")
         st.markdown("---")
         st.subheader(f"Open Positions ({len(open_positions)})")
         rows = []
@@ -102,6 +115,7 @@ def render():
         if len(open_positions) > 5:
             st.caption(f"+ {len(open_positions) - 5} more — see Portfolio page")
     else:
+        logger.debug("[home] No open positions to display")
         st.markdown("---")
         st.info("No open positions yet.")
 

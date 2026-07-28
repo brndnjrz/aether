@@ -38,6 +38,7 @@ def get_financials(ticker: str, ttl: int = 3600) -> Dict[str, Any]:
     """
     key = f"fundamentals_{ticker}"
     if key in _cache and _fresh(_cache[key], ttl):
+        logger.debug(f"get_financials cache hit for {ticker}")
         return _cache[key]["data"]
 
     try:
@@ -174,6 +175,7 @@ def get_financials(ticker: str, ttl: int = 3600) -> Dict[str, Any]:
                 result["ev_ebitda"] = ev / ebit  # rough proxy with EBIT
 
         _cache[key] = {"data": result, "ts": time.time()}
+        logger.info(f"Fetched fundamentals for {ticker}: {len(result)} fields populated")
         return result
 
     except Exception as e:
@@ -185,12 +187,16 @@ def get_earnings_history(ticker: str, ttl: int = 3600) -> pd.DataFrame:
     """Returns earnings history with surprise data if available."""
     key = f"earnings_{ticker}"
     if key in _cache and _fresh(_cache[key], ttl):
+        logger.debug(f"get_earnings_history cache hit for {ticker}")
         return _cache[key]["data"]
     try:
         t = yf.Ticker(ticker)
         hist = t.earnings_history
         if hist is None or hist.empty:
+            logger.warning(f"No earnings history available for {ticker}")
             hist = pd.DataFrame()
+        else:
+            logger.debug(f"Fetched earnings history for {ticker}: {len(hist)} rows")
         _cache[key] = {"data": hist, "ts": time.time()}
         return hist
     except Exception as e:
@@ -201,13 +207,18 @@ def get_earnings_history(ticker: str, ttl: int = 3600) -> pd.DataFrame:
 def get_analyst_recommendations(ticker: str, ttl: int = 3600) -> pd.DataFrame:
     key = f"recs_{ticker}"
     if key in _cache and _fresh(_cache[key], ttl):
+        logger.debug(f"get_analyst_recommendations cache hit for {ticker}")
         return _cache[key]["data"]
     try:
         t = yf.Ticker(ticker)
         recs = t.recommendations
         if recs is None or recs.empty:
+            logger.warning(f"No analyst recommendations available for {ticker}")
             recs = pd.DataFrame()
+        else:
+            logger.debug(f"Fetched analyst recommendations for {ticker}: {len(recs)} rows")
         _cache[key] = {"data": recs, "ts": time.time()}
         return recs
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Analyst recommendations for {ticker}: {e}")
         return pd.DataFrame()

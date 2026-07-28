@@ -208,6 +208,7 @@ def find_flags_and_pennants(
     generation, never silently dropped."""
     rejected: List[Dict[str, Any]] = []
     if df is None or len(df) < 20:
+        logger.warning(f"find_flags_and_pennants: insufficient bars — {0 if df is None else len(df)} (need 20).")
         return [], rejected
 
     swings = detect_swing_points(df)
@@ -227,6 +228,7 @@ def find_flags_and_pennants(
 
         confirmed.append(result)
 
+    logger.debug(f"find_flags_and_pennants: {len(poles)} poles — confirmed={len(confirmed)} rejected={len(rejected)}")
     return confirmed, rejected
 
 
@@ -255,6 +257,7 @@ def detect_flag_pennant_patterns(
       latest_pattern  the pattern behind `signal`, or None
     """
     if df is None or df.empty:
+        logger.warning("detect_flag_pennant_patterns: received None/empty df — returning empty result.")
         return {"signal": None, "patterns": [], "rejected": [], "latest_pattern": None}
 
     patterns, rejected = find_flags_and_pennants(df, **detection_kwargs)
@@ -288,5 +291,8 @@ def detect_flag_pennant_patterns(
             "direction": latest["direction"],
             "note": f"Confidence {latest['confidence_score']:.0f}/100 — breakout confirmed at ${latest['breakout_price']:.2f}",
         }
+        logger.info(f"detect_flag_pennant_patterns: signal={signal['name']} direction={signal['direction']} confidence={latest['confidence_score']:.0f}")
+    else:
+        logger.info(f"detect_flag_pennant_patterns: no signal — accepted={len(accepted)} rejected={len(rejected)}")
 
     return {"signal": signal, "patterns": accepted, "rejected": rejected, "latest_pattern": latest}

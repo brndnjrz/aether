@@ -20,10 +20,13 @@ signal time, since swing detection itself already lags real-time by
 construction (a swing is only confirmed once price reverses by a full
 ATR against it).
 """
+import logging
 from typing import Any, Dict
 
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 WEIGHTS = {
     "volume": 0.20,
@@ -175,6 +178,7 @@ def score_pattern(df: pd.DataFrame, pattern: Dict[str, Any]) -> Dict[str, Any]:
 
     pattern["score_components"] = {k: round(v, 3) for k, v in components.items()}
     pattern["confidence_score"] = round(score, 1)
+    logger.debug(f"score_pattern: confidence={pattern['confidence_score']:.1f} components={pattern['score_components']}")
     return pattern
 
 
@@ -189,7 +193,10 @@ def passes_trend_filter(df: pd.DataFrame, pattern: Dict[str, Any], adx_min: floa
     adx = _col(df, "ADX", idx, default=0.0)
 
     if ema50 != ema50 or sma200 != sma200:
+        logger.warning("passes_trend_filter: EMA_50/SMA_200 unavailable (short history) — skipping trend filter, passing by default.")
         return True
 
     trend_ok = (ema50 > sma200) if pattern["direction"] == "bull" else (ema50 < sma200)
-    return bool(trend_ok and adx >= adx_min)
+    passed = bool(trend_ok and adx >= adx_min)
+    logger.debug(f"passes_trend_filter: passed={passed} direction={pattern['direction']} ema50={ema50:.4f} sma200={sma200:.4f} adx={adx:.1f} adx_min={adx_min:.1f}")
+    return passed

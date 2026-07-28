@@ -1,6 +1,7 @@
 """
 Portfolio page — position tracking, risk analytics, correlation, stress tests.
 """
+import logging
 import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
@@ -19,6 +20,8 @@ from analysis.risk import (
     portfolio_correlation_matrix, calculate_portfolio_metrics,
     stress_test_portfolio, position_size_from_stop,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def render():
@@ -44,9 +47,11 @@ def render():
 def _render_positions():
     positions = get_open_positions()
     if not positions:
+        logger.debug("[portfolio] No open positions to display")
         st.info("No open positions.")
         _render_closed_stats()
         return
+    logger.debug(f"[portfolio] {len(positions)} open positions loaded")
 
     # Build enriched table with live prices
     rows = []
@@ -109,6 +114,7 @@ def _render_risk_analytics():
     tickers = [p["ticker"] for p in positions if p.get("ticker")]
 
     if len(tickers) < 2:
+        logger.debug(f"[portfolio] Risk analytics skipped — only {len(tickers)} position(s), need 2+")
         st.info("Add at least 2 positions to see correlation analysis.")
         _render_stress_test_standalone()
         return
@@ -139,7 +145,10 @@ def _render_risk_analytics():
             text_auto=".2f",
             aspect="auto",
         )
-        fig.update_layout(template="plotly_dark", height=400, margin=dict(l=0, r=0, t=20, b=0))
+        fig.update_layout(
+            template="plotly_dark" if st.context.theme.type == "dark" else "plotly_white",
+            height=400, margin=dict(l=0, r=0, t=20, b=0),
+        )
         st.plotly_chart(fig, use_container_width=True)
 
         # Warn on high correlation
@@ -149,6 +158,10 @@ def _render_risk_analytics():
                 if i < j and corr.loc[t1, t2] > 0.8:
                     high_corr_pairs.append((t1, t2, corr.loc[t1, t2]))
         if high_corr_pairs:
+            logger.warning(
+                "[portfolio] High correlation detected: "
+                + ", ".join(f"{a}/{b} ({c:.2f})" for a, b, c in high_corr_pairs)
+            )
             st.warning(f"⚠️ High correlation detected: " + ", ".join(f"{a}/{b} ({c:.2f})" for a, b, c in high_corr_pairs))
 
     # Portfolio returns
@@ -181,12 +194,13 @@ def _render_risk_analytics():
         drawdown_series = metrics.get("drawdown_series")
         if wealth_index is not None and not wealth_index.empty:
             st.subheader("Growth of $1")
-            fig_wealth = px.line(x=wealth_index.index, y=wealth_index.values, template="plotly_dark")
+            _plotly_theme = "plotly_dark" if st.context.theme.type == "dark" else "plotly_white"
+            fig_wealth = px.line(x=wealth_index.index, y=wealth_index.values, template=_plotly_theme)
             fig_wealth.update_layout(height=250, margin=dict(l=0, r=0, t=10, b=0), xaxis_title=None, yaxis_title="$")
             st.plotly_chart(fig_wealth, use_container_width=True)
 
             st.subheader("Drawdown")
-            fig_dd = px.area(x=drawdown_series.index, y=drawdown_series.values * 100, template="plotly_dark")
+            fig_dd = px.area(x=drawdown_series.index, y=drawdown_series.values * 100, template=_plotly_theme)
             fig_dd.update_traces(line_color="#ef5350", fillcolor="rgba(239,83,80,0.3)")
             fig_dd.update_layout(height=200, margin=dict(l=0, r=0, t=10, b=0), xaxis_title=None, yaxis_title="%")
             st.plotly_chart(fig_dd, use_container_width=True)
@@ -208,7 +222,7 @@ def _render_stress_test_standalone(weights: dict = None):
         orientation="h",
         color="Color",
         color_discrete_map={"Loss": "#ef5350", "Gain": "#26a69a"},
-        template="plotly_dark",
+        template="plotly_dark" if st.context.theme.type == "dark" else "plotly_white",
     )
     fig.update_layout(height=350, showlegend=False, margin=dict(l=0, r=0, t=10, b=0))
     st.plotly_chart(fig, use_container_width=True)
@@ -241,12 +255,15 @@ def _render_position_sizer():
             st.write(f"3:1 R/R Target: **${result['risk_reward_3to1_target']:.2f}**")
             st.write(f"Risk per share: **${result['risk_per_share']:.2f}**")
         else:
+            logger.warning(f"[portfolio] Position sizer error: {result['error']}")
             st.error(result["error"])
 
 
 @st.cache_data(ttl=30)
 def _cached_round_trips(fills: list) -> list:
-    return compute_round_trips(fills)
+    result = compute_round_trips(fills)
+    logger.debug(f"[portfolio] Computed {len(result)} round trips from {len(fills)} fills")
+    return result
 
 
 def _render_options_log():
@@ -292,17 +309,22 @@ def _render_add_fill_form():
         submitted = st.form_submit_button("Log Fill", type="primary")
 
     if submitted:
+        logger.info(f"[portfolio] 'Log Fill' form submitted for {ticker or '(no ticker)'}")
         if not ticker:
+            logger.warning("[portfolio] Log Fill submission rejected: no ticker entered")
             st.warning("Enter a ticker first.")
             return
         if not strike:
+            logger.warning(f"[portfolio] Log Fill submission for {ticker} rejected: no strike entered")
             st.warning("Enter a strike price.")
             return
         if price < 0:
+            logger.warning(f"[portfolio] Log Fill submission for {ticker} rejected: negative price {price}")
             st.warning("Price cannot be negative.")
             return
         filled_at = datetime.combine(fill_date, fill_time, tzinfo=MARKET_TZ).isoformat()
         add_fill(ticker, strike, option_type, expiry_date.isoformat(), side, int(qty), price, filled_at, notes)
+        logger.info(f"[portfolio] Fill logged: {side} {qty}x {ticker} ${strike:g} {option_type} @ ${price:.2f}")
         st.success(f"Logged {side} {qty}x {ticker} ${strike:g} {option_type} {expiry_date.isoformat()} @ ${price:.2f}.")
         st.rerun()
 
@@ -336,9 +358,11 @@ def _render_fill_ledger(fills: list):
 
         editing = st.session_state.get("editing_fill_id") == f["id"]
         if cols[8].button("Edit", key=f"edit_fill_{f['id']}"):
+            logger.info(f"[portfolio] 'Edit' fill button pressed for fill #{f['id']} ({f['ticker']})")
             st.session_state["editing_fill_id"] = None if editing else f["id"]
             st.rerun()
         if cols[9].button("Delete", key=f"del_fill_{f['id']}"):
+            logger.info(f"[portfolio] 'Delete' fill button pressed for fill #{f['id']} ({f['ticker']})")
             remove_fill(f["id"])
             st.rerun()
 
@@ -380,6 +404,7 @@ def _render_edit_fill_form(f: dict):
         if saved:
             filled_at = datetime.combine(fill_date, fill_time, tzinfo=MARKET_TZ).isoformat()
             update_fill(f["id"], ticker, strike, option_type, expiry_date.isoformat(), side, int(qty), price, filled_at, notes)
+            logger.info(f"[portfolio] Fill #{f['id']} ({ticker}) updated")
             st.session_state["editing_fill_id"] = None
             st.success("Fill updated.")
             st.rerun()
@@ -442,7 +467,8 @@ def _render_round_trip_analytics(round_trips: list):
             grp["win_rate"] = grp["mean"] * 100
             fig = px.bar(
                 grp.reset_index(), x="hold_bucket", y="win_rate", text="count",
-                template="plotly_dark", labels={"hold_bucket": "Hold time", "win_rate": "Win rate (%)"},
+                template="plotly_dark" if st.context.theme.type == "dark" else "plotly_white",
+                labels={"hold_bucket": "Hold time", "win_rate": "Win rate (%)"},
             )
             fig.update_traces(texttemplate="n=%{text}", textposition="outside")
             fig.update_layout(height=300, margin=dict(l=0, r=0, t=20, b=0))
@@ -456,7 +482,8 @@ def _render_round_trip_analytics(round_trips: list):
             grp_hour["win_rate"] = grp_hour["mean"] * 100
             fig2 = px.bar(
                 grp_hour.reset_index(), x="entry_hour", y="win_rate", text="count",
-                template="plotly_dark", labels={"entry_hour": "Entry hour (ET)", "win_rate": "Win rate (%)"},
+                template="plotly_dark" if st.context.theme.type == "dark" else "plotly_white",
+                labels={"entry_hour": "Entry hour (ET)", "win_rate": "Win rate (%)"},
             )
             fig2.update_traces(texttemplate="n=%{text}", textposition="outside")
             fig2.update_layout(height=300, margin=dict(l=0, r=0, t=20, b=0))

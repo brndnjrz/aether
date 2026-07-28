@@ -4,8 +4,12 @@ historical price data with a fixed stop-loss/take-profit, one trade at a time.
 Reports win rate and an equity curve so any rule-based signal in the app can be
 checked against its own history instead of trusted on assumption alone.
 """
-import pandas as pd
+import logging
 from typing import Any, Dict
+
+import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 
 def macd_bullish_cross_signal(df: pd.DataFrame) -> pd.Series:
@@ -66,6 +70,8 @@ def simulate_trades(
                     "result": "win",
                 })
                 in_trade = False
+                if len(trades) % 10 == 0:
+                    logger.debug(f"simulate_trades: progress — {len(trades)} trades closed, at bar {i}/{len(prices)}.")
             elif price <= stop_price:
                 cash *= stop_price / entry_price
                 trades.append({
@@ -74,6 +80,8 @@ def simulate_trades(
                     "result": "loss",
                 })
                 in_trade = False
+                if len(trades) % 10 == 0:
+                    logger.debug(f"simulate_trades: progress — {len(trades)} trades closed, at bar {i}/{len(prices)}.")
 
         equity.append(cash)
 
@@ -83,6 +91,14 @@ def simulate_trades(
     wins = sum(1 for t in trades if t["result"] == "win")
     win_rate = (wins / n * 100) if n else 0.0
     total_return_pct = (cash / initial_cash - 1) * 100
+
+    if n == 0:
+        logger.warning("simulate_trades: signal produced no trades over the given history.")
+
+    logger.info(
+        f"simulate_trades: complete — num_trades={n} win_rate={round(win_rate, 1)}% "
+        f"total_return_pct={round(total_return_pct, 1)}%"
+    )
 
     return {
         "trades": trades,

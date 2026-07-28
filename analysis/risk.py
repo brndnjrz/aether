@@ -23,6 +23,9 @@ def position_size_from_stop(
     This is the correct approach: define the stop first, let size follow from risk.
     """
     if entry_price <= 0 or stop_price <= 0 or stop_price >= entry_price:
+        logger.warning(
+            f"position_size_from_stop: invalid price inputs — entry={entry_price} stop={stop_price}"
+        )
         return {"error": "Invalid price inputs — stop must be below entry"}
 
     dollar_risk = portfolio_value * risk_pct
@@ -31,6 +34,10 @@ def position_size_from_stop(
     position_value = shares * entry_price
     position_pct = position_value / portfolio_value
 
+    logger.info(
+        f"position_size_from_stop: shares={round(shares)} position_pct={round(position_pct * 100, 2)}% "
+        f"dollar_risk={round(dollar_risk, 2)}"
+    )
     return {
         "shares": round(shares),
         "position_value": round(position_value, 2),
@@ -49,10 +56,15 @@ def kelly_fraction(win_rate: float, avg_win: float, avg_loss: float, fraction: f
     fraction=0.5 is the standard safer variant.
     """
     if avg_loss <= 0 or win_rate <= 0 or win_rate >= 1:
+        logger.warning(
+            f"kelly_fraction: invalid inputs — win_rate={win_rate} avg_loss={avg_loss}, returning 0.0"
+        )
         return 0.0
     odds = avg_win / avg_loss
     kelly = win_rate - (1 - win_rate) / odds
-    return max(0.0, round(kelly * fraction, 4))
+    result = max(0.0, round(kelly * fraction, 4))
+    logger.debug(f"kelly_fraction: win_rate={win_rate} odds={round(odds, 4)} kelly={result}")
+    return result
 
 
 def regime_kelly_multiplier(signal: float, confidence: float) -> float:
@@ -86,6 +98,10 @@ def kelly_position_size(
     base_kelly = kelly_fraction(win_rate, avg_win, avg_loss, fraction)
     multiplier = regime_kelly_multiplier(regime_signal, regime_confidence)
     adjusted_kelly = round(base_kelly * multiplier, 4)
+    logger.info(
+        f"kelly_position_size: base_kelly_pct={round(base_kelly * 100, 2)}% "
+        f"regime_multiplier={multiplier} adjusted_kelly_pct={round(adjusted_kelly * 100, 2)}%"
+    )
     return {
         "base_kelly_pct": round(base_kelly * 100, 2),
         "regime_multiplier": multiplier,
@@ -108,6 +124,9 @@ def calculate_portfolio_metrics(
     r_series = returns if isinstance(returns, pd.Series) else pd.Series(returns)
 
     if len(r_series) < 5:
+        logger.warning(
+            f"calculate_portfolio_metrics: insufficient return history — n={len(r_series)} (need >= 5)"
+        )
         return {
             "sharpe": 0.0, "sortino": 0.0, "max_drawdown": 0.0,
             "max_drawdown_date": None,
@@ -148,6 +167,10 @@ def calculate_portfolio_metrics(
     neg_r = r[r < 0]
     pl_ratio = (float(np.mean(pos_r)) / abs(float(np.mean(neg_r)))) if (len(pos_r) > 0 and len(neg_r) > 0) else 0.0
 
+    logger.info(
+        f"calculate_portfolio_metrics: n={n} sharpe={round(sharpe, 3)} sortino={round(sortino, 3)} "
+        f"max_drawdown={round(max_drawdown * 100, 2)}% annualized_return={round(ann_return * 100, 2)}%"
+    )
     return {
         "sharpe": round(sharpe, 3),
         "sortino": round(sortino, 3),
@@ -173,9 +196,13 @@ def portfolio_correlation_matrix(price_history: Dict[str, pd.DataFrame]) -> pd.D
             closes[ticker] = df["Close"].pct_change().dropna()
 
     if len(closes) < 2:
+        logger.warning(
+            f"portfolio_correlation_matrix: fewer than 2 tickers with usable price data ({len(closes)}) — cannot correlate."
+        )
         return pd.DataFrame()
 
     combined = pd.DataFrame(closes).dropna()
+    logger.debug(f"portfolio_correlation_matrix: built {len(combined.columns)}x{len(combined.columns)} matrix from {len(combined)} rows.")
     return combined.corr()
 
 
@@ -204,10 +231,12 @@ def stress_test_portfolio(
             # Simple beta-adjusted estimate (assume beta=1 for all if unknown)
             est = sum(w * mkt_return for w in weights.values()) / total_weight if total_weight > 0 else mkt_return
             results[scenario] = round(est * 100, 1)
+        logger.info(f"stress_test_portfolio: ran {len(results)} default scenarios for {len(weights)} tickers.")
         return results
 
     results = {}
     for scenario_name, ticker_returns in scenarios.items():
         port_return = sum(weights.get(t, 0) * r for t, r in ticker_returns.items())
         results[scenario_name] = round(port_return * 100, 1)
+    logger.info(f"stress_test_portfolio: ran {len(results)} custom scenarios for {len(weights)} tickers.")
     return results

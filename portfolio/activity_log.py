@@ -15,11 +15,12 @@ logger = logging.getLogger(__name__)
 def log_activity(event_type: str, ticker: str, detail: Dict[str, Any]):
     init_db()
     with get_conn() as conn:
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO activity_log (event_type, ticker, detail_json, logged_at) VALUES (?, ?, ?, ?)",
             (event_type, ticker.upper().strip(), json.dumps(detail, default=str), now_et_iso()),
         )
         conn.commit()
+        logger.info(f"Logged activity id={cur.lastrowid} event_type={event_type} ticker={ticker.upper().strip()}")
 
 
 def get_activity_in_window(start_iso: str, end_iso: str, ticker: Optional[str] = None) -> List[Dict]:
@@ -35,4 +36,5 @@ def get_activity_in_window(start_iso: str, end_iso: str, ticker: Optional[str] =
                 "SELECT * FROM activity_log WHERE logged_at BETWEEN ? AND ? ORDER BY logged_at",
                 (start_iso, end_iso),
             ).fetchall()
+        logger.debug(f"get_activity_in_window({start_iso} to {end_iso}, ticker={ticker}): {len(rows)} rows")
         return [dict(r) for r in rows]

@@ -25,8 +25,11 @@ def _ollama_available() -> bool:
     """Return True if the Ollama server is reachable."""
     try:
         r = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=2)
-        return r.status_code == 200
+        available = r.status_code == 200
+        logger.debug(f"Ollama availability check at {OLLAMA_BASE_URL}: {available}")
+        return available
     except Exception:
+        logger.debug(f"Ollama not reachable at {OLLAMA_BASE_URL}")
         return False
 
 
@@ -62,6 +65,7 @@ def _ask_ollama(prompt: str, system: str = "", max_tokens: int = 1500, model: Op
             message = data.get("message", {})
             content = message.get("content", "")
             if content:
+                logger.info(f"Ollama call succeeded: model={model} response_len={len(content)}")
                 return content
             if data.get("done_reason") == "length" and message.get("thinking") and attempt == 0:
                 logger.warning(
@@ -86,6 +90,7 @@ def _ask_ollama(prompt: str, system: str = "", max_tokens: int = 1500, model: Op
 
 def _ask_claude(prompt: str, system: str = "", max_tokens: int = 1500) -> Optional[str]:
     if not ANTHROPIC_API_KEY:
+        logger.debug(f"Claude call skipped: ANTHROPIC_API_KEY configured={bool(ANTHROPIC_API_KEY)}")
         return None
     try:
         import anthropic
@@ -103,7 +108,9 @@ def _ask_claude(prompt: str, system: str = "", max_tokens: int = 1500) -> Option
         if system:
             kwargs["system"] = system
         response = client.messages.create(**kwargs)
-        return response.content[0].text
+        text = response.content[0].text
+        logger.info(f"Claude call succeeded: model={CLAUDE_MODEL} response_len={len(text)}")
+        return text
     except Exception as e:
         logger.error("Claude API error: %s", e)
         return None
@@ -118,6 +125,7 @@ def ask_ai(prompt: str, system: str = "", max_tokens: int = 1500, ollama_model: 
     Returns the response text, or None if no provider is available.
     """
     provider = (AI_PROVIDER or "auto").lower()
+    logger.debug(f"ask_ai routing: provider={provider} max_tokens={max_tokens}")
 
     if provider == "claude":
         return _ask_claude(prompt, system, max_tokens)

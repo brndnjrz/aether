@@ -17,6 +17,7 @@ def detect_regime(df: pd.DataFrame, ticker: str = "") -> Dict[str, Any]:
     Returns: regime label, trend, volatility regime, momentum, and raw values.
     """
     if df is None or df.empty or len(df) < 20:
+        logger.warning(f"detect_regime: insufficient data for {ticker or 'unknown ticker'} — need >=20 bars, got {0 if df is None else len(df)}")
         return {"regime": "Insufficient Data", "trend": "unknown"}
 
     last = df.iloc[-1]
@@ -78,6 +79,8 @@ def detect_regime(df: pd.DataFrame, ticker: str = "") -> Dict[str, Any]:
 
     # ── Market context ───────────────────────────────────────────────────
     market_regime = get_sp500_regime()
+
+    logger.info(f"detect_regime: {ticker or 'unknown ticker'} complete — regime={regime} trend={trend} vol_regime={vol_regime}")
 
     return {
         "regime": regime,

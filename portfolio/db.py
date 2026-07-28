@@ -6,8 +6,11 @@ into each module.
 """
 import sqlite3
 import os
+import logging
 from contextlib import contextmanager
 from config.settings import STORAGE_DIR
+
+logger = logging.getLogger(__name__)
 
 DB_PATH = os.path.join(STORAGE_DIR, "journal.db")
 
@@ -19,8 +22,12 @@ def get_conn():
     os.makedirs(STORAGE_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    logger.debug(f"Opened SQLite connection to {DB_PATH}")
     try:
         yield conn
+    except Exception as e:
+        logger.error(f"SQLite error on connection to {DB_PATH}: {e}")
+        raise
     finally:
         conn.close()
 
@@ -28,6 +35,7 @@ def get_conn():
 def init_db():
     global _initialized
     if _initialized:
+        logger.debug("init_db: schema already initialized, skipping")
         return
     with get_conn() as conn:
         conn.executescript("""
@@ -90,3 +98,4 @@ def init_db():
         """)
         conn.commit()
     _initialized = True
+    logger.info(f"Initialized portfolio DB schema at {DB_PATH}")

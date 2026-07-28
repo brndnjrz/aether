@@ -2,6 +2,7 @@
 Stock Screener — empirically-backed screens:
 Quality + Momentum, Earnings Revision + Momentum, 52w-Low Quality, Insider Buying proxy.
 """
+import logging
 import streamlit as st
 import pandas as pd
 import sys, os
@@ -11,6 +12,8 @@ from data import get_price_history, get_financials, get_ticker_info
 from analysis.indicators import calculate_indicators, get_signal_summary
 from analysis.fundamental_score import full_fundamental_report
 
+logger = logging.getLogger(__name__)
+
 # ML prediction — only used when model already exists (never trains in screener loop)
 try:
     from analysis.ml_prediction import predict as ml_predict
@@ -19,6 +22,7 @@ try:
     _ML_AVAILABLE = True
 except Exception:
     _ML_AVAILABLE = False
+    logger.debug("[screener] ML prediction module unavailable — ML Signal column will show placeholders")
 
 
 SP500_SAMPLE = [
@@ -65,10 +69,12 @@ def render():
                 st.caption(f"Screening {len(universe)} stocks...")
 
     if not universe:
+        logger.warning("[screener] Run blocked: no tickers entered and sample universe not enabled")
         st.warning("Enter tickers or enable the sample universe")
         return
 
     if st.button("Run Screen", type="primary"):
+        logger.info(f"[screener] 'Run Screen' button pressed: screen={screen_type!r} universe_size={len(universe)}")
         _run_screen(screen_type, universe)
 
 
@@ -84,19 +90,22 @@ def _run_screen(screen_type: str, universe: list):
             row = _screen_ticker(ticker, screen_type)
             if row:
                 results.append(row)
-        except Exception:
+        except Exception as exc:
+            logger.debug(f"[screener] Skipping {ticker} in screen — error during evaluation: {exc}")
             continue
 
     progress.empty()
     status.empty()
 
     if not results:
+        logger.warning(f"[screener] Screen {screen_type!r} completed: no stocks passed out of {len(universe)} screened")
         st.warning("No stocks passed the screen criteria")
         return
 
     df = pd.DataFrame(results)
     df = df.sort_values("Score", ascending=False)
 
+    logger.info(f"[screener] Screen {screen_type!r} completed: {len(df)}/{len(universe)} stocks passed")
     st.success(f"✅ {len(df)} stocks passed the screen out of {len(universe)}")
     st.dataframe(df, hide_index=True, width="stretch")
 

@@ -20,10 +20,12 @@ def _fresh(entry: dict, ttl: int) -> bool:
 def get_vix_data(ttl: int = 300) -> Dict[str, Any]:
     key = "vix_data"
     if key in _cache and _fresh(_cache[key], ttl):
+        logger.debug("get_vix_data cache hit")
         return _cache[key]["data"]
     try:
         df = get_price_history("^VIX", period="1y", interval="1d")
         if df is None or df.empty:
+            logger.warning("VIX data unavailable — no price history returned for ^VIX")
             return {"current": 20.0, "status": "unavailable"}
 
         current = float(df["Close"].iloc[-1])
@@ -45,6 +47,7 @@ def get_vix_data(ttl: int = 300) -> Dict[str, Any]:
             "history": df["Close"].tail(63).tolist(),
         }
         _cache[key] = {"data": result, "ts": time.time()}
+        logger.info(f"VIX data fetched: current={result['current']} regime={result['regime']} trend={result['trend']}")
         return result
     except Exception as e:
         logger.error(f"VIX data error: {e}")
@@ -55,6 +58,7 @@ def get_market_overview(ttl: int = 300) -> Dict[str, Any]:
     """Returns current prices and % changes for major indices."""
     key = "market_overview"
     if key in _cache and _fresh(_cache[key], ttl):
+        logger.debug("get_market_overview cache hit")
         return _cache[key]["data"]
 
     indices = {
@@ -75,9 +79,13 @@ def get_market_overview(ttl: int = 300) -> Dict[str, Any]:
                     "change": round(curr - prev, 2),
                     "change_pct": round((curr - prev) / prev * 100, 2),
                 }
-        except Exception:
+            else:
+                logger.warning(f"Market overview: insufficient price history for {name} ({ticker})")
+        except Exception as e:
+            logger.warning(f"Market overview fetch failed for {name} ({ticker}): {e}")
             continue
     _cache[key] = {"data": result, "ts": time.time()}
+    logger.info(f"Market overview fetched for {len(result)}/{len(indices)} indices")
     return result
 
 
@@ -90,11 +98,13 @@ def get_sp500_regime(ttl: int = 600) -> Dict[str, Any]:
     """
     key = "sp500_regime"
     if key in _cache and _fresh(_cache[key], ttl):
+        logger.debug("get_sp500_regime cache hit")
         return _cache[key]["data"]
 
     try:
         df = get_price_history("^GSPC", period="1y", interval="1d")
         if df is None or len(df) < 50:
+            logger.warning("SP500 regime: insufficient price history for ^GSPC")
             return {"regime": "Unknown"}
 
         price = float(df["Close"].iloc[-1])
@@ -137,6 +147,7 @@ def get_sp500_regime(ttl: int = 600) -> Dict[str, Any]:
             "vix": vix,
         }
         _cache[key] = {"data": result, "ts": time.time()}
+        logger.info(f"SP500 regime computed: {regime} (price={result['price']} vs ma200={result['ma200']})")
         return result
     except Exception as e:
         logger.error(f"SP500 regime error: {e}")
@@ -147,6 +158,7 @@ def get_sector_performance(ttl: int = 3600) -> Dict[str, Dict]:
     """Returns 1-month and 3-month performance for major sector ETFs."""
     key = "sector_perf"
     if key in _cache and _fresh(_cache[key], ttl):
+        logger.debug("get_sector_performance cache hit")
         return _cache[key]["data"]
 
     sectors = {
@@ -176,7 +188,11 @@ def get_sector_performance(ttl: int = 3600) -> Dict[str, Dict]:
                     "1m_pct": round((curr - m1) / m1 * 100, 2),
                     "3m_pct": round((curr - m3) / m3 * 100, 2),
                 }
-        except Exception:
+            else:
+                logger.warning(f"Sector performance: insufficient price history for {name} ({etf})")
+        except Exception as e:
+            logger.warning(f"Sector performance fetch failed for {name} ({etf}): {e}")
             continue
     _cache[key] = {"data": result, "ts": time.time()}
+    logger.info(f"Sector performance fetched for {len(result)}/{len(sectors)} sectors")
     return result

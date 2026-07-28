@@ -30,12 +30,14 @@ def get_options_chain(ticker: str, expiry: Optional[str] = None, ttl: int = 600)
     """
     key = f"chain_{ticker}_{expiry or 'nearest'}"
     if key in _cache and _fresh(_cache[key], ttl):
+        logger.debug(f"get_options_chain cache hit for {ticker} ({expiry or 'nearest'})")
         return _cache[key]["data"]
 
     try:
         t = yf.Ticker(ticker)
         expirations = t.options
         if not expirations:
+            logger.warning(f"No options chain available for {ticker}")
             return {"error": "No options available for this ticker", "ticker": ticker}
 
         target_expiry = expiry if expiry in expirations else expirations[0]
@@ -52,6 +54,10 @@ def get_options_chain(ticker: str, expiry: Optional[str] = None, ttl: int = 600)
             "puts": chain.puts,
         }
         _cache[key] = {"data": result, "ts": time.time()}
+        logger.info(
+            f"Fetched options chain for {ticker}: expiry={target_expiry} "
+            f"calls={len(result['calls'])} puts={len(result['puts'])}"
+        )
         return result
     except Exception as e:
         logger.error(f"Options chain error for {ticker}: {e}")
@@ -66,11 +72,13 @@ def calculate_iv_rank(ticker: str, ttl: int = 600) -> Dict[str, Any]:
     """
     key = f"ivr_{ticker}"
     if key in _cache and _fresh(_cache[key], ttl):
+        logger.debug(f"calculate_iv_rank cache hit for {ticker}")
         return _cache[key]["data"]
 
     try:
         df = get_price_history(ticker, period="1y", interval="1d")
         if df is None or len(df) < 30:
+            logger.warning(f"IVR calculation: insufficient price history for {ticker}")
             return {"iv_rank": 50, "iv_percentile": 50, "hv_30": 0, "hv_10": 0, "status": "insufficient_data"}
 
         df["returns"] = df["Close"].pct_change()
@@ -137,6 +145,10 @@ def calculate_iv_rank(ticker: str, ttl: int = 600) -> Dict[str, Any]:
             "iv_vs_garch_ratio": round(atm_iv / garch_vol, 2) if atm_iv and garch_vol else None,
         }
         _cache[key] = {"data": result, "ts": time.time()}
+        logger.info(
+            f"IVR computed for {ticker}: iv_rank={result['iv_rank']} "
+            f"vol_regime={result['vol_regime']} atm_iv={result['atm_iv']}"
+        )
         return result
     except Exception as e:
         logger.error(f"IVR calculation error for {ticker}: {e}")
@@ -148,13 +160,16 @@ def get_atm_greeks(ticker: str, expiry: Optional[str] = None) -> Dict[str, Any]:
     try:
         chain_data = get_options_chain(ticker, expiry)
         if "error" in chain_data:
+            logger.warning(f"get_atm_greeks: options chain error for {ticker}: {chain_data['error']}")
             return {}
         price = chain_data.get("current_price")
         if not price:
+            logger.warning(f"get_atm_greeks: no current price available for {ticker}")
             return {}
         calls = chain_data["calls"]
         puts = chain_data["puts"]
         if calls.empty or puts.empty:
+            logger.warning(f"get_atm_greeks: empty calls/puts for {ticker}")
             return {}
 
         # ATM call
@@ -213,6 +228,7 @@ def get_atm_greeks(ticker: str, expiry: Optional[str] = None) -> Dict[str, Any]:
 
             return base
 
+        logger.debug(f"Computed ATM greeks for {ticker} @ expiry {selected_expiry}")
         return {
             "atm_call": row_to_dict(atm_call, "call"),
             "atm_put": row_to_dict(atm_put, "put"),
