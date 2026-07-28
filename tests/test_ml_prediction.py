@@ -41,8 +41,8 @@ def test_ml_prediction_module_imports_cleanly():
 def test_pages_trading_imports_cleanly():
     """
     pages/trading.py imports predict/train_model/get_prediction_history/
-    evaluate_model at module level (unguarded, unlike research.py/screener.py/
-    watchlist.py which wrap the same import in try/except). If that import
+    evaluate_model at module level (unguarded, unlike research.py/screener.py
+    which wrap the same import in try/except). If that import
     chain breaks, the entire Trading page — not just ML — goes down.
     """
     import pages.trading  # noqa: F401 — import success is the assertion

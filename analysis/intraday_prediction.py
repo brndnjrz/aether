@@ -3,8 +3,8 @@ Intraday ML direction prediction — 15-minute (and other intraday) bars.
 
 Deliberately a **separate module** from analysis/ml_prediction.py rather than an
 interval parameter threaded through it. `ml_prediction.predict()` is called from
-four pages (Trading Desk, Research, Watchlist, Screener), so modifying it to
-serve intraday bars would put all four in the blast radius of every change here.
+three pages (Trading Desk, Research, Screener), so modifying it to
+serve intraday bars would put all three in the blast radius of every change here.
 This module instead **reuses ml_prediction's scaffolding read-only** — the
 walk-forward runner, the model configs, and the label helpers are all pure and
 bar-size agnostic, so they can be imported and called without being edited.
