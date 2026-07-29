@@ -1547,6 +1547,37 @@ def _render_predictions_disclaimer():
     )
 
 
+def _render_all_intervals_summary(results: dict, mode: str):
+    """
+    One row per interval from a Train All / Predict All run. Errors (most
+    commonly insufficient history for that interval, e.g. 1h needing more
+    calendar days than the provider returns) are shown inline per row rather
+    than raised, since one interval failing shouldn't hide the others that
+    succeeded.
+    """
+    rows = []
+    for interval, result in results.items():
+        if result.get("error"):
+            rows.append({"Interval": interval, "Status": "❌ Error", "Detail": result["error"]})
+            continue
+        if mode == "train":
+            trade = result.get("tradeability", {})
+            rows.append({
+                "Interval": interval, "Status": "✅ Trained",
+                "Detail": (
+                    f"acc {result['directional_accuracy'] * 100:.1f}% ± {result['accuracy_std'] * 100:.1f}% · "
+                    f"{'reliable' if result['is_reliable'] else 'unreliable'} · "
+                    f"{'tradeable' if trade.get('is_tradeable') else 'not tradeable'} after costs"
+                ),
+            })
+        else:
+            rows.append({
+                "Interval": interval, "Status": f"{'🟢' if result['direction'] == 'bullish' else '🔴' if result['direction'] == 'bearish' else '⚪'} {result['direction'].upper()}",
+                "Detail": f"prob {result['probability'] * 100:.0f}% · confidence {result['confidence']} · acc {result['model_accuracy'] * 100:.1f}%",
+            })
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+
 def _render_intraday_predictions():
     """
     Intraday (15-min) direction model. Entirely separate from the daily model:
@@ -1601,6 +1632,43 @@ def _render_intraday_predictions():
         st.info("Enter a ticker symbol to get started.")
         return
     st.session_state["intraday_pred_ticker"] = ticker
+
+    with st.expander(f"Train / predict all intervals for {ticker}", expanded=False):
+        st.caption(
+            f"Runs {', '.join(INTERVAL_SPECS)} one after another for {ticker} — useful before "
+            "a session to refresh everything at once instead of switching the interval dropdown "
+            "four times. Each interval is independent, so one failing (e.g. insufficient history) "
+            "doesn't block the rest."
+        )
+        ca1, ca2 = st.columns(2)
+        train_all_btn = ca1.button("Train / Update All", key="intraday_train_all_btn", width="stretch")
+        predict_all_btn = ca2.button("Generate All Predictions", type="primary", key="intraday_predict_all_btn", width="stretch")
+
+        if train_all_btn:
+            logger.info(f"[trading] 'Train / Update All' pressed for {ticker}")
+            results = {}
+            progress = st.progress(0.0)
+            for i, iv in enumerate(INTERVAL_SPECS):
+                with st.spinner(f"Training {iv} model for {ticker}..."):
+                    results[iv] = train_intraday_model(ticker, iv)
+                progress.progress((i + 1) / len(INTERVAL_SPECS))
+            progress.empty()
+            _render_all_intervals_summary(results, mode="train")
+
+        if predict_all_btn:
+            logger.info(f"[trading] 'Generate All Predictions' pressed for {ticker}")
+            results = {}
+            progress = st.progress(0.0)
+            for i, iv in enumerate(INTERVAL_SPECS):
+                with st.spinner(f"Predicting {iv} direction for {ticker}..."):
+                    results[iv] = predict_intraday(ticker, iv)
+                    if not results[iv].get("error"):
+                        log_activity("intraday_prediction_generated", ticker, results[iv])
+                progress.progress((i + 1) / len(INTERVAL_SPECS))
+            progress.empty()
+            _render_all_intervals_summary(results, mode="predict")
+
+    st.markdown("---")
 
     meta = load_metadata(ticker, interval)
     has_model = intraday_model_exists(ticker, interval)
