@@ -217,7 +217,38 @@ def test_prediction_history_empty_before_any_predictions(isolated_storage):
     assert len(history) == 0
     assert list(history.columns) == [
         "date", "direction", "probability", "confidence", "actual_outcome", "correct",
+        "model_accuracy", "expected_move_pct", "price_at_prediction",
     ]
+
+
+def test_prediction_history_does_not_drop_model_accuracy_or_expected_move(isolated_storage):
+    """
+    Regression test for a real bug: get_prediction_history() read every field
+    from the JSONL log into a DataFrame, then sliced to a fixed column list
+    before returning — a list that never included "model_accuracy" or
+    "expected_move_pct", even though save_prediction() always writes them.
+    The UI's fallback ("N/A" / "—") fired on every single row because the
+    columns were never there to check, not because the data was missing.
+    Caught from a real user's exported CSV showing every row's Exp Move and
+    Model Acc as empty, while the same rows in the raw JSONL had real values.
+    """
+    from analysis.ml_prediction import _predictions_path, get_prediction_history
+    import json
+
+    record = {
+        "predicted_at": "2026-07-29T10:43:24.951145-04:00", "date": "2026-07-29T10:43:24.951145-04:00",
+        "ticker": "ZZCOLDROP", "direction": "neutral", "probability": 0.5117, "confidence": "low",
+        "model_accuracy": 0.4467, "expected_move_pct": -1.25, "horizon_days": 5,
+        "price_at_prediction": 734.11, "actual_outcome": None, "correct": None,
+    }
+    path = _predictions_path("ZZCOLDROP")
+    with open(path, "w") as f:
+        f.write(json.dumps(record) + "\n")
+
+    history = get_prediction_history("ZZCOLDROP")
+    assert history.iloc[0]["model_accuracy"] == 0.4467
+    assert history.iloc[0]["expected_move_pct"] == -1.25
+    assert history.iloc[0]["price_at_prediction"] == 734.11
 
 
 def test_predict_persists_to_history(synthetic_indicators_df, isolated_storage):
@@ -252,6 +283,64 @@ def test_predict_appends_without_overwriting(synthetic_indicators_df, isolated_s
 
     history = get_prediction_history("ZZAPPEND")
     assert len(history) == 3
+
+
+# ── _price_sanity_error() — guards against a corrupted last bar ─────────────
+# Found via a real user report: one logged prediction had price_at_prediction
+# = ~$108 for SPY while every adjacent prediction (90+ others across 5 logs)
+# showed ~$750. The ticker field was correct, so it wasn't a mislabeled log —
+# most likely a single bad tick from the data provider. Can't prove the exact
+# external cause, but the fix doesn't need to: refuse to predict on a last
+# bar that looks nothing like its own recent history.
+
+def test_price_sanity_flags_a_corrupted_last_bar():
+    from analysis.ml_prediction import _price_sanity_error
+
+    normal = [748.0, 750.0, 751.0, 749.0, 752.0, 750.0, 753.0, 749.0, 750.0, 751.0,
+              752.0, 750.0, 748.0, 749.0, 751.0, 750.0, 752.0, 749.0, 750.0, 751.0]
+    df = pd.DataFrame({"Close": normal + [108.70552848146195]})
+
+    error = _price_sanity_error(df, "SPY")
+    assert error is not None
+    assert "SPY" in error
+
+
+def test_price_sanity_passes_a_normal_last_bar():
+    from analysis.ml_prediction import _price_sanity_error
+
+    normal = [748.0, 750.0, 751.0, 749.0, 752.0, 750.0, 753.0, 749.0, 750.0, 751.0,
+              752.0, 750.0, 748.0, 749.0, 751.0, 750.0, 752.0, 749.0, 750.0, 751.0]
+    df = pd.DataFrame({"Close": normal + [754.0]})
+
+    assert _price_sanity_error(df, "SPY") is None
+
+
+def test_price_sanity_does_not_flag_a_large_but_plausible_move():
+    """A real ~12% gap (earnings, news) on a volatile name must not trip this."""
+    from analysis.ml_prediction import _price_sanity_error
+
+    normal = [100.0] * 20
+    df = pd.DataFrame({"Close": normal + [112.0]})
+
+    assert _price_sanity_error(df, "SMALLCAP") is None
+
+
+def test_price_sanity_skips_when_too_little_history():
+    from analysis.ml_prediction import _price_sanity_error
+
+    df = pd.DataFrame({"Close": [100.0, 101.0, 102.0, 500.0]})
+    assert _price_sanity_error(df, "NEWLISTING") is None
+
+
+def test_predict_refuses_on_a_corrupted_last_bar(synthetic_indicators_df, isolated_storage):
+    from analysis.ml_prediction import predict
+
+    corrupted = synthetic_indicators_df.copy()
+    corrupted.iloc[-1, corrupted.columns.get_loc("Close")] = 1.0  # nowhere near its own recent history
+
+    result = predict("ZZBADPRICE", corrupted)
+    assert result["error"] is not None
+    assert "ZZBADPRICE" in result["error"] or "deviates" in result["error"]
 
 
 # ── evaluate_model() ─────────────────────────────────────────────────────────

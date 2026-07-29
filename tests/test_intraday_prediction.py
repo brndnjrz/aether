@@ -422,6 +422,20 @@ def test_predict_without_auto_train_errors_cleanly(intraday_indicators_df, isola
     assert "not trained" in result["error"].lower() or "no 15m model" in result["error"].lower()
 
 
+def test_predict_intraday_refuses_on_a_corrupted_last_bar(intraday_indicators_df, isolated_intraday_storage):
+    """
+    predict_intraday() shares ml_prediction's _price_sanity_error() rather
+    than duplicating it, so a corrupted final bar is refused here the same
+    way as the daily model — same failure class, same guard.
+    """
+    corrupted = intraday_indicators_df.copy()
+    corrupted.iloc[-1, corrupted.columns.get_loc("Close")] = 1.0
+
+    result = predict_intraday("TEST", "15m", df=corrupted)
+    assert result["error"] is not None
+    assert "deviates" in result["error"]
+
+
 def test_predict_reuses_an_existing_model(intraday_indicators_df, isolated_intraday_storage):
     train_intraday_model("TEST", "15m", df=intraday_indicators_df)
     mtime = _xgb_path("TEST", "15m").stat().st_mtime
@@ -460,6 +474,7 @@ def test_prediction_round_trips_into_history(intraday_indicators_df, isolated_in
     assert len(hist) == 1
     assert hist.iloc[0]["direction"] in ("bullish", "bearish", "neutral")
     assert pd.notna(hist.iloc[0]["date"])
+    assert pd.notna(hist.iloc[0]["price_at_prediction"])
 
 
 def test_history_appends_rather_than_overwrites(intraday_indicators_df, isolated_intraday_storage):

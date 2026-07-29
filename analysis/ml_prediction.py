@@ -225,6 +225,41 @@ def _filter_directional(X: pd.DataFrame, y: pd.Series) -> Tuple[pd.DataFrame, pd
     return X.loc[mask], y.loc[mask]
 
 
+def _price_sanity_error(df: pd.DataFrame, ticker: str, threshold: float = 0.15) -> Optional[str]:
+    """
+    Guards against a single corrupted/glitched final bar from the data
+    provider silently poisoning price_at_prediction. Observed once in
+    production: a fetched last close of ~$108 for SPY, saved and displayed
+    alongside every adjacent prediction showing ~$750 — every other
+    prediction across five separate logs (90+ daily, 30+ intraday) had a
+    normal price, so this reads as a one-off bad fetch, not a systemic
+    issue, but it's cheap to guard against recurring.
+
+    Compares the latest close to the median of the preceding ~20 bars
+    (excluding itself) rather than a caller-supplied "last known good"
+    price, so a real multi-day trend never trips it — only a single bar
+    that jumps far outside its own recent neighborhood. A move this size
+    in one bar is not a real price for any equity/ETF; it's bad data.
+
+    Returns an error message if the check fails, else None. Skips the
+    check (returns None) when there isn't enough history to judge from.
+    """
+    recent = df["Close"].tail(21)
+    if len(recent) < 11:
+        return None
+    recent_median = float(recent.iloc[:-1].median())
+    latest_close = float(recent.iloc[-1])
+    if recent_median <= 0:
+        return None
+    deviation = abs(latest_close - recent_median) / recent_median
+    if deviation > threshold:
+        return (
+            f"Latest price for {ticker} ({latest_close:.2f}) deviates {deviation:.0%} from "
+            f"its own recent median ({recent_median:.2f}) — likely a bad data fetch. Try again."
+        )
+    return None
+
+
 def _run_walk_forward(
     X: pd.DataFrame,
     y_dir: pd.Series,
@@ -788,6 +823,12 @@ def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
             result["error"] = f"Data fetch failed: {exc}"
             return result
 
+    sanity_error = _price_sanity_error(df, ticker)
+    if sanity_error:
+        logger.error(f"predict: {ticker} failed price sanity check: {sanity_error}")
+        result["error"] = sanity_error
+        return result
+
     # ── Train if models do not exist ──────────────────────────────────────────
     if not _xgb_path(ticker).exists() or not _rf_path(ticker).exists():
         logger.info("predict: no saved models for %s — training now", ticker)
@@ -955,12 +996,23 @@ def get_prediction_history(ticker: str) -> pd.DataFrame:
     confidence : str
     actual_outcome : str or None  (filled in retrospectively)
     correct : bool or None
+    model_accuracy : float or None
+    expected_move_pct : float or None
+    price_at_prediction : float or None
     """
     ticker = ticker.upper()
     resolve_predictions(ticker)
 
     path = _predictions_path(ticker)
-    empty_cols = ["date", "direction", "probability", "confidence", "actual_outcome", "correct"]
+    # model_accuracy/expected_move_pct/price_at_prediction were being read
+    # into the intermediate DataFrame below and then silently dropped by the
+    # final df[empty_cols] slice, since they were never listed here — the
+    # bug behind "Exp Move"/"Model Acc" always showing empty in the UI even
+    # though the underlying JSONL records had real values the whole time.
+    empty_cols = [
+        "date", "direction", "probability", "confidence", "actual_outcome", "correct",
+        "model_accuracy", "expected_move_pct", "price_at_prediction",
+    ]
 
     if not path.exists():
         return pd.DataFrame(columns=empty_cols)

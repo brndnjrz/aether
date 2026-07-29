@@ -1318,20 +1318,32 @@ def _render_model_performance(eval_result: dict, ticker: str):
                 st.dataframe(conf_df, hide_index=True, width="stretch")
 
 
-def _format_correct_label(direction: str, correct) -> str:
+def _format_correct_label(direction: str, correct, has_price: bool = True) -> str:
     """
     `correct` is True/False/None. Rendered as a raw boolean, Streamlit shows
     it as a checkbox — and a still-pending prediction (None) has no glyph of
     its own, so it renders as an empty box indistinguishable from an
-    incorrect call. Explicit text removes that ambiguity: pending, not
-    graded, correct, and incorrect are four different states and now look
-    like four different things. Neutral predictions are never resolved by
-    design (resolve_predictions() excludes them, matching how training
-    excludes the neutral class) — labeled "not graded" rather than
-    "pending" so it doesn't imply one is still coming.
+    incorrect call. Explicit text removes that ambiguity.
+
+    Five states, five distinct labels:
+    - not graded: neutral predictions are never resolved by design
+      (resolve_predictions() excludes them, matching how training excludes
+      the neutral class)
+    - no baseline price: resolve_predictions() requires price_at_prediction
+      to compute a real outcome — some predictions logged before that field
+      existed have none, and can never resolve no matter how much time
+      passes. Without this check they'd show "Pending" forever, which
+      wrongly implies a result is still coming.
+    - pending: still within its horizon — will resolve once enough trading
+      days/bars have elapsed
+    - correct / incorrect: resolved
     """
     if pd.isna(correct):
-        return "— (not graded)" if str(direction).lower() == "neutral" else "⏳ Pending"
+        if str(direction).lower() == "neutral":
+            return "— (not graded)"
+        if not has_price:
+            return "— (no baseline price)"
+        return "⏳ Pending"
     return "✅ Correct" if bool(correct) else "❌ Incorrect"
 
 
@@ -1339,6 +1351,7 @@ def _format_outcome_label(actual_outcome) -> str:
     if pd.isna(actual_outcome):
         return "—"
     return f"{float(actual_outcome):+.2f}%"
+
 
 
 def _render_prediction_history(ticker: str):
@@ -1478,8 +1491,10 @@ def _render_prediction_history(ticker: str):
         display_df["Actual Outcome"] = "—"
 
     if "correct" in display_df.columns:
+        has_price_col = display_df["price_at_prediction"] if "price_at_prediction" in display_df.columns else pd.Series([True] * len(display_df), index=display_df.index)
         display_df["Correct"] = [
-            _format_correct_label(d, c) for d, c in zip(display_df["direction"], display_df["correct"])
+            _format_correct_label(d, c, has_price=pd.notna(p))
+            for d, c, p in zip(display_df["direction"], display_df["correct"], has_price_col)
         ]
     else:
         display_df["Correct"] = "—"
@@ -1716,8 +1731,10 @@ def _render_intraday_predictions():
         # different states and should look like three different things.
         display["actual_outcome"] = display["actual_outcome"].map(_format_outcome_label)
         display["correct"] = [
-            _format_correct_label(d, c) for d, c in zip(display["direction"], display["correct"])
+            _format_correct_label(d, c, has_price=pd.notna(p))
+            for d, c, p in zip(display["direction"], display["correct"], display["price_at_prediction"])
         ]
+        display = display.drop(columns=["price_at_prediction"])
         display = display.rename(columns={
             "date": "Date", "direction": "Direction", "probability": "Probability",
             "confidence": "Confidence", "horizon_minutes": "Horizon (min)",

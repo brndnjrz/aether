@@ -58,6 +58,7 @@ from config.tz import MARKET_TZ, now_et_iso
 from analysis.ml_prediction import (
     _directional_accuracy,
     _filter_directional,
+    _price_sanity_error,
     _rf_config,
     _run_walk_forward,
     _to_binary_labels,
@@ -705,6 +706,11 @@ def predict_intraday(
         return {"error": f"No {interval} price data available for {ticker}.",
                 "ticker": ticker, "interval": interval}
 
+    sanity_error = _price_sanity_error(df, ticker)
+    if sanity_error:
+        logger.error(f"predict_intraday: {ticker} {interval} failed price sanity check: {sanity_error}")
+        return {"error": sanity_error, "ticker": ticker, "interval": interval}
+
     if not model_exists(ticker, interval):
         if not auto_train:
             return {"error": f"No {interval} model trained for {ticker}.",
@@ -792,7 +798,7 @@ def predict_intraday(
 # ── Prediction history ───────────────────────────────────────────────────────
 
 _HISTORY_COLS = ["date", "direction", "probability", "confidence",
-                 "horizon_minutes", "actual_outcome", "correct"]
+                 "horizon_minutes", "actual_outcome", "correct", "price_at_prediction"]
 
 
 def save_intraday_prediction(ticker: str, interval: str, prediction: Dict[str, Any]) -> None:
