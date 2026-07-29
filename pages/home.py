@@ -8,18 +8,9 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from data.macro_data import get_market_overview, get_sp500_regime, get_sector_performance, get_vix_data
+from portfolio.activity_log import EVENT_LABELS
 
 logger = logging.getLogger(__name__)
-
-_EVENT_LABELS = {
-    "day_trading_analyze": "Day Trading — Analyze",
-    "options_view": "Options — Chain viewed",
-    "options_expiry_view": "Options — Expiry picked",
-    "prediction_generated": "Predictions — Daily signal",
-    "intraday_prediction_generated": "Predictions — Intraday signal",
-    "strategy_lab_setup": "Strategy Lab — MTF setup logged",
-    "orbc_signal": "Strategy Lab — ORBC signal logged",
-}
 
 
 def render():
@@ -174,7 +165,7 @@ def render():
         rows = [{
             "Time": pd.Timestamp(a["logged_at"]).strftime("%m/%d %I:%M %p ET"),
             "Ticker": a["ticker"],
-            "Event": _EVENT_LABELS.get(a["event_type"], a["event_type"]),
+            "Event": EVENT_LABELS.get(a["event_type"], a["event_type"]),
         } for a in recent]
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 

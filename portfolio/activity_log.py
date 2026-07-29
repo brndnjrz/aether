@@ -11,6 +11,19 @@ from config.tz import now_et_iso
 
 logger = logging.getLogger(__name__)
 
+# Single source of truth for turning a raw event_type into something
+# readable — shared by the Dashboard's Recent Activity feed and the Options
+# Log's "what were you looking at" lookup, so the two can't drift apart.
+EVENT_LABELS = {
+    "day_trading_analyze": "Day Trading — Analyze",
+    "options_view": "Options — Chain viewed",
+    "options_expiry_view": "Options — Expiry picked",
+    "prediction_generated": "Predictions — Daily signal",
+    "intraday_prediction_generated": "Predictions — Intraday signal",
+    "strategy_lab_setup": "Strategy Lab — MTF setup logged",
+    "orbc_signal": "Strategy Lab — ORBC signal logged",
+}
+
 
 def log_activity(event_type: str, ticker: str, detail: Dict[str, Any]):
     init_db()
