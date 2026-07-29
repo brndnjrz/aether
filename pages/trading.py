@@ -1288,11 +1288,57 @@ def _render_model_performance(eval_result: dict, ticker: str):
                 st.caption(f"Balanced: {bull_pct:.0f}% bullish ({n_bull:,}) / {bear_pct:.0f}% bearish ({n_bear:,})")
 
     with col2:
-        st.markdown("#### Fold-by-Fold Accuracy")
+        st.markdown("#### Forward Verification")
         st.caption(
-            "Per-fold accuracy chart requires running Generate Prediction first. "
-            "Walk-forward mean accuracy and std are shown in the Performance Metrics panel."
+            "Walk-forward accuracy (left) is measured on held-out historical data. "
+            "This is measured on live predictions actually logged for this ticker, "
+            "graded once each one's horizon has elapsed — the real-world check."
         )
+        total_preds = eval_result.get("total_predictions") or 0
+        last_n_acc = eval_result.get("last_n_accuracy")
+        by_conf = eval_result.get("win_rate_by_confidence") or {}
+
+        if last_n_acc is None and not by_conf:
+            st.info(
+                f"{total_preds} prediction(s) logged for {ticker} so far — need at least 5 "
+                "resolved (horizon elapsed) before a forward-verified hit rate shows here."
+            )
+        else:
+            if last_n_acc is not None:
+                st.metric(
+                    "Recent Hit Rate", f"{last_n_acc * 100:.1f}%",
+                    help="Directional hit rate over the most recently resolved predictions (up to the last 20).",
+                )
+            if by_conf:
+                st.markdown("**Hit rate by confidence**")
+                conf_df = pd.DataFrame([
+                    {"Confidence": lvl.title(), "Hit Rate": f"{v * 100:.1f}%"}
+                    for lvl, v in by_conf.items()
+                ])
+                st.dataframe(conf_df, hide_index=True, width="stretch")
+
+
+def _format_correct_label(direction: str, correct) -> str:
+    """
+    `correct` is True/False/None. Rendered as a raw boolean, Streamlit shows
+    it as a checkbox — and a still-pending prediction (None) has no glyph of
+    its own, so it renders as an empty box indistinguishable from an
+    incorrect call. Explicit text removes that ambiguity: pending, not
+    graded, correct, and incorrect are four different states and now look
+    like four different things. Neutral predictions are never resolved by
+    design (resolve_predictions() excludes them, matching how training
+    excludes the neutral class) — labeled "not graded" rather than
+    "pending" so it doesn't imply one is still coming.
+    """
+    if pd.isna(correct):
+        return "— (not graded)" if str(direction).lower() == "neutral" else "⏳ Pending"
+    return "✅ Correct" if bool(correct) else "❌ Incorrect"
+
+
+def _format_outcome_label(actual_outcome) -> str:
+    if pd.isna(actual_outcome):
+        return "—"
+    return f"{float(actual_outcome):+.2f}%"
 
 
 def _render_prediction_history(ticker: str):
@@ -1306,6 +1352,21 @@ def _render_prediction_history(ticker: str):
     if hist_df.empty:
         st.info("No prediction history yet for this ticker. Generate a prediction to start tracking.")
         return
+
+    # Forward-verified hit rate — over the FULL history, not the month/year
+    # window below, so it reads as "does this model actually work" rather
+    # than resetting to nothing whenever the filter lands on a quiet month.
+    resolved = hist_df[hist_df["correct"].notna()]
+    if not resolved.empty:
+        hit_rate = resolved["correct"].astype(bool).mean() * 100
+        h1, h2 = st.columns(2)
+        h1.metric("Logged Predictions", len(hist_df))
+        h2.metric("Resolved Hit Rate", f"{hit_rate:.1f}%", f"{len(resolved)} resolved")
+    else:
+        st.caption(
+            f"{len(hist_df)} logged · none resolved yet — a prediction resolves once its "
+            "horizon (in trading days) has elapsed."
+        )
 
     # Year/month filter — defaults to the current month. Plotly's autorange on
     # a date axis with sparse/clustered points (a new ticker with only a
@@ -1411,7 +1472,19 @@ def _render_prediction_history(ticker: str):
     else:
         display_df["direction_display"] = "N/A"
 
-    cols_to_show = ["Date", "direction_display", "Probability", "confidence", "Exp Move", "Model Acc"]
+    if "actual_outcome" in display_df.columns:
+        display_df["Actual Outcome"] = display_df["actual_outcome"].map(_format_outcome_label)
+    else:
+        display_df["Actual Outcome"] = "—"
+
+    if "correct" in display_df.columns:
+        display_df["Correct"] = [
+            _format_correct_label(d, c) for d, c in zip(display_df["direction"], display_df["correct"])
+        ]
+    else:
+        display_df["Correct"] = "—"
+
+    cols_to_show = ["Date", "direction_display", "Probability", "confidence", "Exp Move", "Model Acc", "Actual Outcome", "Correct"]
     available_cols = [c for c in cols_to_show if c in display_df.columns]
     table_df = display_df[available_cols].rename(columns={"direction_display": "Direction", "confidence": "Confidence"})
 
@@ -1636,6 +1709,20 @@ def _render_intraday_predictions():
             )
         display = hist.copy()
         display["date"] = display["date"].dt.tz_convert(MARKET_TZ).dt.strftime("%Y-%m-%d %I:%M %p ET")
+        # Rendered as a raw boolean, "correct" shows as a checkbox, and a
+        # still-pending prediction (None) has no glyph of its own — it would
+        # render as an empty box indistinguishable from an incorrect call.
+        # Explicit text instead: pending, correct, and incorrect are three
+        # different states and should look like three different things.
+        display["actual_outcome"] = display["actual_outcome"].map(_format_outcome_label)
+        display["correct"] = [
+            _format_correct_label(d, c) for d, c in zip(display["direction"], display["correct"])
+        ]
+        display = display.rename(columns={
+            "date": "Date", "direction": "Direction", "probability": "Probability",
+            "confidence": "Confidence", "horizon_minutes": "Horizon (min)",
+            "actual_outcome": "Actual Outcome", "correct": "Correct",
+        })
         st.dataframe(display, hide_index=True, width="stretch")
 
 
