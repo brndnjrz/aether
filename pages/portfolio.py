@@ -78,8 +78,17 @@ def _theme() -> str:
 
 def _round_trips_df(round_trips: list) -> pd.DataFrame:
     df = pd.DataFrame(round_trips)
-    df["entry_time"] = pd.to_datetime(df["entry_time"])
-    df["exit_time"] = pd.to_datetime(df["exit_time"])
+    # format="mixed" is required: fill timestamps are ISO8601 but not always
+    # the same ISO8601 — .isoformat() omits the microseconds field entirely
+    # when it's exactly zero and includes it otherwise, so the same column
+    # mixes "...T11:23:07-04:00" and "...T11:23:07.216006-04:00". Without
+    # format="mixed", pandas' vectorized parser infers one fixed format from
+    # the first row and raises ValueError on every later row that doesn't
+    # match it — exactly the bug already fixed once in
+    # analysis/ml_prediction.py's get_prediction_history(), recurring here
+    # because this is a separate parsing call over separate data.
+    df["entry_time"] = pd.to_datetime(df["entry_time"], format="mixed")
+    df["exit_time"] = pd.to_datetime(df["exit_time"], format="mixed")
     return df
 
 
