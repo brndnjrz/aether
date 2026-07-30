@@ -217,7 +217,7 @@ def test_prediction_history_empty_before_any_predictions(isolated_storage):
     assert len(history) == 0
     assert list(history.columns) == [
         "date", "direction", "probability", "confidence", "actual_outcome", "correct",
-        "model_accuracy", "expected_move_pct", "price_at_prediction",
+        "model_accuracy", "expected_move_pct", "horizon_days", "price_at_prediction",
     ]
 
 

@@ -998,6 +998,7 @@ def get_prediction_history(ticker: str) -> pd.DataFrame:
     correct : bool or None
     model_accuracy : float or None
     expected_move_pct : float or None
+    horizon_days : int or None
     price_at_prediction : float or None
     """
     ticker = ticker.upper()
@@ -1009,9 +1010,11 @@ def get_prediction_history(ticker: str) -> pd.DataFrame:
     # final df[empty_cols] slice, since they were never listed here — the
     # bug behind "Exp Move"/"Model Acc" always showing empty in the UI even
     # though the underlying JSONL records had real values the whole time.
+    # horizon_days has the same problem — save_prediction() always writes it,
+    # but it was never in this list either.
     empty_cols = [
         "date", "direction", "probability", "confidence", "actual_outcome", "correct",
-        "model_accuracy", "expected_move_pct", "price_at_prediction",
+        "model_accuracy", "expected_move_pct", "horizon_days", "price_at_prediction",
     ]
 
     if not path.exists():

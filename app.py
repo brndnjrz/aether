@@ -267,5 +267,6 @@ pg = st.navigation([
     st.Page("pages/portfolio.py", title="Options Log", icon="📝"),
     st.Page("pages/trading.py", title="Trading Desk", icon="🎯"),
     st.Page("pages/strategy_lab.py", title="Strategy Lab", icon="🧭"),
+    st.Page("pages/model_lab.py", title="Model Lab", icon="🧪"),
 ])
 pg.run()
