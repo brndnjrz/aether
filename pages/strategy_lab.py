@@ -38,6 +38,13 @@ from analysis.orbc_strategy import (
     to_market_tz,
 )
 from analysis.trendlines import detect_recent_trendlines, detect_swing_points
+from analysis.intraday_prediction import (
+    INTERVAL_SPECS,
+    model_exists as intraday_model_exists,
+    load_metadata as load_intraday_metadata,
+    get_intraday_prediction_history,
+)
+from config.tz import MARKET_TZ
 from portfolio.activity_log import log_activity
 
 logger = logging.getLogger(__name__)
@@ -239,6 +246,68 @@ def _render_mtf(ticker: str):
         _render_scanner(ticker)
     with sub_backtest:
         _render_backtest(ticker)
+
+
+_DIRECTION_ICONS = {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪"}
+
+
+def _render_intraday_predictions_reference(ticker: str):
+    """
+    Read-only reference panel: the latest saved Intraday Prediction per
+    interval, for looking over while trading without leaving Strategy Lab.
+    Training/refreshing models stays on Trading Desk — this tab only reads
+    what's already saved there.
+    """
+    st.caption(
+        "Latest saved Intraday Prediction per interval — train or refresh these "
+        "from Trading Desk → Predictions → Intraday. This panel only reads what's "
+        "already saved, it doesn't generate anything."
+    )
+
+    rows = []
+    untrained = []
+    for interval in INTERVAL_SPECS:
+        if not intraday_model_exists(ticker, interval):
+            untrained.append(interval)
+            rows.append({
+                "Interval": interval, "Status": "— No model trained",
+                "Direction": "—", "Confidence": "—", "Probability": "—",
+                "Model Accuracy": "—", "Generated": "—",
+            })
+            continue
+
+        history = get_intraday_prediction_history(ticker, interval)
+        if history.empty:
+            rows.append({
+                "Interval": interval, "Status": "— Trained, no prediction yet",
+                "Direction": "—", "Confidence": "—", "Probability": "—",
+                "Model Accuracy": "—", "Generated": "—",
+            })
+            continue
+
+        latest = history.iloc[0]
+        meta = load_intraday_metadata(ticker, interval)
+        direction = (latest["direction"] or "neutral").lower()
+        icon = _DIRECTION_ICONS.get(direction, "⚪")
+        accuracy = meta.get("directional_accuracy")
+        generated = latest["date"]
+        rows.append({
+            "Interval": interval, "Status": "Saved prediction",
+            "Direction": f"{icon} {direction.upper()}",
+            "Confidence": (latest["confidence"] or "—").title() if latest["confidence"] else "—",
+            "Probability": f"{latest['probability'] * 100:.0f}%" if pd.notna(latest["probability"]) else "—",
+            "Model Accuracy": f"{accuracy * 100:.1f}%" if accuracy is not None else "—",
+            "Generated": generated.tz_convert(MARKET_TZ).strftime("%m/%d %I:%M %p ET") if pd.notna(generated) else "—",
+        })
+
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+    if untrained:
+        st.info(
+            f"No model trained yet for {ticker} at {', '.join(untrained)} — "
+            "head to Trading Desk → Predictions → Intraday to train it (or use "
+            "Train / Update All to cover every interval at once)."
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -720,7 +789,7 @@ def render():
     with tab_orbc:
         _render_orbc(ticker)
     with tab_mtf:
-        _render_mtf(ticker)
+        _render_intraday_predictions_reference(ticker)
 
     st.markdown("---")
     st.caption("Aether • Data from yfinance • For personal use only. Not financial advice.")
