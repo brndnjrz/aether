@@ -37,6 +37,7 @@ from analysis.orbc_strategy import (
     latest_session_state,
     to_market_tz,
 )
+from analysis.trendlines import detect_recent_trendlines, detect_swing_points
 from portfolio.activity_log import log_activity
 
 logger = logging.getLogger(__name__)
@@ -409,6 +410,35 @@ def _orbc_signal_chart(session_df: pd.DataFrame, orange: dict, signals: list, re
                        line=dict(color="#ff9800", width=1.5)),
             row=1, col=1,
         )
+
+    # Trendlines/swings — same detection + styling as the Day Trading 5m chart,
+    # fit on the session bars so they scale to whatever interval is selected.
+    trendlines = detect_recent_trendlines(session_df)
+    swings = detect_swing_points(session_df)
+
+    if trendlines:
+        fig.add_trace(go.Scatter(
+            x=trendlines["index"], y=trendlines["support_line"], name="Support Line",
+            line=dict(color="#00e676", width=2, dash="dash"),
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=trendlines["index"], y=trendlines["resist_line"], name="Resistance Line",
+            line=dict(color="#ff1744", width=2, dash="dash"),
+        ), row=1, col=1)
+
+    if swings:
+        swing_highs = [s for s in swings if s["type"] == "high"]
+        swing_lows = [s for s in swings if s["type"] == "low"]
+        if swing_highs:
+            fig.add_trace(go.Scatter(
+                x=[s["timestamp"] for s in swing_highs], y=[s["price"] for s in swing_highs], name="Swing High",
+                mode="markers", marker=dict(symbol="triangle-down", size=9, color="#ef5350"),
+            ), row=1, col=1)
+        if swing_lows:
+            fig.add_trace(go.Scatter(
+                x=[s["timestamp"] for s in swing_lows], y=[s["price"] for s in swing_lows], name="Swing Low",
+                mode="markers", marker=dict(symbol="triangle-up", size=9, color="#26a69a"),
+            ), row=1, col=1)
 
     # Opening range band + edges
     fig.add_hrect(
