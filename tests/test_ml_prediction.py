@@ -218,6 +218,7 @@ def test_prediction_history_empty_before_any_predictions(isolated_storage):
     assert list(history.columns) == [
         "date", "direction", "probability", "confidence", "actual_outcome", "correct",
         "model_accuracy", "expected_move_pct", "horizon_days", "price_at_prediction",
+        "indicator_snapshot",
     ]
 
 
@@ -249,6 +250,43 @@ def test_prediction_history_does_not_drop_model_accuracy_or_expected_move(isolat
     assert history.iloc[0]["model_accuracy"] == 0.4467
     assert history.iloc[0]["expected_move_pct"] == -1.25
     assert history.iloc[0]["price_at_prediction"] == 734.11
+
+
+def test_save_prediction_persists_indicator_snapshot(synthetic_indicators_df, isolated_storage):
+    """predict() must compute an indicator_snapshot and it must round-trip
+    through save_prediction()/get_prediction_history() — the data Phase 2's
+    failure categorization (analysis/prediction_errors.py) reads."""
+    from analysis.ml_prediction import predict, get_prediction_history
+
+    result = predict("ZZSNAP", synthetic_indicators_df)
+    assert result["error"] is None
+    assert isinstance(result["indicator_snapshot"], dict)
+    assert result["indicator_snapshot"]  # non-empty for a real synthetic df
+
+    history = get_prediction_history("ZZSNAP")
+    assert isinstance(history.iloc[0]["indicator_snapshot"], dict)
+    assert history.iloc[0]["indicator_snapshot"] == result["indicator_snapshot"]
+
+
+def test_prediction_history_backfills_missing_indicator_snapshot_for_legacy_rows(isolated_storage):
+    """Rows logged before indicator_snapshot existed must backfill to None,
+    not raise or misalign columns — same convention as horizon_days/
+    model_accuracy's earlier backfill fixes."""
+    from analysis.ml_prediction import _predictions_path, get_prediction_history
+    import json
+
+    record = {
+        "predicted_at": "2026-06-01T10:00:00-04:00", "date": "2026-06-01T10:00:00-04:00",
+        "ticker": "ZZLEGACY", "direction": "bullish", "probability": 0.6, "confidence": "medium",
+        "model_accuracy": 0.55, "expected_move_pct": 1.0, "horizon_days": 5,
+        "price_at_prediction": 100.0, "actual_outcome": None, "correct": None,
+    }
+    path = _predictions_path("ZZLEGACY")
+    with open(path, "w") as f:
+        f.write(json.dumps(record) + "\n")
+
+    history = get_prediction_history("ZZLEGACY")
+    assert history.iloc[0]["indicator_snapshot"] is None
 
 
 def test_predict_persists_to_history(synthetic_indicators_df, isolated_storage):

@@ -12,9 +12,16 @@ import streamlit as st
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from analysis.ml_prediction import _xgb_path as _daily_xgb_path, _rf_path as _daily_rf_path
-from analysis.intraday_prediction import INTERVAL_SPECS, model_exists as intraday_model_exists
+from analysis.ml_prediction import (
+    _xgb_path as _daily_xgb_path, _rf_path as _daily_rf_path,
+    get_prediction_history,
+)
+from analysis.intraday_prediction import (
+    INTERVAL_SPECS, model_exists as intraday_model_exists,
+    get_intraday_prediction_history,
+)
 from analysis.prediction_performance import compute_daily_prediction_metrics, compute_intraday_prediction_metrics
+from analysis.prediction_errors import categorize_incorrect_predictions, aggregate_failure_categories
 
 logger = logging.getLogger(__name__)
 
@@ -123,12 +130,73 @@ def _render_dashboard(metrics: dict, ticker: str, model_label: str):
                 st.caption(f"— {w}")
 
 
+def _render_failure_analysis(ticker: str, model_label: str, history: pd.DataFrame, interval: str = None):
+    st.markdown("**Why the model was wrong**")
+    recompute = st.checkbox(
+        "Recompute categories for legacy predictions (fetches network data)",
+        value=False, key=f"model_lab_recompute_{model_label}",
+        help=(
+            "Predictions logged before this feature shipped have no saved indicator "
+            "snapshot. Checking this re-fetches price history and recomputes "
+            "indicators for those rows only — predictions with a saved snapshot "
+            "are categorized either way, no network needed."
+        ),
+    )
+
+    price_history_fetcher = None
+    if recompute:
+        from data.price_data import get_price_history
+
+        if interval is None:
+            price_history_fetcher = lambda t: get_price_history(t, period="2y")
+        else:
+            max_period = INTERVAL_SPECS[interval]["max_period"]
+            price_history_fetcher = lambda t: get_price_history(t, period=max_period, interval=interval)
+
+    from data.fundamentals import get_earnings_history
+
+    categorized = categorize_incorrect_predictions(
+        history, price_history_fetcher=price_history_fetcher, ticker=ticker,
+        earnings_fetcher=get_earnings_history,
+    )
+    if categorized.empty:
+        st.caption("No incorrect predictions to analyze yet.")
+        return
+
+    agg = aggregate_failure_categories(categorized)
+    top = (agg["top_category"] or "—").replace("_", " ")
+    st.caption(f"{agg['n_incorrect']} incorrect prediction(s) — most common reason: {top}.")
+
+    counts_df = pd.DataFrame([
+        {"Category": c.replace("_", " ").title(), "Count": v}
+        for c, v in agg["category_counts"].items() if v > 0
+    ])
+    if not counts_df.empty:
+        st.bar_chart(counts_df.set_index("Category"))
+
+    with st.expander(f"{len(categorized)} incorrect prediction(s) — detail", expanded=False):
+        detail_df = pd.DataFrame([
+            {
+                "Date": row["date"],
+                "Direction": row["direction"],
+                "Categories": ", ".join(c.replace("_", " ") for c in row["failure_categories"]),
+                "Snapshot": row["snapshot_source"],
+            }
+            for _, row in categorized.iterrows()
+        ])
+        st.dataframe(detail_df, hide_index=True, width="stretch")
+
+
 def _render_daily_performance_dashboard(ticker: str):
     if not _daily_model_exists(ticker):
         st.info(f"No daily model trained yet for {ticker} — train it from Trading Desk → Predictions.")
         return
-    metrics = compute_daily_prediction_metrics(ticker)
+    history = get_prediction_history(ticker)
+    metrics = compute_daily_prediction_metrics(ticker, history=history)
     _render_dashboard(metrics, ticker, "daily")
+    if metrics["n_resolved"] > 0:
+        st.markdown("---")
+        _render_failure_analysis(ticker, "daily", history)
 
 
 def _render_intraday_performance_dashboard(ticker: str, interval: str):
@@ -138,8 +206,12 @@ def _render_intraday_performance_dashboard(ticker: str, interval: str):
             "Trading Desk → Predictions → Intraday."
         )
         return
-    metrics = compute_intraday_prediction_metrics(ticker, interval)
+    history = get_intraday_prediction_history(ticker, interval)
+    metrics = compute_intraday_prediction_metrics(ticker, interval, history=history)
     _render_dashboard(metrics, ticker, f"{interval} intraday")
+    if metrics["n_resolved"] > 0:
+        st.markdown("---")
+        _render_failure_analysis(ticker, f"{interval}_intraday", history, interval=interval)
 
 
 def render():

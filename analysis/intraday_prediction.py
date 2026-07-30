@@ -770,6 +770,13 @@ def predict_intraday(
     tradeability = assess_tradeability(accuracy, info["horizon_sigma"], round_trip_cost_pct)
     bar_ts = market_df.index[-1]
 
+    try:
+        from analysis.prediction_errors import build_indicator_snapshot
+        indicator_snapshot = build_indicator_snapshot(market_df)
+    except Exception as exc:
+        logger.debug("predict_intraday: indicator snapshot skipped for %s %s: %s", ticker, interval, exc)
+        indicator_snapshot = {}
+
     result = {
         "ticker": ticker,
         "interval": interval,
@@ -786,6 +793,7 @@ def predict_intraday(
         "price_at_prediction": float(market_df["Close"].iloc[-1]),
         "bar_timestamp": bar_ts.isoformat(),
         "last_trained": meta.get("trained_at"),
+        "indicator_snapshot": indicator_snapshot,
     }
     save_intraday_prediction(ticker, interval, result)
     logger.info(
@@ -798,7 +806,8 @@ def predict_intraday(
 # ── Prediction history ───────────────────────────────────────────────────────
 
 _HISTORY_COLS = ["date", "direction", "probability", "confidence",
-                 "horizon_minutes", "actual_outcome", "correct", "price_at_prediction"]
+                 "horizon_minutes", "actual_outcome", "correct", "price_at_prediction",
+                 "indicator_snapshot"]
 
 
 def save_intraday_prediction(ticker: str, interval: str, prediction: Dict[str, Any]) -> None:
@@ -818,6 +827,7 @@ def save_intraday_prediction(ticker: str, interval: str, prediction: Dict[str, A
             "horizon_minutes": prediction.get("horizon_minutes"),
             "model_accuracy": prediction.get("model_accuracy"),
             "price_at_prediction": prediction.get("price_at_prediction"),
+            "indicator_snapshot": prediction.get("indicator_snapshot"),
             "actual_outcome": None,
             "correct": None,
         }

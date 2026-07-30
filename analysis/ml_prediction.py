@@ -804,6 +804,7 @@ def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
         "horizon_days": None,
         "neutral_threshold_pct": None,
         "hyperparam_overrides": {},
+        "indicator_snapshot": {},
         "error": None,
     }
 
@@ -961,6 +962,17 @@ def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     if result["model_accuracy"] == 0.0:
         result["model_accuracy"] = metadata.get("directional_accuracy", 0.0) or 0.0
 
+    # ── Indicator snapshot (Prediction Improvement Engine, Phase 2) ──────────
+    # Point-in-time context for failure categorization later — a snapshot
+    # failure must never block the prediction itself, hence the try/except
+    # rather than letting build_indicator_snapshot's own internals leak here.
+    try:
+        from analysis.prediction_errors import build_indicator_snapshot
+        indicator_snapshot = build_indicator_snapshot(df)
+    except Exception as exc:
+        logger.debug(f"predict: indicator snapshot skipped for {ticker}: {exc}")
+        indicator_snapshot = {}
+
     # ── Assemble result ───────────────────────────────────────────────────────
     result.update({
         "direction": direction,
@@ -969,6 +981,7 @@ def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
         "confidence": confidence,
         "top_features": top_features,
         "price_at_prediction": float(df["Close"].iloc[-1]),
+        "indicator_snapshot": indicator_snapshot,
     })
 
     # ── Persist prediction ────────────────────────────────────────────────────
@@ -1000,6 +1013,9 @@ def get_prediction_history(ticker: str) -> pd.DataFrame:
     expected_move_pct : float or None
     horizon_days : int or None
     price_at_prediction : float or None
+    indicator_snapshot : dict or None  (point-in-time context for failure
+        categorization — see analysis/prediction_errors.py; None for
+        predictions logged before this field existed)
     """
     ticker = ticker.upper()
     resolve_predictions(ticker)
@@ -1015,6 +1031,7 @@ def get_prediction_history(ticker: str) -> pd.DataFrame:
     empty_cols = [
         "date", "direction", "probability", "confidence", "actual_outcome", "correct",
         "model_accuracy", "expected_move_pct", "horizon_days", "price_at_prediction",
+        "indicator_snapshot",
     ]
 
     if not path.exists():
@@ -1084,6 +1101,7 @@ def save_prediction(ticker: str, prediction: Dict[str, Any]) -> None:
             "expected_move_pct": prediction.get("expected_move_pct"),
             "horizon_days": prediction.get("horizon_days"),
             "price_at_prediction": prediction.get("price_at_prediction"),
+            "indicator_snapshot": prediction.get("indicator_snapshot"),
             "actual_outcome": None,
             "correct": None,
         }
