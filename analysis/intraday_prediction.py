@@ -58,9 +58,13 @@ from config.tz import MARKET_TZ, now_et_iso
 from analysis.ml_prediction import (
     _directional_accuracy,
     _filter_directional,
+    _gbc_config,
+    _logreg_config,
     _price_sanity_error,
     _rf_config,
     _run_walk_forward,
+    _run_walk_forward_multi,
+    _softmax_ensemble_weights,
     _to_binary_labels,
     _xgb_config,
     _STORAGE_DIR,
@@ -627,10 +631,18 @@ def train_intraday_model(
     rf_hp_overrides = rf_hp_choice["overrides"]
     rf_cfg = {**_rf_config(n_features=len(INTRADAY_FEATURE_NAMES)), **rf_hp_overrides}
 
-    wf = _run_walk_forward(X, y_dir, xgb_cfg, rf_cfg, n_splits=10, gap=horizon_bars)
+    wf_multi = _run_walk_forward_multi(
+        X, y_dir, {"xgb": ("xgb", xgb_cfg), "rf": ("rf", rf_cfg)},
+        n_splits=10, gap=horizon_bars, ensemble_weights={"xgb": 0.65, "rf": 0.35},
+    )
+    wf = wf_multi["ensemble"]
     if wf["n_folds"] == 0:
         result["error"] = "Walk-forward validation produced no valid folds — need more history."
         return result
+
+    ensemble_weights = _softmax_ensemble_weights({
+        name: m["mean_directional_accuracy"] for name, m in wf_multi["per_model"].items()
+    })
 
     tradeability = assess_tradeability(
         wf["mean_directional_accuracy"], choice["info"]["horizon_sigma"], round_trip_cost_pct,
@@ -665,6 +677,7 @@ def train_intraday_model(
         "tradeability": tradeability,
         "hyperparam_overrides": hp_overrides,
         "rf_hyperparam_overrides": rf_hp_overrides,
+        "ensemble_weights": ensemble_weights,
     }
     try:
         joblib.dump(xgb_final, _xgb_path(ticker, interval))
@@ -768,7 +781,8 @@ def predict_intraday(
 
     xgb_prob = float(xgb_model.predict_proba(latest)[0, 1])
     rf_prob = float(rf_model.predict_proba(latest)[0, 1])
-    ensemble = 0.65 * xgb_prob + 0.35 * rf_prob
+    ensemble_weights = meta.get("ensemble_weights") or {"xgb": 0.65, "rf": 0.35}
+    ensemble = ensemble_weights.get("xgb", 0.65) * xgb_prob + ensemble_weights.get("rf", 0.35) * rf_prob
 
     if ensemble >= 0.55:
         direction = "bullish"
@@ -808,6 +822,7 @@ def predict_intraday(
         "bar_timestamp": bar_ts.isoformat(),
         "last_trained": meta.get("trained_at"),
         "indicator_snapshot": indicator_snapshot,
+        "ensemble_weights": ensemble_weights,
     }
     save_intraday_prediction(ticker, interval, result)
     logger.info(
@@ -815,6 +830,89 @@ def predict_intraday(
         ticker, interval, direction, ensemble, confidence,
     )
     return result
+
+
+def compare_intraday_models(
+    ticker: str, interval: str = DEFAULT_INTERVAL, df: Optional[pd.DataFrame] = None,
+) -> Dict[str, Any]:
+    """
+    Intraday sibling of ml_prediction.compare_models() — scores XGBoost,
+    RandomForest, LogisticRegression, and GradientBoosting through the same
+    generalized walk-forward harness (ml_prediction._run_walk_forward_multi,
+    imported read-only, not a duplicated harness), using the interval's
+    already-selected label scheme and hyperparameters from load_metadata()
+    so the comparison matches what's actually deployed. Pure read/compare —
+    never retrains or overwrites _xgb_path()/_rf_path()/the accuracy JSON.
+
+    Returns the same shape as ml_prediction.compare_models(), plus
+    "interval".
+    """
+    ticker = ticker.upper().strip()
+    interval = _interval_tag(interval)
+    out: Dict[str, Any] = {
+        "ticker": ticker, "interval": interval,
+        "horizon_bars": None, "sigma_multiple": None,
+        "models": {}, "best_single_model": None,
+        "ensemble_weights": {}, "ensemble": {}, "error": None,
+    }
+
+    if df is None:
+        df = load_intraday_history(ticker, interval)
+    if df is None or df.empty:
+        out["error"] = f"No {interval} price data available for {ticker}."
+        return out
+
+    meta = load_metadata(ticker, interval)
+    horizon_bars = meta.get("horizon_bars", 5)
+    sigma_multiple = meta.get("sigma_multiple", 0.75)
+    out["horizon_bars"] = horizon_bars
+    out["sigma_multiple"] = sigma_multiple
+
+    try:
+        X, y, info = build_intraday_features(
+            df, ticker=ticker, horizon_bars=horizon_bars,
+            sigma_multiple=sigma_multiple, interval=interval,
+        )
+    except ValueError as exc:
+        out["error"] = str(exc)
+        return out
+
+    X_dir, y_dir = _filter_directional(X, y)
+    if len(X_dir) < MIN_DIRECTIONAL_SAMPLES:
+        out["error"] = f"Only {len(X_dir)} directional samples for {ticker} {interval} — need more history."
+        return out
+
+    norm_window = INTERVAL_SPECS[interval]["bars_per_session"] * 10
+    X_norm = normalize_intraday_features(X_dir, window=norm_window)
+
+    balance = class_balance_check(y_dir)
+    spw = balance["recommended_scale_pos_weight"]
+    xgb_cfg = {**_xgb_config(scale_pos_weight=spw), **meta.get("hyperparam_overrides", {})}
+    rf_cfg = {**_rf_config(n_features=len(INTRADAY_FEATURE_NAMES)), **meta.get("rf_hyperparam_overrides", {})}
+
+    model_specs = {
+        "xgb": ("xgb", xgb_cfg),
+        "rf": ("rf", rf_cfg),
+        "logreg": ("logreg", _logreg_config()),
+        "gbc": ("gbc", _gbc_config()),
+    }
+    wf_multi = _run_walk_forward_multi(X_norm, y_dir, model_specs, n_splits=10, gap=horizon_bars)
+    out["models"] = wf_multi["per_model"]
+
+    if wf_multi["n_folds"] == 0:
+        out["error"] = "Walk-forward produced no valid folds — need more data"
+        return out
+
+    accuracies = {name: m["mean_directional_accuracy"] for name, m in wf_multi["per_model"].items()}
+    out["best_single_model"] = max(accuracies, key=accuracies.get)
+    out["ensemble_weights"] = _softmax_ensemble_weights(accuracies)
+    out["ensemble"] = wf_multi["ensemble"]
+
+    logger.info(
+        "compare_intraday_models: %s %s best_single_model=%s accuracies=%s",
+        ticker, interval, out["best_single_model"], accuracies,
+    )
+    return out
 
 
 # ── Prediction history ───────────────────────────────────────────────────────

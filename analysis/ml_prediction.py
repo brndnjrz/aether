@@ -80,9 +80,11 @@ from config.tz import now_et_iso
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
 
 # XGBoost: optional but strongly preferred.
 try:
@@ -174,6 +176,39 @@ def _rf_config(n_features: int = 18) -> Dict[str, Any]:
         "class_weight": "balanced",
         "random_state": 42,
         "n_jobs": -1,
+    }
+
+
+def _logreg_config() -> Dict[str, Any]:
+    """
+    Linear baseline for model comparison (Prediction Improvement Engine,
+    Phase 4) — a cheap sanity floor other models should beat. Needs
+    StandardScaler-transformed input, unlike the tree models; handled inside
+    _fit_predict_proba(), never exposed to callers. `penalty` is left at
+    sklearn's default (l2) rather than passed explicitly — sklearn 1.8+
+    deprecates the standalone `penalty` param in favor of `l1_ratio`.
+    """
+    return {
+        "C": 1.0,
+        "class_weight": "balanced",
+        "max_iter": 1000,
+        "random_state": 42,
+    }
+
+
+def _gbc_config() -> Dict[str, Any]:
+    """
+    sklearn's own gradient boosting — a second, differently-regularized
+    boosted-tree comparison point against XGBoost, at zero new dependency
+    cost. Deliberately similar regularization philosophy to _xgb_config()
+    for a fair walk-forward comparison.
+    """
+    return {
+        "n_estimators": 150,
+        "max_depth": 3,
+        "learning_rate": 0.05,
+        "subsample": 0.8,
+        "random_state": 42,
     }
 
 
@@ -273,71 +308,80 @@ def _price_sanity_error(df: pd.DataFrame, ticker: str, threshold: float = 0.15) 
     return None
 
 
-def _run_walk_forward(
-    X: pd.DataFrame,
-    y_dir: pd.Series,
-    xgb_cfg: Dict[str, Any],
-    rf_cfg: Dict[str, Any],
-    n_splits: int = 10,
-    gap: int = 5,
-) -> Dict[str, Any]:
+_ENSEMBLE_SOFTMAX_TEMPERATURE = 0.05
+
+
+def _softmax_ensemble_weights(
+    mean_accuracies: Dict[str, float],
+    temperature: float = _ENSEMBLE_SOFTMAX_TEMPERATURE,
+) -> Dict[str, float]:
     """
-    Run anchored walk-forward validation. Returns a summary dict.
-    y_dir contains {-1, 0, 1} labels; neutral rows are excluded per fold.
+    {model_name: mean_directional_accuracy} -> {model_name: weight}, summing
+    to 1.0. Softmax over (accuracy - 0.5), so a model exactly at the
+    coin-flip baseline gets a near-zero relative score rather than the ~40-45%
+    share a raw-accuracy-proportional split would give it, and the gap
+    between e.g. a 54% and a 58% model is sharpened rather than compressed.
+    A model at or below 0.50 still gets a small positive weight — never
+    fully zeroed, matching the ensemble's existing philosophy of blending
+    rather than hard model-selection. Generalizes the historical hardcoded
+    0.65/0.35 XGB/RF split to N models; temperature=0.05 approximates that
+    split for a typical XGB-ahead-of-RF accuracy gap.
     """
-    tscv = TimeSeriesSplit(n_splits=n_splits, gap=gap)
-    X_arr = X.values.astype("float32")
-    y_arr = y_dir.values
+    names = list(mean_accuracies.keys())
+    if not names:
+        return {}
+    scores = np.array([mean_accuracies[n] - 0.5 for n in names])
+    exp_scores = np.exp(scores / temperature)
+    weights = exp_scores / exp_scores.sum()
+    return {n: round(float(w), 4) for n, w in zip(names, weights)}
 
-    fold_accs: List[float] = []
-    fold_aucs: List[float] = []
-    total_val_samples = 0
 
-    for train_idx, val_idx in tscv.split(X_arr):
-        if len(val_idx) < 10:
-            continue
-
-        # Filter neutrals
-        y_train_all = y_arr[train_idx]
-        y_val_all = y_arr[val_idx]
-
-        train_dir_mask = y_train_all != 0
-        val_dir_mask = y_val_all != 0
-
-        if train_dir_mask.sum() < 20 or val_dir_mask.sum() < 5:
-            continue
-
-        X_train = X_arr[train_idx][train_dir_mask].astype("float32")
-        y_train = _to_binary_labels(pd.Series(y_train_all[train_dir_mask]))
-        X_val = X_arr[val_idx][val_dir_mask].astype("float32")
-        y_val = _to_binary_labels(pd.Series(y_val_all[val_dir_mask]))
-
-        if len(np.unique(y_train)) < 2 or len(np.unique(y_val)) < 2:
-            continue
-
-        # Train XGBoost (or fallback RF)
+def _fit_predict_proba(
+    kind: str,
+    config: Dict[str, Any],
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+) -> np.ndarray:
+    """
+    Fit one model kind for one walk-forward fold, return predict_proba's
+    positive-class column. "xgb" falls back to a default-config
+    RandomForest if xgboost isn't importable — same degrade-not-crash
+    convention as the rest of this module for that optional dependency.
+    "logreg" needs StandardScaler-transformed input (fit on this fold's
+    training split only, never the validation split) — the only model kind
+    that does; tree-based kinds take the raw features.
+    """
+    if kind == "xgb":
         if _XGBOOST_AVAILABLE:
-            xgb_m = XGBClassifier(**xgb_cfg)
-            xgb_m.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
-            xgb_probs = xgb_m.predict_proba(X_val)[:, 1]
+            m = XGBClassifier(**config)
+            m.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
         else:
-            rf_fb = RandomForestClassifier(**rf_cfg)
-            rf_fb.fit(X_train, y_train)
-            xgb_probs = rf_fb.predict_proba(X_val)[:, 1]
+            m = RandomForestClassifier(**_rf_config())
+            m.fit(X_train, y_train)
+        return m.predict_proba(X_val)[:, 1]
+    if kind == "rf":
+        m = RandomForestClassifier(**config)
+        m.fit(X_train, y_train)
+        return m.predict_proba(X_val)[:, 1]
+    if kind == "logreg":
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_val_scaled = scaler.transform(X_val)
+        m = LogisticRegression(**config)
+        m.fit(X_train_scaled, y_train)
+        return m.predict_proba(X_val_scaled)[:, 1]
+    if kind == "gbc":
+        m = GradientBoostingClassifier(**config)
+        m.fit(X_train, y_train)
+        return m.predict_proba(X_val)[:, 1]
+    raise ValueError(f"Unknown model kind: {kind!r}")
 
-        rf_m = RandomForestClassifier(**rf_cfg)
-        rf_m.fit(X_train, y_train)
-        rf_probs = rf_m.predict_proba(X_val)[:, 1]
 
-        ensemble = 0.65 * xgb_probs + 0.35 * rf_probs
-
-        fold_accs.append(_directional_accuracy(y_val, ensemble))
-        try:
-            fold_aucs.append(float(roc_auc_score(y_val, ensemble)))
-        except ValueError:
-            fold_aucs.append(0.5)
-        total_val_samples += len(y_val)
-
+def _summarize_fold_scores(fold_accs: List[float], fold_aucs: List[float], n_validation_samples: int) -> Dict[str, Any]:
+    """Shared by every per-model and ensemble summary in _run_walk_forward_multi
+    — identical math/thresholds to the original _run_walk_forward's summary."""
     if not fold_accs:
         return {
             "n_folds": 0,
@@ -376,11 +420,124 @@ def _run_walk_forward(
         "mean_directional_accuracy": round(mean_acc, 4),
         "std_directional_accuracy": round(std_acc, 4),
         "mean_auc": round(mean_auc, 4),
-        "n_validation_samples": total_val_samples,
+        "n_validation_samples": n_validation_samples,
         "is_reliable": is_reliable,
         "reliability_reason": reason,
         "fold_accuracies": [round(a, 4) for a in fold_accs],
     }
+
+
+def _run_walk_forward_multi(
+    X: pd.DataFrame,
+    y_dir: pd.Series,
+    model_specs: Dict[str, Tuple[str, Dict[str, Any]]],
+    n_splits: int = 10,
+    gap: int = 5,
+    ensemble_weights: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
+    """
+    Generalizes the anchored walk-forward validation to N models.
+    model_specs: {model_name: (model_kind, config_dict)}, model_kind in
+    {"xgb", "rf", "logreg", "gbc"}. y_dir contains {-1, 0, 1} labels;
+    neutral rows are excluded per fold — identical CV-splitting/neutral-
+    filtering machinery as the original 2-model _run_walk_forward.
+
+    ensemble_weights is the FIXED weight dict used to blend every fold's
+    per-model probabilities (defaults to equal 1/N weight per model if not
+    given) — deliberately not adaptive per fold, so a caller that wants the
+    historical hardcoded 0.65/0.35 XGB/RF blend gets bit-identical results
+    to the original function on every fold, not a look-ahead-free but
+    numerically different adaptive scheme.
+
+    Returns {"n_folds", "per_model": {name: {...same shape as the original
+    return dict...}}, "ensemble_weights": <the weights actually used for
+    blending>, "ensemble": {...same shape...}}.
+    """
+    names = list(model_specs.keys())
+    if ensemble_weights is None:
+        ensemble_weights = {name: 1.0 / len(names) for name in names}
+
+    tscv = TimeSeriesSplit(n_splits=n_splits, gap=gap)
+    X_arr = X.values.astype("float32")
+    y_arr = y_dir.values
+
+    per_model_fold_accs: Dict[str, List[float]] = {name: [] for name in names}
+    per_model_fold_aucs: Dict[str, List[float]] = {name: [] for name in names}
+    ensemble_fold_accs: List[float] = []
+    ensemble_fold_aucs: List[float] = []
+    total_val_samples = 0
+
+    for train_idx, val_idx in tscv.split(X_arr):
+        if len(val_idx) < 10:
+            continue
+
+        y_train_all = y_arr[train_idx]
+        y_val_all = y_arr[val_idx]
+        train_dir_mask = y_train_all != 0
+        val_dir_mask = y_val_all != 0
+        if train_dir_mask.sum() < 20 or val_dir_mask.sum() < 5:
+            continue
+
+        X_train = X_arr[train_idx][train_dir_mask].astype("float32")
+        y_train = _to_binary_labels(pd.Series(y_train_all[train_dir_mask]))
+        X_val = X_arr[val_idx][val_dir_mask].astype("float32")
+        y_val = _to_binary_labels(pd.Series(y_val_all[val_dir_mask]))
+
+        if len(np.unique(y_train)) < 2 or len(np.unique(y_val)) < 2:
+            continue
+
+        fold_probs: Dict[str, np.ndarray] = {}
+        for name, (kind, config) in model_specs.items():
+            probs = _fit_predict_proba(kind, config, X_train, y_train, X_val, y_val)
+            fold_probs[name] = probs
+            per_model_fold_accs[name].append(_directional_accuracy(y_val, probs))
+            try:
+                per_model_fold_aucs[name].append(float(roc_auc_score(y_val, probs)))
+            except ValueError:
+                per_model_fold_aucs[name].append(0.5)
+
+        ensemble_probs = sum(ensemble_weights[name] * fold_probs[name] for name in names)
+        ensemble_fold_accs.append(_directional_accuracy(y_val, ensemble_probs))
+        try:
+            ensemble_fold_aucs.append(float(roc_auc_score(y_val, ensemble_probs)))
+        except ValueError:
+            ensemble_fold_aucs.append(0.5)
+        total_val_samples += len(y_val)
+
+    per_model_summary = {
+        name: _summarize_fold_scores(per_model_fold_accs[name], per_model_fold_aucs[name], total_val_samples)
+        for name in names
+    }
+    ensemble_summary = _summarize_fold_scores(ensemble_fold_accs, ensemble_fold_aucs, total_val_samples)
+
+    return {
+        "n_folds": ensemble_summary["n_folds"],
+        "per_model": per_model_summary,
+        "ensemble_weights": ensemble_weights,
+        "ensemble": ensemble_summary,
+    }
+
+
+def _run_walk_forward(
+    X: pd.DataFrame,
+    y_dir: pd.Series,
+    xgb_cfg: Dict[str, Any],
+    rf_cfg: Dict[str, Any],
+    n_splits: int = 10,
+    gap: int = 5,
+) -> Dict[str, Any]:
+    """
+    Run anchored walk-forward validation for the original 2-model XGB/RF
+    ensemble. UNCHANGED signature/return shape — now a thin wrapper over
+    _run_walk_forward_multi() with the historical fixed 0.65/0.35 blend, so
+    every existing caller (select_label_scheme, select_hyperparams,
+    select_rf_hyperparams, evaluate_model, intraday_prediction.py's
+    read-only import) keeps working unmodified.
+    """
+    return _run_walk_forward_multi(
+        X, y_dir, {"xgb": ("xgb", xgb_cfg), "rf": ("rf", rf_cfg)},
+        n_splits=n_splits, gap=gap, ensemble_weights={"xgb": 0.65, "rf": 0.35},
+    )["ensemble"]
 
 
 def _load_model_metadata(ticker: str) -> Dict[str, Any]:
@@ -653,6 +810,7 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
         "neutral_threshold_pct": None,
         "hyperparam_overrides": {},
         "rf_hyperparam_overrides": {},
+        "ensemble_weights": {},
         "label_search": [],
         "hyperparam_search": [],
         "rf_hyperparam_search": [],
@@ -733,13 +891,26 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
     rf_cfg = {**_rf_config(n_features=len(FEATURE_NAMES)), **rf_hp_overrides}
 
     # ── Full walk-forward validation BEFORE fitting the final model ───────────
+    # Runs through _run_walk_forward_multi directly (rather than the
+    # _run_walk_forward wrapper) so per-model accuracies are available to
+    # compute a learned ensemble weight below — "ensemble" is bit-identical
+    # to what _run_walk_forward(...) would have returned, since the fixed
+    # 0.65/0.35 weight is passed explicitly.
     logger.info("train_model: running full walk-forward validation for %s", ticker)
-    wf = _run_walk_forward(X_dir_18, y_dir, xgb_cfg, rf_cfg, n_splits=10, gap=horizon_days)
+    wf_multi = _run_walk_forward_multi(
+        X_dir_18, y_dir, {"xgb": ("xgb", xgb_cfg), "rf": ("rf", rf_cfg)},
+        n_splits=10, gap=horizon_days, ensemble_weights={"xgb": 0.65, "rf": 0.35},
+    )
+    wf = wf_multi["ensemble"]
+    ensemble_weights = _softmax_ensemble_weights({
+        name: m["mean_directional_accuracy"] for name, m in wf_multi["per_model"].items()
+    })
     logger.info(
-        "train_model: validation complete — mean_acc=%.3f std=%.3f reliable=%s",
+        "train_model: validation complete — mean_acc=%.3f std=%.3f reliable=%s ensemble_weights=%s",
         wf["mean_directional_accuracy"],
         wf["std_directional_accuracy"],
         wf["is_reliable"],
+        ensemble_weights,
     )
 
     # ── Final model trained on ALL directional data (18 core features only) ───
@@ -773,6 +944,7 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
             "neutral_threshold": neutral_threshold,
             "hyperparam_overrides": hp_overrides,
             "rf_hyperparam_overrides": rf_hp_overrides,
+            "ensemble_weights": ensemble_weights,
         }
         with open(_STORAGE_DIR / f"{ticker}_accuracy.json", "w") as f_acc:
             json.dump(acc_record, f_acc)
@@ -800,6 +972,7 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
         "neutral_threshold_pct": round(neutral_threshold * 100, 2),
         "hyperparam_overrides": hp_overrides,
         "rf_hyperparam_overrides": rf_hp_overrides,
+        "ensemble_weights": ensemble_weights,
         "label_search": label_choice["candidates"],
         "hyperparam_search": hp_choice["candidates"],
         "rf_hyperparam_search": rf_hp_choice["candidates"],
@@ -881,6 +1054,7 @@ def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
         "neutral_threshold_pct": None,
         "hyperparam_overrides": {},
         "rf_hyperparam_overrides": {},
+        "ensemble_weights": {},
         "indicator_snapshot": {},
         "error": None,
     }
@@ -934,6 +1108,8 @@ def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     result["neutral_threshold_pct"] = round(neutral_threshold * 100, 2)
     result["hyperparam_overrides"] = metadata["hyperparam_overrides"]
     result["rf_hyperparam_overrides"] = metadata["rf_hyperparam_overrides"]
+    ensemble_weights = metadata["ensemble_weights"]
+    result["ensemble_weights"] = ensemble_weights
 
     # ── Load models ───────────────────────────────────────────────────────────
     try:
@@ -966,7 +1142,7 @@ def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     try:
         xgb_prob = float(xgb_model.predict_proba(X_arr)[0, 1])
         rf_prob = float(rf_model.predict_proba(X_arr)[0, 1])
-        ensemble_prob = 0.65 * xgb_prob + 0.35 * rf_prob
+        ensemble_prob = ensemble_weights.get("xgb", 0.65) * xgb_prob + ensemble_weights.get("rf", 0.35) * rf_prob
     except Exception as exc:
         logger.error(f"predict: model inference error for {ticker}: {exc}")
         result["error"] = f"Model inference error: {exc}"
@@ -1023,7 +1199,7 @@ def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
 
         xgb_probs_full = xgb_model.predict_proba(X_dir_18)[:, 1]
         rf_probs_full = rf_model.predict_proba(X_dir_18)[:, 1]
-        ensemble_full = 0.65 * xgb_probs_full + 0.35 * rf_probs_full
+        ensemble_full = ensemble_weights.get("xgb", 0.65) * xgb_probs_full + ensemble_weights.get("rf", 0.35) * rf_probs_full
 
         predicted_mask = ensemble_full >= 0.5 if direction == "bullish" else ensemble_full < 0.5
 
@@ -1366,6 +1542,7 @@ def evaluate_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, 
     neutral_threshold = metadata["neutral_threshold"]
     hp_overrides = metadata["hyperparam_overrides"]
     rf_hp_overrides = metadata["rf_hyperparam_overrides"]
+    ensemble_weights = metadata["ensemble_weights"]
     out["horizon_days"] = horizon_days
 
     try:
@@ -1398,7 +1575,10 @@ def evaluate_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, 
 
     # Use only the 18 core features, consistent with train_model() and inference
     X_dir_18 = X_dir[FEATURE_NAMES]
-    wf = _run_walk_forward(X_dir_18, y_dir, xgb_cfg, rf_cfg, n_splits=10, gap=horizon_days)
+    wf = _run_walk_forward_multi(
+        X_dir_18, y_dir, {"xgb": ("xgb", xgb_cfg), "rf": ("rf", rf_cfg)},
+        n_splits=10, gap=horizon_days, ensemble_weights=ensemble_weights,
+    )["ensemble"]
     out["directional_accuracy"] = wf["mean_directional_accuracy"]
     out["accuracy_std"] = wf["std_directional_accuracy"]
     out["is_reliable"] = wf["is_reliable"]
@@ -1436,3 +1616,103 @@ def evaluate_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, 
     )
 
     return out
+
+
+def compare_models(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+    """
+    Score XGBoost, RandomForest, LogisticRegression, and GradientBoosting
+    against each other through the same walk-forward harness training uses
+    (_run_walk_forward_multi, n_splits=10) — an informational comparison
+    panel (Prediction Improvement Engine, Phase 4). Pure read/compare: never
+    retrains or overwrites any persisted model, never touches _xgb_path()/
+    _rf_path()/the accuracy JSON.
+
+    Uses the ticker's already-selected label scheme and hyperparameters
+    (from _load_model_metadata) so the comparison is apples-to-apples with
+    what's actually deployed, not a differently-tuned re-run.
+
+    Returns
+    -------
+    dict with keys: ticker, horizon_days, neutral_threshold,
+    models ({name: per-model walk-forward summary}), best_single_model
+    (highest mean_directional_accuracy), ensemble_weights (softmax-over-
+    accuracy weights an ensemble of all 4 models would use — informational;
+    not wired into predict()'s actual 2-model inference), ensemble (an
+    equal-weighted blend of all 4 — a baseline reference point, not the
+    recommended weighting), error.
+    """
+    ticker = ticker.upper()
+    out: Dict[str, Any] = {
+        "ticker": ticker,
+        "horizon_days": None,
+        "neutral_threshold": None,
+        "models": {},
+        "best_single_model": None,
+        "ensemble_weights": {},
+        "ensemble": {},
+        "error": None,
+    }
+
+    if df is None:
+        try:
+            from data.price_data import get_price_history
+            from analysis.indicators import calculate_indicators
+            df_raw = get_price_history(ticker, period="2y")
+            if df_raw is None or df_raw.empty:
+                out["error"] = f"No price data for {ticker}"
+                return out
+            df = calculate_indicators(df_raw)
+        except Exception as exc:
+            out["error"] = f"Data fetch failed: {exc}"
+            return out
+
+    metadata = _load_model_metadata(ticker)
+    horizon_days = metadata["horizon_days"]
+    neutral_threshold = metadata["neutral_threshold"]
+    out["horizon_days"] = horizon_days
+    out["neutral_threshold"] = neutral_threshold
+
+    try:
+        X, y = build_features(df, ticker=ticker, forward_bars=horizon_days, neutral_threshold=neutral_threshold)
+    except (ValueError, KeyError) as exc:
+        out["error"] = str(exc)
+        return out
+
+    X_dir, y_dir = _filter_directional(X, y)
+    if len(X_dir) < 250:
+        out["error"] = (
+            f"Only {len(X_dir)} directional samples for {ticker} after neutral-zone removal. "
+            "Provide at least 250 bars of price data."
+        )
+        return out
+    X_dir_18 = X_dir[FEATURE_NAMES]
+
+    balance = class_balance_check(y_dir)
+    spw = balance["recommended_scale_pos_weight"]
+    xgb_cfg = {**_xgb_config(scale_pos_weight=spw), **metadata["hyperparam_overrides"]}
+    rf_cfg = {**_rf_config(n_features=len(FEATURE_NAMES)), **metadata["rf_hyperparam_overrides"]}
+
+    model_specs = {
+        "xgb": ("xgb", xgb_cfg),
+        "rf": ("rf", rf_cfg),
+        "logreg": ("logreg", _logreg_config()),
+        "gbc": ("gbc", _gbc_config()),
+    }
+    wf_multi = _run_walk_forward_multi(X_dir_18, y_dir, model_specs, n_splits=10, gap=horizon_days)
+    out["models"] = wf_multi["per_model"]
+
+    if wf_multi["n_folds"] == 0:
+        out["error"] = "Walk-forward produced no valid folds — need more data"
+        return out
+
+    accuracies = {name: m["mean_directional_accuracy"] for name, m in wf_multi["per_model"].items()}
+    out["best_single_model"] = max(accuracies, key=accuracies.get)
+    out["ensemble_weights"] = _softmax_ensemble_weights(accuracies)
+    out["ensemble"] = wf_multi["ensemble"]
+
+    logger.info(
+        "compare_models: %s best_single_model=%s accuracies=%s",
+        ticker, out["best_single_model"], accuracies,
+    )
+    return out
+

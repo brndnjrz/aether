@@ -14,11 +14,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from analysis.ml_prediction import (
     _xgb_path as _daily_xgb_path, _rf_path as _daily_rf_path,
-    get_prediction_history,
+    get_prediction_history, compare_models,
 )
 from analysis.intraday_prediction import (
     INTERVAL_SPECS, model_exists as intraday_model_exists,
-    get_intraday_prediction_history,
+    get_intraday_prediction_history, compare_intraday_models,
 )
 from analysis.prediction_performance import compute_daily_prediction_metrics, compute_intraday_prediction_metrics
 from analysis.prediction_errors import categorize_incorrect_predictions, aggregate_failure_categories
@@ -187,6 +187,42 @@ def _render_failure_analysis(ticker: str, model_label: str, history: pd.DataFram
         st.dataframe(detail_df, hide_index=True, width="stretch")
 
 
+def _render_model_comparison(ticker: str, model_label: str, comparison_fn, button_key: str):
+    st.markdown("**Model comparison**")
+    st.caption(
+        "Scores XGBoost, RandomForest, LogisticRegression, and GradientBoosting "
+        "against each other through the same walk-forward validation training "
+        "uses. Read-only — doesn't retrain or change the deployed model."
+    )
+    if not st.button(f"Run comparison for {ticker}", key=button_key):
+        return
+
+    with st.spinner("Running walk-forward validation for 4 models..."):
+        result = comparison_fn(ticker)
+
+    if result.get("error"):
+        st.warning(result["error"])
+        return
+
+    rows = [
+        {
+            "Model": name.title(),
+            "Accuracy": _pct(m["mean_directional_accuracy"]),
+            "Std": _pct(m["std_directional_accuracy"]),
+            "AUC": f"{m['mean_auc']:.3f}",
+            "Folds": m["n_folds"],
+            "Recommended Weight": _pct(result["ensemble_weights"].get(name)),
+        }
+        for name, m in result["models"].items()
+    ]
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    st.caption(
+        f"Best single model: **{result['best_single_model'].title()}**. "
+        f"Recommended weight is a softmax over each model's accuracy — informational, "
+        f"not wired into the deployed 2-model (XGB/RF) ensemble."
+    )
+
+
 def _render_daily_performance_dashboard(ticker: str):
     if not _daily_model_exists(ticker):
         st.info(f"No daily model trained yet for {ticker} — train it from Trading Desk → Predictions.")
@@ -197,6 +233,8 @@ def _render_daily_performance_dashboard(ticker: str):
     if metrics["n_resolved"] > 0:
         st.markdown("---")
         _render_failure_analysis(ticker, "daily", history)
+    st.markdown("---")
+    _render_model_comparison(ticker, "daily", compare_models, "model_lab_compare_daily")
 
 
 def _render_intraday_performance_dashboard(ticker: str, interval: str):
@@ -212,6 +250,12 @@ def _render_intraday_performance_dashboard(ticker: str, interval: str):
     if metrics["n_resolved"] > 0:
         st.markdown("---")
         _render_failure_analysis(ticker, f"{interval}_intraday", history, interval=interval)
+    st.markdown("---")
+    _render_model_comparison(
+        ticker, f"{interval} intraday",
+        lambda t: compare_intraday_models(t, interval),
+        f"model_lab_compare_intraday_{interval}",
+    )
 
 
 def render():
