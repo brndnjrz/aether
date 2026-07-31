@@ -9,7 +9,7 @@ The **Predictions** tab (Trading Desk page, `pages/trading.py`) runs a machine-l
 - **Train / Update Model** — fetches 2 years of daily bars, builds the 18-feature matrix, runs the 10-fold walk-forward validation described below, then fits the final model on all available directional history and saves it to `storage/`. Takes roughly 10-20 seconds. Requires at least 60 bars of history, and at least 50 directional (non-neutral) samples after the neutral-zone filter — tickers with too little history or an IPO within the lookback window will error out here.
 - **Generate Prediction** — loads the saved model and runs inference on the latest bar. If no model exists yet for the ticker, this auto-trains one first.
 
-**Status row** (above the buttons): model status (not trained / trained / overdue for refresh — flagged after 30 days), last-trained timestamp read from `{TICKER}_accuracy.json` (or the model file's mtime if that log is missing), and a "last prediction" timestamp for the current session.
+**Status row** (above the buttons): model status (not trained / trained / overdue for refresh — flagged when any retrain trigger fires, see [Retraining](#retraining)), last-trained timestamp read from `{TICKER}_accuracy.json` (or the model file's mtime if that log is missing), and a "last prediction" timestamp for the current session.
 
 Once you click **Generate Prediction**, five sections render in order:
 
@@ -27,7 +27,7 @@ A disclaimer banner is shown at the bottom of the tab regardless of state, resta
 
 The model is a two-member ensemble:
 
-| Model | Role | Weight |
+| Model | Role | Default Weight |
 |-------|------|--------|
 | **XGBoost** (`binary:logistic`) | Primary classifier — gradient-boosted shallow trees optimized for AUC | 65% |
 | **Random Forest** | Calibration member — provides diversity and prevents XGBoost from overconfident outputs | 35% |
@@ -35,8 +35,10 @@ The model is a two-member ensemble:
 The ensemble bull probability is:
 
 ```
-P_bull = 0.65 × XGBoost_prob + 0.35 × RF_prob
+P_bull = weight_xgb × XGBoost_prob + weight_rf × RF_prob
 ```
+
+`weight_xgb`/`weight_rf` are **learned, not fixed** — computed at training time as a softmax over each model's out-of-fold walk-forward directional accuracy (`analysis/ml_prediction.py::_softmax_ensemble_weights()`), then persisted in `{TICKER}_accuracy.json`'s `ensemble_weights` field and read back at inference. A model at or below the 50% coin-flip baseline still gets a small positive weight — the scheme blends rather than hard-selects. Models trained before this existed (or a freshly-deployed ticker with no accuracy log yet) default to the historical fixed 65/35 split, so nothing changes until a model is retrained.
 
 The combined probability is then mapped to a direction:
 
@@ -45,6 +47,10 @@ The combined probability is then mapped to a direction:
 - `0.45 ≤ P_bull ≤ 0.55` → **NEUTRAL** (dead-band; no directional call)
 
 The display gauge is capped at 35–65% to prevent conveying false precision. Raw model output beyond these bounds does not meaningfully distinguish between different confidence levels given the amount of noise in financial data.
+
+### Model comparison (informational)
+
+`analysis/ml_prediction.py::compare_models()` (surfaced in the **Model Lab** page) scores XGBoost, Random Forest, and two additional sklearn-native candidates — Logistic Regression and Gradient Boosting — against each other through the same walk-forward harness training uses, and reports what an accuracy-proportional weighting of all four would look like. This is read-only: it never retrains or changes the deployed 2-model ensemble above. It exists to answer "would a 3rd or 4th model actually help this ticker" before committing to the extra training cost of deploying one.
 
 ## 5-Day Price Path Simulation
 
@@ -199,7 +205,13 @@ The 50% baseline is the "coin flip" — what you would achieve by predicting bul
 
 ### When to retrain
 
-The app flags a model as **overdue** 30 days after the last training date. This is the default retrain schedule.
+The app checks three retraining triggers (`analysis/retrain_triggers.py::check_all_retrain_triggers()`), surfaced on both the Predictions tab's status badge and the Model Lab page:
+
+- **Staleness** — model is older than `config.settings.RETRAIN_STALENESS_DAYS` (30 by default).
+- **Performance drop** — the live win rate on resolved predictions has fallen `RETRAIN_ACCURACY_DROP_THRESHOLD` (5 points by default) or more below the accuracy the model was trained with, once at least `RETRAIN_MIN_RESOLVED_FOR_DROP_CHECK` (20) predictions have resolved.
+- **Elevated market volatility** — the current VIX regime is "Elevated Fear" or "Crisis". This is a coarse, current-state-only flag, not a true before/after regime-change detector — there is no persisted snapshot of what the regime was when the model was last trained to compare against.
+
+Any of the three flags the model as overdue. This is informational only — no automatic retraining happens inside the app; a human still clicks **Train / Update Model**.
 
 Retrain more frequently if:
 - The stock has been through a major regime change (e.g., earnings blowout, sector rotation, acquisition announcement)
@@ -211,9 +223,23 @@ Retrain more frequently if:
 1. Navigate to the **AI Predictions** page
 2. Enter the ticker
 3. Click **Train / Update Model**
-4. The new model replaces the old one in `storage/`; prediction history is preserved
+4. The new model replaces the old one in `storage/`; prediction history is preserved, and the model it replaces is archived under `storage/versions/{TICKER}/` (see Model Versioning below)
 
 Retraining fetches 2 years of fresh daily data each time. The walk-forward validation runs on that full 2-year window, so older data influences the early folds while more recent data dominates the later folds — which are the most predictive of near-term performance.
+
+### Scheduled retraining
+
+`scripts/scheduled_retrain.py` is a standalone CLI (not imported by the app) that sweeps every ticker/interval with an existing model, checks the three triggers above, and retrains whatever needs it:
+
+```
+python3 scripts/scheduled_retrain.py [--tickers AAPL,SPY] [--dry-run] [--force]
+```
+
+It logs one line per ticker to `storage/retrain_log.jsonl` and never lets one ticker's failure abort the sweep. It registers no schedule of its own — wire it to cron/launchd, e.g. `0 6 * * 1-5 cd /path/to/aether && python3 scripts/scheduled_retrain.py`.
+
+### Model versioning
+
+Every retrain archives the model it's about to replace under `storage/versions/{TICKER}/v{N}_{xgb,rf,accuracy}.{pkl,json}`, with an append-only `history.jsonl` event log (`analysis/ml_prediction.py::get_version_history()`/`rollback_to_version()`). A ticker's first-ever training run creates no version — v1 is the first model that got *replaced*, not the first trained. Model Lab's "Version history" section lists these and can roll back to any of them (a straight file copy, never a retrain); rolling back archives the current model first, so nothing is ever silently discarded.
 
 ### Storage
 
@@ -221,10 +247,15 @@ Trained models are stored in the `storage/` directory at the project root:
 
 ```
 storage/
-├── {TICKER}_xgb.pkl         # XGBoost model
-├── {TICKER}_rf.pkl          # Random Forest model
-├── {TICKER}_accuracy.json   # Walk-forward metrics from last training run
-└── {TICKER}_predictions.jsonl  # Timestamped prediction log (append-only)
+├── {TICKER}_xgb.pkl              # XGBoost model (current/"latest")
+├── {TICKER}_rf.pkl               # Random Forest model (current/"latest")
+├── {TICKER}_accuracy.json        # Walk-forward metrics from last training run,
+│                                  # including the learned ensemble_weights
+├── {TICKER}_predictions.jsonl    # Timestamped prediction log (append-only)
+├── retrain_log.jsonl             # scripts/scheduled_retrain.py's sweep log
+└── versions/{TICKER}/
+    ├── v{N}_xgb.pkl / v{N}_rf.pkl / v{N}_accuracy.json   # archived prior model
+    └── history.jsonl             # append-only archive/rollback event log
 ```
 
 Each ticker has its own model files. Training AAPL does not affect the NVDA model. The prediction log is append-only — predictions are never deleted, which allows you to review the model's signal history over time on the Prediction History chart.

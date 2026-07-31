@@ -70,3 +70,10 @@ IVR_LOW = 30
 IV_RV_PREMIUM_THRESHOLD = 1.15  # IV 15% > RV = potentially rich premium
 
 STORAGE_DIR = os.path.join(os.path.dirname(__file__), "..", "storage")
+
+# Model retraining triggers (Prediction Improvement Engine, Phase 8)
+RETRAIN_STALENESS_DAYS = 30              # existing behavior, now centralized
+RETRAIN_ACCURACY_DROP_THRESHOLD = 0.05   # trigger if live accuracy falls this
+                                          # far below the trained-in accuracy
+RETRAIN_MIN_RESOLVED_FOR_DROP_CHECK = 20  # don't judge a drop on too few resolved predictions
+

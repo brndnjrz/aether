@@ -28,6 +28,7 @@ from analysis.intraday_prediction import (
 )
 from analysis.prediction_performance import compute_daily_prediction_metrics, compute_intraday_prediction_metrics
 from analysis.prediction_errors import categorize_incorrect_predictions, aggregate_failure_categories
+from analysis.retrain_triggers import check_all_retrain_triggers
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +270,23 @@ def _render_version_history(ticker: str, model_label: str, get_history_fn, rollb
                 st.rerun()
 
 
+def _render_retrain_triggers(ticker: str, interval: str = None):
+    st.markdown("**Retrain triggers**")
+    check = check_all_retrain_triggers(ticker, interval=interval)
+    triggers = check["triggers"]
+
+    if check["should_retrain"]:
+        st.warning("Retrain recommended — see below for which trigger(s) fired.")
+    else:
+        st.caption("No retrain trigger currently active.")
+
+    rows = [
+        {"Trigger": name.replace("_", " ").title(), "Fired": "Yes" if t["triggered"] else "No", "Detail": t["reason"]}
+        for name, t in triggers.items()
+    ]
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+
 def _render_daily_performance_dashboard(ticker: str):
     if not _daily_model_exists(ticker):
         st.info(f"No daily model trained yet for {ticker} — train it from Trading Desk → Predictions.")
@@ -283,6 +301,8 @@ def _render_daily_performance_dashboard(ticker: str):
     _render_model_comparison(ticker, "daily", compare_models, "model_lab_compare_daily")
     st.markdown("---")
     _render_version_history(ticker, "daily", get_daily_version_history, rollback_daily_version)
+    st.markdown("---")
+    _render_retrain_triggers(ticker)
 
 
 def _render_intraday_performance_dashboard(ticker: str, interval: str):
@@ -310,6 +330,8 @@ def _render_intraday_performance_dashboard(ticker: str, interval: str):
         lambda t: get_intraday_version_history(t, interval),
         lambda t, v: rollback_intraday_version(t, interval, v),
     )
+    st.markdown("---")
+    _render_retrain_triggers(ticker, interval=interval)
 
 
 def render():

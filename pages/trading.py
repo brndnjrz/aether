@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 # ML prediction — optional import so page still works if scikit-learn/xgboost/narwhals not installed
 try:
     from analysis.ml_prediction import predict, train_model, get_prediction_history, evaluate_model
+    from analysis.retrain_triggers import check_all_retrain_triggers
     _ML_AVAILABLE = True
 except Exception:
     _ML_AVAILABLE = False
@@ -995,21 +996,6 @@ def _trained_at_str(ticker: str) -> str | None:
     return None
 
 
-def _retrain_overdue(ticker: str) -> bool:
-    acc_path = STORAGE_DIR / f"{ticker.upper()}_accuracy.json"
-    xgb_path = STORAGE_DIR / f"{ticker.upper()}_xgb.pkl"
-    check_path = acc_path if acc_path.exists() else xgb_path
-    if not check_path.exists():
-        return False
-    try:
-        import time as _time
-        mtime = check_path.stat().st_mtime
-        age_days = (_time.time() - mtime) / 86400
-        return age_days > 30
-    except Exception:
-        return False
-
-
 def _load_pred_df(ticker: str, period: str = "2y") -> pd.DataFrame | None:
     raw = get_price_history(ticker, period=period)
     if raw is None or raw.empty:
@@ -1879,12 +1865,13 @@ def _render_daily_predictions():
     status_col1, status_col2, status_col3 = st.columns(3)
     model_exists = _model_exists(ticker)
     trained_at = _trained_at_str(ticker) if model_exists else None
-    overdue = _retrain_overdue(ticker) if model_exists else False
+    retrain_check = check_all_retrain_triggers(ticker) if model_exists else None
+    should_retrain = bool(retrain_check and retrain_check["should_retrain"])
 
     with status_col1:
         if model_exists:
-            icon = "✅" if not overdue else "⏰"
-            st.markdown(f"{icon} **Model status:** {'Trained' if not overdue else 'Overdue for refresh'}")
+            icon = "✅" if not should_retrain else "⏰"
+            st.markdown(f"{icon} **Model status:** {'Trained' if not should_retrain else 'Overdue for refresh'}")
         else:
             st.markdown("❌ **Model status:** Not trained")
 
@@ -1903,6 +1890,14 @@ def _render_daily_predictions():
                     st.caption(f"Last prediction: **{utc_iso_to_et_str(pred_ts, '%I:%M %p ET')}** (this session)")
                 except Exception:
                     pass
+
+    if should_retrain:
+        fired = [
+            t["reason"] for t in retrain_check["triggers"].values() if t["triggered"]
+        ]
+        st.warning(
+            "Retrain recommended — " + " ".join(fired) + " Use **Train / Update Model** below.",
+        )
 
     st.markdown("---")
 
