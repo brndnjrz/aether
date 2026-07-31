@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -159,6 +160,161 @@ def _accuracy_path(ticker: str, interval: str) -> Path:
 
 def _predictions_path(ticker: str, interval: str) -> Path:
     return _STORAGE_DIR / f"{ticker.upper()}_{_interval_tag(interval)}_predictions.jsonl"
+
+
+# ── Model versioning (Prediction Improvement Engine, Phase 7) ────────────────
+# Mirrors ml_prediction.py's versioning exactly, interval-scoped. A parallel
+# archive tree alongside the flat "latest" files — _xgb_path()/_rf_path()/
+# _accuracy_path() above are never touched by any of this.
+
+_VERSION_HISTORY_COLUMNS = [
+    "version", "ticker", "interval", "archived_at", "directional_accuracy",
+    "accuracy_std", "mean_auc", "is_reliable", "horizon_bars", "sigma_multiple",
+    "hyperparam_overrides", "rf_hyperparam_overrides", "ensemble_weights",
+    "trained_at", "rolled_back_from_latest",
+]
+
+
+def _versions_dir(ticker: str, interval: str) -> Path:
+    d = _STORAGE_DIR / "versions" / f"{ticker.upper()}_{_interval_tag(interval)}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _version_history_path(ticker: str, interval: str) -> Path:
+    return _versions_dir(ticker, interval) / "history.jsonl"
+
+
+def _next_version_number(ticker: str, interval: str) -> int:
+    path = _version_history_path(ticker, interval)
+    if not path.exists():
+        return 1
+    max_version = 0
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+                max_version = max(max_version, int(record.get("version", 0)))
+            except (json.JSONDecodeError, ValueError, TypeError):
+                continue
+    return max_version + 1
+
+
+def _archive_current_version(ticker: str, interval: str, acc_record: Dict[str, Any]) -> int:
+    """Same contract as ml_prediction._archive_current_version(), interval-scoped."""
+    ticker = ticker.upper()
+    xgb_path = _xgb_path(ticker, interval)
+    rf_path = _rf_path(ticker, interval)
+    acc_path = _accuracy_path(ticker, interval)
+    if not (xgb_path.exists() and rf_path.exists()):
+        return 0
+
+    version = _next_version_number(ticker, interval)
+    versions_dir = _versions_dir(ticker, interval)
+    try:
+        shutil.copy2(xgb_path, versions_dir / f"v{version}_xgb.pkl")
+        shutil.copy2(rf_path, versions_dir / f"v{version}_rf.pkl")
+        if acc_path.exists():
+            shutil.copy2(acc_path, versions_dir / f"v{version}_accuracy.json")
+        history_record = {
+            "version": version,
+            "ticker": ticker,
+            "interval": interval,
+            "archived_at": now_et_iso(),
+            "directional_accuracy": acc_record.get("directional_accuracy"),
+            "accuracy_std": acc_record.get("accuracy_std"),
+            "mean_auc": acc_record.get("mean_auc"),
+            "is_reliable": acc_record.get("is_reliable"),
+            "horizon_bars": acc_record.get("horizon_bars"),
+            "sigma_multiple": acc_record.get("sigma_multiple"),
+            "hyperparam_overrides": acc_record.get("hyperparam_overrides"),
+            "rf_hyperparam_overrides": acc_record.get("rf_hyperparam_overrides"),
+            "ensemble_weights": acc_record.get("ensemble_weights"),
+            "trained_at": acc_record.get("trained_at"),
+            "rolled_back_from_latest": False,
+        }
+        with open(_version_history_path(ticker, interval), "a") as f:
+            f.write(json.dumps(history_record) + "\n")
+        logger.info("_archive_current_version: %s %s archived as v%d", ticker, interval, version)
+        return version
+    except Exception as exc:
+        logger.warning("_archive_current_version: failed to archive %s %s: %s", ticker, interval, exc)
+        return 0
+
+
+def get_version_history(ticker: str, interval: str = DEFAULT_INTERVAL) -> pd.DataFrame:
+    """Same contract as ml_prediction.get_version_history(), interval-scoped."""
+    path = _version_history_path(ticker, interval)
+    if not path.exists():
+        return pd.DataFrame(columns=_VERSION_HISTORY_COLUMNS)
+
+    records = []
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    if not records:
+        return pd.DataFrame(columns=_VERSION_HISTORY_COLUMNS)
+
+    df = pd.DataFrame(records)
+    for col in _VERSION_HISTORY_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+    return df[_VERSION_HISTORY_COLUMNS].sort_values("version", ascending=False).reset_index(drop=True)
+
+
+def rollback_to_version(ticker: str, interval: str, version: int) -> Dict[str, Any]:
+    """Same contract as ml_prediction.rollback_to_version(), interval-scoped."""
+    ticker = ticker.upper()
+    out: Dict[str, Any] = {
+        "ticker": ticker, "interval": interval, "rolled_back_to_version": None,
+        "new_current_version_archived": None, "error": None,
+    }
+
+    versions_dir = _versions_dir(ticker, interval)
+    src_xgb = versions_dir / f"v{version}_xgb.pkl"
+    src_rf = versions_dir / f"v{version}_rf.pkl"
+    src_acc = versions_dir / f"v{version}_accuracy.json"
+    if not (src_xgb.exists() and src_rf.exists()):
+        out["error"] = f"Version {version} not found for {ticker} {interval}."
+        return out
+
+    current_meta = load_metadata(ticker, interval)
+    archived_version = _archive_current_version(ticker, interval, current_meta)
+    out["new_current_version_archived"] = archived_version or None
+
+    try:
+        shutil.copy2(src_xgb, _xgb_path(ticker, interval))
+        shutil.copy2(src_rf, _rf_path(ticker, interval))
+        if src_acc.exists():
+            shutil.copy2(src_acc, _accuracy_path(ticker, interval))
+    except Exception as exc:
+        out["error"] = f"Rollback failed: {exc}"
+        return out
+
+    try:
+        with open(_version_history_path(ticker, interval), "a") as f:
+            f.write(json.dumps({
+                "version": version, "ticker": ticker, "interval": interval,
+                "archived_at": now_et_iso(), "rolled_back_from_latest": True,
+            }) + "\n")
+    except Exception as exc:
+        logger.warning("rollback_to_version: could not append history record for %s %s: %s", ticker, interval, exc)
+
+    out["rolled_back_to_version"] = version
+    logger.info(
+        "rollback_to_version: %s %s rolled back to v%d (archived previous latest as v%s)",
+        ticker, interval, version, archived_version,
+    )
+    return out
 
 
 def model_exists(ticker: str, interval: str = DEFAULT_INTERVAL) -> bool:
@@ -680,6 +836,9 @@ def train_intraday_model(
         "ensemble_weights": ensemble_weights,
     }
     try:
+        # Archive whatever model is currently deployed BEFORE overwriting it —
+        # a no-op on this ticker+interval's first-ever train.
+        archived_version = _archive_current_version(ticker, interval, load_metadata(ticker, interval))
         joblib.dump(xgb_final, _xgb_path(ticker, interval))
         joblib.dump(rf_final, _rf_path(ticker, interval))
         with open(_accuracy_path(ticker, interval), "w") as f:
@@ -705,6 +864,7 @@ def train_intraday_model(
         "hyperparam_search": hp_choice["candidates"],
         "rf_hyperparam_search": rf_hp_choice["candidates"],
         "session_mask_dropped": choice["info"]["dropped_to_session_mask"],
+        "archived_version": archived_version or None,
     })
     return result
 

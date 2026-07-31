@@ -71,6 +71,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -133,6 +134,185 @@ def _rf_path(ticker: str) -> Path:
 
 def _predictions_path(ticker: str) -> Path:
     return _STORAGE_DIR / f"{ticker.upper()}_predictions.jsonl"
+
+
+# ── Model versioning (Prediction Improvement Engine, Phase 7) ────────────────
+# A parallel archive tree alongside the flat "latest" files above —
+# _xgb_path()/_rf_path() are never touched by any of this, so every
+# existing reader keeps working on the exact same paths regardless of
+# whether a ticker has version history.
+
+_VERSION_HISTORY_COLUMNS = [
+    "version", "ticker", "archived_at", "directional_accuracy", "accuracy_std",
+    "mean_auc", "is_reliable", "horizon_days", "neutral_threshold",
+    "hyperparam_overrides", "rf_hyperparam_overrides", "ensemble_weights",
+    "trained_at", "rolled_back_from_latest",
+]
+
+
+def _versions_dir(ticker: str) -> Path:
+    d = _STORAGE_DIR / "versions" / ticker.upper()
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _version_history_path(ticker: str) -> Path:
+    return _versions_dir(ticker) / "history.jsonl"
+
+
+def _next_version_number(ticker: str) -> int:
+    path = _version_history_path(ticker)
+    if not path.exists():
+        return 1
+    max_version = 0
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+                max_version = max(max_version, int(record.get("version", 0)))
+            except (json.JSONDecodeError, ValueError, TypeError):
+                continue
+    return max_version + 1
+
+
+def _archive_current_version(ticker: str, acc_record: Dict[str, Any]) -> int:
+    """
+    Archive whatever is CURRENTLY at _xgb_path/_rf_path/the accuracy JSON —
+    the model about to be replaced by this training run — into
+    storage/versions/{TICKER}/v{N}_*, before the caller overwrites the
+    "latest" files. No-op (returns 0) if nothing exists yet to archive —
+    a ticker's first-ever train has no prior model to preserve, so v1 is
+    the first model that got REPLACED, not the first trained.
+    """
+    ticker = ticker.upper()
+    xgb_path = _xgb_path(ticker)
+    rf_path = _rf_path(ticker)
+    acc_path = _STORAGE_DIR / f"{ticker}_accuracy.json"
+    if not (xgb_path.exists() and rf_path.exists()):
+        return 0
+
+    version = _next_version_number(ticker)
+    versions_dir = _versions_dir(ticker)
+    try:
+        shutil.copy2(xgb_path, versions_dir / f"v{version}_xgb.pkl")
+        shutil.copy2(rf_path, versions_dir / f"v{version}_rf.pkl")
+        if acc_path.exists():
+            shutil.copy2(acc_path, versions_dir / f"v{version}_accuracy.json")
+        history_record = {
+            "version": version,
+            "ticker": ticker,
+            "archived_at": now_et_iso(),
+            "directional_accuracy": acc_record.get("directional_accuracy"),
+            "accuracy_std": acc_record.get("accuracy_std"),
+            "mean_auc": acc_record.get("mean_auc"),
+            "is_reliable": acc_record.get("is_reliable"),
+            "horizon_days": acc_record.get("horizon_days"),
+            "neutral_threshold": acc_record.get("neutral_threshold"),
+            "hyperparam_overrides": acc_record.get("hyperparam_overrides"),
+            "rf_hyperparam_overrides": acc_record.get("rf_hyperparam_overrides"),
+            "ensemble_weights": acc_record.get("ensemble_weights"),
+            "trained_at": acc_record.get("trained_at"),
+            "rolled_back_from_latest": False,
+        }
+        with open(_version_history_path(ticker), "a") as f:
+            f.write(json.dumps(history_record) + "\n")
+        logger.info("_archive_current_version: %s archived as v%d", ticker, version)
+        return version
+    except Exception as exc:
+        logger.warning("_archive_current_version: failed to archive %s: %s", ticker, exc)
+        return 0
+
+
+def get_version_history(ticker: str) -> pd.DataFrame:
+    """
+    Read storage/versions/{TICKER}/history.jsonl, sorted version-descending.
+    An append-only EVENT log, not a snapshot-per-version table — a rollback
+    appends a second row for a version number that was already archived
+    once, distinguished by rolled_back_from_latest=True, rather than
+    overwriting or deduplicating the earlier entry.
+
+    Empty DataFrame (documented columns) if the ticker has never been
+    retrained — not an error.
+    """
+    path = _version_history_path(ticker)
+    if not path.exists():
+        return pd.DataFrame(columns=_VERSION_HISTORY_COLUMNS)
+
+    records = []
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    if not records:
+        return pd.DataFrame(columns=_VERSION_HISTORY_COLUMNS)
+
+    df = pd.DataFrame(records)
+    for col in _VERSION_HISTORY_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+    return df[_VERSION_HISTORY_COLUMNS].sort_values("version", ascending=False).reset_index(drop=True)
+
+
+def rollback_to_version(ticker: str, version: int) -> Dict[str, Any]:
+    """
+    Restore an archived version's model files as the current "latest" —
+    a straight file copy (shutil.copy2), never a retrain. Archives the
+    CURRENT latest as a new version FIRST (via _archive_current_version),
+    so rolling back never discards the model being rolled back FROM — it
+    becomes retrievable too. Returns a structured {"error": ...} on a
+    missing/corrupt version rather than raising, matching every other
+    public function's contract in this module.
+    """
+    ticker = ticker.upper()
+    out: Dict[str, Any] = {
+        "ticker": ticker, "rolled_back_to_version": None,
+        "new_current_version_archived": None, "error": None,
+    }
+
+    versions_dir = _versions_dir(ticker)
+    src_xgb = versions_dir / f"v{version}_xgb.pkl"
+    src_rf = versions_dir / f"v{version}_rf.pkl"
+    src_acc = versions_dir / f"v{version}_accuracy.json"
+    if not (src_xgb.exists() and src_rf.exists()):
+        out["error"] = f"Version {version} not found for {ticker}."
+        return out
+
+    current_meta = _load_model_metadata(ticker)
+    archived_version = _archive_current_version(ticker, current_meta)
+    out["new_current_version_archived"] = archived_version or None
+
+    try:
+        shutil.copy2(src_xgb, _xgb_path(ticker))
+        shutil.copy2(src_rf, _rf_path(ticker))
+        if src_acc.exists():
+            shutil.copy2(src_acc, _STORAGE_DIR / f"{ticker}_accuracy.json")
+    except Exception as exc:
+        out["error"] = f"Rollback failed: {exc}"
+        return out
+
+    try:
+        with open(_version_history_path(ticker), "a") as f:
+            f.write(json.dumps({
+                "version": version, "ticker": ticker,
+                "archived_at": now_et_iso(), "rolled_back_from_latest": True,
+            }) + "\n")
+    except Exception as exc:
+        logger.warning("rollback_to_version: could not append history record for %s: %s", ticker, exc)
+
+    out["rolled_back_to_version"] = version
+    logger.info(
+        "rollback_to_version: %s rolled back to v%d (archived previous latest as v%s)",
+        ticker, version, archived_version,
+    )
+    return out
 
 
 # ── Model configuration ───────────────────────────────────────────────────────
@@ -814,6 +994,7 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
         "label_search": [],
         "hyperparam_search": [],
         "rf_hyperparam_search": [],
+        "archived_version": None,
         "error": None,
     }
 
@@ -930,6 +1111,9 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
     # ── Persist models ────────────────────────────────────────────────────────
     now_iso = now_et_iso()
     try:
+        # Archive whatever model is currently deployed BEFORE overwriting it —
+        # a no-op on a ticker's first-ever train (nothing to archive yet).
+        archived_version = _archive_current_version(ticker, _load_model_metadata(ticker))
         joblib.dump(xgb_final, _xgb_path(ticker))
         joblib.dump(rf_final, _rf_path(ticker))
         # Also persist the accuracy metrics so predict() can load them without retraining
@@ -976,6 +1160,7 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
         "label_search": label_choice["candidates"],
         "hyperparam_search": hp_choice["candidates"],
         "rf_hyperparam_search": rf_hp_choice["candidates"],
+        "archived_version": archived_version or None,
         "error": None,
     })
     return result

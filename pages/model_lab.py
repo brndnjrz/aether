@@ -1,7 +1,9 @@
 """
 Model Lab — read-only prediction performance dashboard across the daily and
 intraday models. Reads what Trading Desk has already logged and graded
-(via analysis.prediction_performance); trains or generates nothing itself.
+(via analysis.prediction_performance); trains or generates nothing itself,
+with one deliberate exception — Version History's rollback button, which
+copies previously-archived model files back into place (never a retrain).
 """
 import logging
 import os
@@ -15,10 +17,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from analysis.ml_prediction import (
     _xgb_path as _daily_xgb_path, _rf_path as _daily_rf_path,
     get_prediction_history, compare_models,
+    get_version_history as get_daily_version_history,
+    rollback_to_version as rollback_daily_version,
 )
 from analysis.intraday_prediction import (
     INTERVAL_SPECS, model_exists as intraday_model_exists,
     get_intraday_prediction_history, compare_intraday_models,
+    get_version_history as get_intraday_version_history,
+    rollback_to_version as rollback_intraday_version,
 )
 from analysis.prediction_performance import compute_daily_prediction_metrics, compute_intraday_prediction_metrics
 from analysis.prediction_errors import categorize_incorrect_predictions, aggregate_failure_categories
@@ -223,6 +229,46 @@ def _render_model_comparison(ticker: str, model_label: str, comparison_fn, butto
     )
 
 
+def _render_version_history(ticker: str, model_label: str, get_history_fn, rollback_fn):
+    st.markdown("**Version history**")
+    history = get_history_fn(ticker)
+    if history.empty:
+        st.caption("No prior versions yet — versions are created starting from a model's second training run.")
+        return
+
+    display_df = history.copy()
+    display_df["Accuracy"] = display_df["directional_accuracy"].apply(_pct)
+    display_df["Event"] = display_df["rolled_back_from_latest"].apply(
+        lambda v: "Rolled back to" if v else "Archived (replaced by retrain)"
+    )
+    st.dataframe(
+        display_df[["version", "Event", "archived_at", "Accuracy", "is_reliable"]].rename(
+            columns={"version": "Version", "archived_at": "When", "is_reliable": "Was Reliable"}
+        ),
+        hide_index=True, width="stretch",
+    )
+
+    archived_versions = sorted(history[~history["rolled_back_from_latest"]]["version"].unique(), reverse=True)
+    if not archived_versions:
+        return
+    with st.expander("Rollback to a prior version", expanded=False):
+        st.caption(
+            "Copies that version's files back into place — a straight file "
+            "copy, not a retrain. The current model is archived first, so "
+            "rolling back never discards it."
+        )
+        target = st.selectbox(
+            "Version", archived_versions, key=f"model_lab_rollback_select_{model_label}",
+        )
+        if st.button(f"Rollback {ticker} ({model_label}) to v{target}", key=f"model_lab_rollback_btn_{model_label}"):
+            result = rollback_fn(ticker, target)
+            if result.get("error"):
+                st.error(result["error"])
+            else:
+                st.success(f"Rolled back to v{target}.")
+                st.rerun()
+
+
 def _render_daily_performance_dashboard(ticker: str):
     if not _daily_model_exists(ticker):
         st.info(f"No daily model trained yet for {ticker} — train it from Trading Desk → Predictions.")
@@ -235,6 +281,8 @@ def _render_daily_performance_dashboard(ticker: str):
         _render_failure_analysis(ticker, "daily", history)
     st.markdown("---")
     _render_model_comparison(ticker, "daily", compare_models, "model_lab_compare_daily")
+    st.markdown("---")
+    _render_version_history(ticker, "daily", get_daily_version_history, rollback_daily_version)
 
 
 def _render_intraday_performance_dashboard(ticker: str, interval: str):
@@ -255,6 +303,12 @@ def _render_intraday_performance_dashboard(ticker: str, interval: str):
         ticker, f"{interval} intraday",
         lambda t: compare_intraday_models(t, interval),
         f"model_lab_compare_intraday_{interval}",
+    )
+    st.markdown("---")
+    _render_version_history(
+        ticker, f"{interval}_intraday",
+        lambda t: get_intraday_version_history(t, interval),
+        lambda t, v: rollback_intraday_version(t, interval, v),
     )
 
 
