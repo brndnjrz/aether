@@ -17,6 +17,7 @@ Not a brokerage. Doesn't execute trades. Not financial advice.
 - [Architecture & Workflow](#architecture--workflow)
 - [Project Structure](#project-structure)
 - [Extensibility & Customization](#extensibility--customization)
+- [Future Ideas (Not Yet Built)](#future-ideas-not-yet-built)
 - [Data Sources & Caching](#data-sources--caching)
 - [Reliability & Verification](#reliability--verification)
 - [Disclaimer & License](#disclaimer--license)
@@ -44,7 +45,8 @@ Not a brokerage. Doesn't execute trades. Not financial advice.
 | **Research** (`pages/research.py`) | Full single-stock deep dive: fundamental scorecard, technical chart, ML direction signal, options IV, news sentiment, and an AI investment brief |
 | **Options Log** (`pages/portfolio.py`) | The trade journal: manual fill entry → automatic FIFO round-trip P&L, hold-time/entry-hour/ticker/option-type/day-of-week win-rate analytics, and a cumulative P&L equity curve |
 | **Trading Desk** (`pages/trading.py`) | Four tabs in one page — **Day Trading** (market-status banner, intraday signals, candlestick pattern read, Flag/Pennant continuation-pattern detection with confidence scoring, suggested entry/stop/target, AI brief, MACD backtest), **Options** (chain, IV Rank, GARCH forward-vol forecast, Greeks, P&L diagrams, AI brief), **News** (headline sentiment), **Predictions** (ML direction signal + simulated price path) |
-| **Strategy Lab** (`pages/strategy_lab.py`) | Two intraday strategies, each with a Live Scanner and Backtest sub-tab — **ORBC** first (Opening Range Breakout Confirmation: requires a 2nd consecutive close outside the opening range before signalling, in `analysis/orbc_strategy.py`), then **MTF** (4H trend → 30m pullback into a demand zone → 5m structure shift → tape confirmation, in `analysis/mtf_strategy.py`) |
+| **Strategy Lab** (`pages/strategy_lab.py`) | **ORBC** (Opening Range Breakout Confirmation: requires a 2nd consecutive close outside the opening range before signalling, in `analysis/orbc_strategy.py`) with a Live Scanner and Backtest sub-tab, plus a read-only **Intraday Predictions** reference panel (latest saved intraday prediction per interval, so it can be checked without leaving this page) |
+| **Model Lab** (`pages/model_lab.py`) | Read-only prediction track record for the daily and intraday ML models — precision/recall/F1/calibration, why-it-was-wrong failure analysis, an informational 4-model comparison, version history with rollback, and retrain-trigger status. Reads what Trading Desk has already logged; the **Prediction Improvement Engine** (see [AI & ML Model Overview](#ai--ml-model-overview)) |
 
 Every Analyze click, options view, and prediction on the Trading Desk logs to a local activity log — later surfaced by Options Log's "what were you looking at" picker and the Dashboard's Recent Activity feed.
 
@@ -125,6 +127,20 @@ Also: drops `day_of_week` (near-useless in a 60-day window), adds time-of-day, V
 
 **Caveat:** intraday direction prediction is a harder problem than daily — order-flow shops attack it with data this app doesn't have. Expect 50–53% accuracy, and expect costs to eat most of it.
 
+### Prediction Improvement Engine
+
+Both models are wrapped in a closed loop that tracks, explains, and maintains their own accuracy over time — surfaced on the **Model Lab** page (`pages/model_lab.py`):
+
+- **Tracking + performance dashboard** (`analysis/prediction_performance.py`) — precision/recall/F1/false-positive-rate/false-negative-rate per direction, avg profit per signal, holding time, and confidence calibration (does "high confidence" actually mean higher accuracy?), computed from every prediction Trading Desk has already logged and graded.
+- **Failure analysis** (`analysis/prediction_errors.py`) — categorizes every *incorrect* prediction against the technical/volatility/earnings context it was made in (counter-trend, choppy market, volume anomaly, RSI divergence, elevated VIX regime, earnings window), so a run of misses points at a *reason*, not just a number.
+- **Model comparison** (`compare_models()`/`compare_intraday_models()`) — an informational, read-only walk-forward bake-off of XGBoost, Random Forest, Logistic Regression, and Gradient Boosting, with a recommended softmax weighting. Never changes the deployed model on its own.
+- **Ensemble weighting** — the XGBoost/RF blend is a **learned** softmax over each model's walk-forward accuracy (`_softmax_ensemble_weights()`), persisted per ticker and read back at inference. Falls back to the historical fixed 65/35 split for any model trained before this shipped.
+- **Hyperparameter search** — both XGBoost and Random Forest configs are auto-selected per ticker from a small grid, scored via a reduced-fold walk-forward; always falls back to library defaults if nothing in the grid beats them.
+- **Model versioning** — every retrain archives the model it replaces under `storage/versions/{TICKER}/`, with a rollback button in Model Lab that copies an older version's files back into place (a file copy, never a retrain).
+- **Retrain triggers** (`analysis/retrain_triggers.py`) — staleness, a live-accuracy drop vs. the trained-in accuracy, and elevated VIX are checked on both Trading Desk's status badge and Model Lab, plus a standalone `scripts/scheduled_retrain.py` CLI for cron-driven sweeps.
+
+Full technical writeup, including the exact formulas and storage layout: `docs/ML_PREDICTION.md`.
+
 ## Setup Environment Using Anaconda
 
 1. Install [Anaconda](https://www.anaconda.com/download) or [Miniconda](https://docs.conda.io/en/latest/miniconda.html)
@@ -168,7 +184,7 @@ Also: drops `day_of_week` (near-useless in a 60-day window), adds time-of-day, V
 
 ### Dashboard (Home)
 
-Landing page. No input required.
+Landing page. No input required — just open the app.
 
 - Regime banner (Bull/Uptrend/Sideways/Downtrend/Bear vs. the S&P's 200-day MA)
 - Live index cards (SPY/QQQ/IWM/VIX)
@@ -177,9 +193,11 @@ Landing page. No input required.
 - Open positions (empty until logged)
 - **Recent Activity** — the last 8 logged events across Trading Desk and Strategy Lab, newest first
 
+**Example:** start every session here for a 10-second market read — if the regime banner says "Downtrend" and VIX is elevated, that's a cue to size down before opening Trading Desk. Once you've logged a few Trading Desk/Strategy Lab actions, Recent Activity doubles as a "what was I doing yesterday" scroll-back.
+
 ### Research
 
-Enter a ticker + lookback period — loads automatically.
+Enter a ticker + lookback period — loads automatically, no button to click.
 
 - **Chart & Technicals** — candlestick + SMA/Bollinger/support-resistance/trendlines
 - **Fundamentals** — Quality/Value/Growth 0–100 scores + red flags
@@ -188,12 +206,16 @@ Enter a ticker + lookback period — loads automatically.
 - **AI Brief** — one-click investment summary
 - **ML Direction Signal** — runs automatically between the scorecard and the chart
 
+**Example:** type `NVDA` in the sidebar's Quick Lookup (or directly in Research's ticker box), pick a 1-year lookback, and skim top-to-bottom: fundamentals scorecard first (does the business hold up?), then the ML Direction Signal (does the model see a near-term edge?), then click **Generate Stock Brief** to have the AI tie both together in plain English before you move to Trading Desk to act on it.
+
 ### Options Log
 
 The trade journal — the only page where you log trades. Enter each options fill as your broker reports it; `portfolio/round_trips.py` FIFO-matches buys against sells into round trips with P&L and hold time.
 
 - **Pattern-finding analytics** — a cumulative P&L equity curve, win rate by hold-time bucket, entry hour, option type, and day of week, and a per-ticker performance breakdown (total/avg P&L, win rate).
 - **Equity positions have no logging UI** — options fills only. Formerly "Portfolio," with Positions / Risk Analytics / Position Sizer tabs; those tracked equity positions with no UI to ever add one, and the Position Sizer duplicated Trading Desk's own Quick Risk Calculator, so all three were cut.
+
+**Example:** after your broker fills a `SPY 15Feb25 590C` buy and, three days later, the matching sell, log both fills under the **Fill Ledger** as they happen. Once both sides are in, the FIFO matcher turns them into one round trip on the **Round Trips** table and folds it into **Win Rate** (e.g. "60% win rate on holds under 1 day") and the cumulative P&L equity curve — the picture of *your own* trading, not the model's.
 
 ### Trading Desk
 
@@ -204,11 +226,16 @@ Four tabs:
 - **News** — headline sentiment for the entered ticker, same VADER scoring as Research.
 - **Predictions** — train/retrain the ML ensemble, generate a direction signal + simulated price path. A **Prediction horizon** toggle switches between **Daily (swing)** — the original model, unchanged — and **Intraday (15-min bars)**, a separate model with its own features, labels, and storage. See [AI & ML Model Overview](#ai--ml-model-overview) and `docs/ML_PREDICTION.md`.
 
+**Examples:**
+- **Day Trading** — enter `AAPL`, check the Suggested Entry/Stop/Target card; if it agrees with a Flag/Pennant pattern drawn on the chart at a confidence ≥ 70, that's a stronger case than either signal alone. Click **Run Backtest** to sanity-check the MACD-cross rule on AAPL's own recent history first.
+- **Options** — same ticker, Options tab: check IV Rank — a rank above ~70 with GARCH forecasting lower forward vol than current ATM IV is the setup for selling premium (credit spread/covered call), not buying it.
+- **Predictions** — first time on a ticker, click **Train / Update Model** (~10–20s), then **Generate Prediction**. A HIGH-confidence BULLISH call with a positive walk-forward accuracy delta is worth weighing; a LOW-confidence or NEUTRAL result means don't trade off this signal today. Toggle to **Intraday (15-min bars)** for a same-day read instead of a 5-day one.
+
 Day-by-day, week-by-week rhythm: `docs/workflow.md`.
 
 ### Strategy Lab
 
-Two intraday strategies, each its own tab with a Live Scanner and a Backtest sub-tab, **ORBC first**.
+One live strategy — **ORBC**, with a Live Scanner and Backtest sub-tab — plus a read-only Intraday Predictions reference panel.
 
 **ORBC (Opening Range)** — the first N minutes after the 9:30 ET open set a reference high/low. Waits for a **second consecutive close** outside that range before signalling — filters most post-open false breakouts. Logic: `analysis/orbc_strategy.py`.
 
@@ -218,13 +245,27 @@ Two intraday strategies, each its own tab with a Live Scanner and a Backtest sub
 - **Both directions supported** — `evaluate_orbc_trade()` is direction-aware, unlike this app's other long-only simulators. Positions always flatten at session close.
 - **Small sample by design** — intraday bars cap at ~60 days and ORBC fires at most once per session, so a backtest yields a few dozen trades. Warns explicitly below 30.
 
+**Example:** shortly after 9:30 ET, open the **Live Scanner** on `SPY` and watch the opening-range band form; when a close breaks it and a second consecutive close confirms in the same direction with no ✕ filter marks, check the confidence score — above ~60 with volume/VWAP agreement is the strongest version of this setup — then click **Log this ORBC signal**. Before trading it live, run the **Backtest** sub-tab on the same ticker/config to see the historical win rate (with the small-sample caveat in mind).
+
 Full rule set + daily routine: `docs/ORBC_PLAYBOOK.md`.
 
-**MTF** — 4H trend → 30m pullback into a demand zone → 5m structure shift → tape confirmation (price/volume proxy, not real order flow) → target at the volume-profile point of control, stop at the swing low. Logic: `analysis/mtf_strategy.py`.
+**Intraday Predictions** — a read-only table of the latest saved Intraday Prediction per interval (5m/15m/30m/1h): direction, confidence, probability, model accuracy, and when it was generated. Training/refreshing those models stays on Trading Desk; this tab only reads what's already saved there. (This replaced an MTF strategy tab that wasn't seeing use — its logic still exists in `analysis/mtf_strategy.py` but isn't currently wired into any page.)
+
+### Model Lab
+
+Read-only prediction track record for the daily and intraday ML models — the **Prediction Improvement Engine**'s dashboard. It doesn't fetch, train, or predict on its own; it reads and analyzes what Trading Desk has already logged and graded (two exceptions: Model Comparison fits throwaway models purely to score them, and Version History's rollback button copies files). Enter a ticker, then pick **Daily Model** or **Intraday Model**.
+
+- **Performance dashboard** — accuracy, win rate, precision/recall/F1/false-positive-rate/false-negative-rate per direction (with a confusion matrix), average profit per signal, average holding time, and confidence calibration (does HIGH confidence actually land higher accuracy than LOW?).
+- **Failure analysis ("Why the model was wrong")** — every incorrect prediction categorized against the technical/volatility/earnings context it was made in (counter-trend, choppy market, volume anomaly, RSI divergence, elevated VIX regime, earnings window), as a bar chart + detail table. An opt-in checkbox recomputes categories for predictions logged before this feature shipped (fetches network data); predictions with a saved snapshot need no network at all.
+- **Model comparison** — click **Run comparison** to score XGBoost, Random Forest, Logistic Regression, and Gradient Boosting against each other via the same walk-forward validation training uses, with a recommended softmax weighting. Informational only — never changes the deployed model.
+- **Version history** — every retrain's replaced model is archived here; roll back to any prior version with one click (archives the current model first, so nothing is discarded).
+- **Retrain triggers** — staleness, live-accuracy drop, and elevated-VIX status, the same three checks Trading Desk's Predictions status badge uses.
+
+**Example:** after a few weeks of live `TSLA` predictions, open Model Lab → Daily Model. If Win Rate is well below the walk-forward accuracy the model trained with, check **Retrain Triggers** — a performance-drop flag there means it's time to hit Trading Desk's **Train / Update Model**. Before you do, check **Failure Analysis** first: if most misses cluster under "elevated_vol_regime," the model isn't broken, the market just got choppier than its training window — retraining on fresher data (which now includes that regime) is exactly the fix. If a retrain makes things worse, **Version History** lets you roll back to the version you just replaced.
 
 ## Architecture & Workflow
 
-No central orchestrator. `app.py` sets page config, theme, and the sidebar, then `st.navigation()` routes between five independent pages. Each page:
+No central orchestrator. `app.py` sets page config, theme, and the sidebar, then `st.navigation()` routes between six independent pages (Dashboard, Research, Options Log, Trading Desk, Strategy Lab, Model Lab). Each page:
 
 1. **Fetches** — price/fundamentals/options/news via `data/*.py`, cached per `config/settings.py` TTLs
 2. **Computes** — indicators, scores, or the ML ensemble via `analysis/*.py`
@@ -235,6 +276,7 @@ No central orchestrator. `app.py` sets page config, theme, and the sidebar, then
 
 - **`storage/journal.db`** (SQLite, via `portfolio/db.py`) — positions, activity log, options fills
 - **`storage/{TICKER}_*`** — trained models, walk-forward accuracy, prediction history — one set per trained ticker
+- **`storage/versions/{TICKER}/`** — archived prior model versions + an append-only rollback log; **`storage/retrain_log.jsonl`** — `scripts/scheduled_retrain.py`'s sweep log
 
 No request/response API layer — Streamlit's script-rerun model *is* the request cycle. `st.session_state` carries state (e.g. the quick-lookup ticker) across page switches.
 
@@ -252,8 +294,9 @@ aether/
 │   ├── home.py               # Dashboard — market overview, regime Markov, sector performance, positions, recent activity
 │   ├── research.py           # Research page
 │   ├── portfolio.py          # Options Log — the trade journal + pattern-finding analytics
-│   ├── strategy_lab.py       # ORBC + MTF setups — each with a live scanner and backtest
-│   └── trading.py            # Trading Desk — Day Trading / Options / News / Predictions tabs
+│   ├── strategy_lab.py       # ORBC scanner+backtest + read-only Intraday Predictions reference panel
+│   ├── trading.py            # Trading Desk — Day Trading / Options / News / Predictions tabs
+│   └── model_lab.py          # Model Lab — read-only prediction performance dashboard (Prediction Improvement Engine)
 ├── analysis/
 │   ├── indicators.py          # RSI, MACD, ADX, Bollinger Bands, etc.
 │   ├── patterns.py            # Candlestick pattern detectors (Doji, Engulfing, Inside Bar, NR4)
@@ -265,8 +308,11 @@ aether/
 │   ├── orbc_strategy.py       # Opening Range Breakout Confirmation: opening range, confirmation state machine, backtest
 │   ├── volume_profile.py      # Volume-by-price profile — POC/value-area proxy used by mtf_strategy.py
 │   ├── backtest.py            # Generic long-only backtest engine + MACD bullish-cross signal
-│   ├── ml_prediction.py       # XGBoost + RF ensemble (daily): train, predict, evaluate
+│   ├── ml_prediction.py       # XGBoost + RF ensemble (daily): train, predict, evaluate, compare_models, versioning
 │   ├── intraday_prediction.py # Separate intraday (15m) direction model — own features/labels/storage
+│   ├── prediction_performance.py  # Precision/recall/F1/calibration metrics over logged, graded predictions
+│   ├── prediction_errors.py       # Categorizes incorrect predictions against their technical/vol/earnings context
+│   ├── retrain_triggers.py        # Staleness, live-accuracy-drop, and elevated-VIX retrain checks
 │   ├── price_projection.py    # Monte Carlo price-path simulation
 │   ├── options_pricing.py     # Black-Scholes pricing, Greeks, implied-vol solver
 │   ├── volatility_forecast.py # GARCH(1,1) forward volatility forecast
@@ -291,22 +337,32 @@ aether/
 │   ├── activity_log.py         # Records Day Trading / Options / Prediction view events
 │   ├── option_fills.py         # Options fill ledger CRUD
 │   └── round_trips.py          # FIFO buy/sell matcher → round trips with P&L, hold time
+├── scripts/
+│   └── scheduled_retrain.py    # Standalone CLI — cron-driven retrain sweep, not imported by the app
 ├── docs/
 │   ├── workflow.md                    # Day-by-day and week-by-week usage workflow
 │   ├── ORBC_PLAYBOOK.md               # ORBC rules, design decisions, and daily trading routine
-│   ├── ML_PREDICTION.md               # Full technical writeup of the ML ensemble
+│   ├── ML_PREDICTION.md               # Full technical writeup of the ML ensemble + Prediction Improvement Engine
 │   ├── Identifying-Chart-Patterns.md  # Flag/Pennant pattern reference
 │   └── VERIFICATION_CHECKLIST.md      # Manual verification steps for a few past fixes
 ├── tests/
-│   ├── conftest.py             # Shared fixtures — synthetic daily + intraday OHLCV, isolated storage dir
-│   ├── test_ml_prediction.py   # Regression suite for analysis/ml_prediction.py (see Reliability & Verification)
-│   ├── test_orbc_strategy.py   # ORBC confirmation state machine, filters, stops/targets, direction-aware P&L
-│   └── test_intraday_prediction.py  # Intraday label masking, vol-scaled bands, storage isolation from daily
+│   ├── conftest.py                    # Shared fixtures — synthetic daily + intraday OHLCV, isolated storage dir
+│   ├── test_ml_prediction.py          # Regression suite for analysis/ml_prediction.py (see Reliability & Verification)
+│   ├── test_orbc_strategy.py          # ORBC confirmation state machine, filters, stops/targets, direction-aware P&L
+│   ├── test_intraday_prediction.py    # Intraday label masking, vol-scaled bands, storage isolation from daily
+│   ├── test_prediction_performance.py # Precision/recall/F1/calibration metric math
+│   ├── test_prediction_errors.py      # Failure-categorization rule set
+│   ├── test_model_comparison.py       # 4-model walk-forward bake-off + learned ensemble-weight backward-compat
+│   ├── test_model_versioning.py       # Archive/rollback file management, version history
+│   ├── test_retrain_triggers.py       # Staleness/performance-drop/regime-change trigger logic
+│   └── test_scheduled_retrain.py      # scripts/scheduled_retrain.py's discovery, dry-run, and failure isolation
 └── storage/                    # Persisted ML models and prediction logs (auto-created)
     ├── {TICKER}_xgb.pkl
     ├── {TICKER}_rf.pkl
     ├── {TICKER}_accuracy.json
-    └── {TICKER}_predictions.jsonl
+    ├── {TICKER}_predictions.jsonl
+    ├── retrain_log.jsonl
+    └── versions/{TICKER}/        # Archived prior model versions + rollback history
 ```
 
 ## Extensibility & Customization
@@ -315,6 +371,12 @@ aether/
 - **Add an ML feature** — extend `data/feature_engineering.py`'s feature matrix. The daily ensemble picks up new columns on the next training run.
 - **Add or retune an AI brief** — add a `generate_*` prompt builder in `ai/stock_brief.py`, and give it its own `OLLAMA_MODEL_*` override in `config/settings.py` if it deserves a different model.
 - **Tune scoring or risk thresholds** — `config/settings.py` centralizes fundamental scoring cutoffs (ROIC, FCF yield, margin expansion), options thresholds (IVR high/low, IV/RV premium), and risk defaults (per-trade risk %, max position size).
+
+## Future Ideas (Not Yet Built)
+
+Things worth investigating later — noted here so they don't get re-litigated from scratch, not committed to:
+
+- **Extended-hours (pre-market / after-hours) data.** Every fetch in `data/price_data.py` calls yfinance's `.history()` with no `prepost` argument, which defaults to regular-session-only (9:30–4:00 ET) bars — pre-market and after-hours prints are silently excluded everywhere (Day Trading, Predictions, ORBC). Passing `prepost=True` on intraday intervals would add them, and could help with two specific things: seeing an earnings-reaction move the moment it prints after-hours, and a pre-market read on Day Trading before 9:30. It's not a clean win, though — extended-hours bars are low-volume/wide-spread and would skew RSI/ADX/VWAP if fed into existing signals unchanged, and both ORBC's and the intraday ML model's session-boundary logic explicitly assume RTH-only bars (`config/tz.py`, `analysis/orbc_strategy.py`, `build_intraday_labels()`) — turning it on naively would break both. A safer scoped version: an opt-in "show pre/post market" toggle on the Day Trading chart for visual context only, never wired into VWAP/momentum/ORBC/the ML model. Needs its own investigation before building, not a small tweak. "24-hour" data isn't a real concept for stocks regardless (that's crypto-only); this is specifically about the pre-market/after-hours windows.
 
 ## Data Sources & Caching
 
@@ -331,11 +393,14 @@ Cache TTLs (`config/settings.py`): price data 5 min, fundamentals 1 hour, option
 
 Reliability rests on three mechanisms:
 
-**1. A `pytest` regression suite** (`tests/`, 91 tests, run with `pytest tests/ -q` — no network access needed):
+**1. A `pytest` regression suite** (`tests/`, 198 tests, run with `pytest tests/ -q` — no network access needed):
 
-- `test_ml_prediction.py` — the daily model end-to-end: an import-crash guard (the exact failure that silently killed the Predictions tab for 11 days), train/predict/evaluate on synthetic data, the reliability gate correctly rejecting a pure random walk, and the predict → save → history persistence round-trip.
+- `test_ml_prediction.py` — the daily model end-to-end: an import-crash guard (the exact failure that silently killed the Predictions tab for 11 days), train/predict/evaluate on synthetic data, the reliability gate correctly rejecting a pure random walk, hyperparameter search, and the predict → save → history persistence round-trip.
 - `test_orbc_strategy.py` — the ORBC confirmation state machine against hand-built sessions: a single breakout close never signals, a close back inside resets the count, filters fall through from the 2nd to the 3rd close, and short P&L carries the correct sign.
 - `test_intraday_prediction.py` — storage isolation from the daily model, session-boundary label masking, trailing-sigma leak resistance, and naive/UTC index handling.
+- `test_prediction_performance.py` / `test_prediction_errors.py` — the Model Lab metric math (precision/recall/F1/calibration) and the failure-categorization rule set, from the Prediction Improvement Engine.
+- `test_model_comparison.py` — the 4-model walk-forward bake-off, and a bit-for-bit reproduction guard proving the learned ensemble weight never changes the original 65/35 XGB/RF blend's math.
+- `test_model_versioning.py` / `test_retrain_triggers.py` / `test_scheduled_retrain.py` — model version archive/rollback, the three retrain triggers, and the standalone cron sweep script.
 
 **2. The ML model self-gates on quality.** Walk-forward validation must clear 52% mean directional accuracy with std-dev ≤ 8% across folds — a model that doesn't clear the bar is reported as such instead of silently saved.
 

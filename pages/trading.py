@@ -15,8 +15,8 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from data.price_data import get_price_history, get_current_price
-from analysis.indicators import calculate_indicators, get_signal_summary
+from data.price_data import get_price_history
+from analysis.indicators import calculate_indicators
 from data.macro_data import get_vix_data, get_sp500_regime
 from analysis.risk import position_size_from_stop, regime_kelly_multiplier
 from analysis.regime_markov import analyze_regime_markov
@@ -832,6 +832,20 @@ def _render_options():
         st.session_state["_last_logged_opt_ticker"] = ticker
 
     st.markdown("#### Implied Volatility Dashboard")
+    with st.expander("How to read this", expanded=False):
+        st.markdown(
+            "- **IV Rank** — where current IV sits vs. its own 52-week range (0=lowest, "
+            "100=highest). High (>60) means options are rich for *this* stock's own history — "
+            "favors selling premium. Low (<30) means cheap — favors buying.\n"
+            "- **IV/RV Ratio** — IV vs. realized (actual) volatility. >1.15x = rich, <0.85x = "
+            "cheap. This and IV Rank can disagree (rich vs. its own history but still fair vs. "
+            "recent realized moves) — that's a real signal, not a bug.\n"
+            "- **IV/GARCH Ratio** — the same rich/cheap framing, but forward-looking: GARCH "
+            "forecasts where volatility is *going*, not where it's already been. Agreement "
+            "between IV/RV and IV/GARCH is a higher-conviction read than either alone.\n"
+            "- **Term Structure** — Backwardation (near-term IV > far-term) often reflects an "
+            "upcoming event (earnings); Contango (far-term > near-term) is the normal state."
+        )
     c1, c2, c3, c4, c5 = st.columns(5)
     ivr = iv_metrics.get("iv_rank", 50)
     ivr_signal = "🔴 Sell Premium" if ivr > 60 else ("🟢 Buy Premium" if ivr < 30 else "🟡 Neutral")
@@ -1074,7 +1088,7 @@ def _render_prediction_card(result: dict):
         st.caption("Neutral zone: 47–53% — no directional call issued. Display range capped at 35–65% to prevent false precision.")
 
     with col_stats:
-        st.markdown(f"#### Signal Details")
+        st.markdown("#### Signal Details")
         conf_badge_class = {"HIGH": "aeth-badge--bull", "MODERATE": "aeth-badge--warn", "LOW": "aeth-badge--neutral"}.get(confidence, "aeth-badge--neutral")
         st.markdown(
             f'<span class="aeth-badge {conf_badge_class}">Confidence: {confidence}</span>',
@@ -2005,6 +2019,27 @@ def _render_daily_predictions():
     cached_price_path = st.session_state.get(_price_path_cache_key(ticker))
 
     if cached_result and not cached_result.get("error"):
+        with st.expander("How to read this", expanded=False):
+            st.markdown(
+                "- **Gauge** — bull probability, deliberately capped at 35–65% so it never "
+                "implies more confidence than the walk-forward accuracy supports. 45–55% is the "
+                "neutral dead-band — no directional call there.\n"
+                "- **Confidence badge** — HIGH/MODERATE/LOW reflects how far the probability sits "
+                "from neutral, not how *right* the model tends to be — check Model Lab's "
+                "confidence calibration table for whether HIGH actually means more accurate for "
+                "this ticker.\n"
+                "- **Expected Move** — a historical look-back (median past return in similar "
+                "setups), not a forecast — a rough magnitude reference only.\n"
+                "- **Feature Importance** — *why* the model leans this way (e.g. trend features "
+                "dominating vs. volatility features), not a ranking of what to trust more.\n"
+                "- **Model Performance / Walk-Forward Accuracy** — the honest, out-of-sample "
+                "estimate from training. The accuracy delta is the edge over a 50% coin flip; "
+                "52–58% is the normal, real range — don't expect much higher without suspecting "
+                "overfit.\n\n"
+                "Full writeup: `docs/ML_PREDICTION.md`. Live track record across all past "
+                "predictions (not just this one): **Model Lab**."
+            )
+
         st.markdown("## Direction Signal")
         _render_prediction_card(cached_result)
 

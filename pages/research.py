@@ -5,15 +5,13 @@ Workflow enforced: Business context → Financials → Technical → AI Brief �
 import logging
 import streamlit as st
 import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
 import pandas as pd
-import numpy as np
 from typing import Optional
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from data import get_price_history, get_financials, get_ticker_info, get_earnings_history
+from data import get_price_history, get_ticker_info
 from analysis import (
     calculate_indicators, get_signal_summary, detect_support_resistance, detect_regime, full_fundamental_report,
     detect_recent_trendlines, detect_swing_points,
@@ -27,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # ML prediction — optional import so page still works if xgboost not installed
 try:
-    from analysis.ml_prediction import predict as ml_predict, train_model as ml_train
+    from analysis.ml_prediction import predict as ml_predict
     _ML_AVAILABLE = True
 except Exception:
     _ML_AVAILABLE = False
@@ -86,7 +84,6 @@ def render():
     # ── Header ────────────────────────────────────────────────────────────
     name = info.get("longName") or fund_report.get("name", ticker)
     sector = info.get("sector", "")
-    industry = info.get("industry", "")
     mkt_cap = info.get("marketCap")
     cap_str = f"${mkt_cap/1e12:.2f}T" if mkt_cap and mkt_cap > 1e12 else (f"${mkt_cap/1e9:.1f}B" if mkt_cap else "")
 
@@ -178,7 +175,7 @@ def render():
             ml_cols[1].metric(
                 "Bull Probability",
                 f"{prob * 100:.0f}%",
-                f"Neutral zone: 45–55%",
+                "Neutral zone: 45–55%",
             )
             ml_cols[2].metric(
                 "Model Accuracy",
@@ -323,7 +320,6 @@ def _render_price_chart(df: pd.DataFrame, ticker: str, sr: dict, trendlines: Opt
 
 def _render_indicator_panel(df: pd.DataFrame, signals: dict, regime: dict):
     cols = st.columns(4)
-    last = df.iloc[-1]
 
     with cols[0]:
         st.markdown("**Trend**")

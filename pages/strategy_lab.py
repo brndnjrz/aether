@@ -1,6 +1,6 @@
 """
-Strategy Lab — two independent intraday strategies, each with a live scanner
-and a mechanical backtest over recent history.
+Strategy Lab — ORBC live scanner + backtest, plus a read-only Intraday
+Predictions reference panel.
 
 1. ORBC (Opening Range Breakout Confirmation) — define the opening range from
    the first N minutes after the 9:30 ET open, then require a second (or
@@ -8,11 +8,9 @@ and a mechanical backtest over recent history.
    filters the false breakouts common right after the open. Logic in
    analysis/orbc_strategy.py.
 
-2. MTF setup — identify trend on the 4-hour chart, wait for a pullback into a
-   demand zone on the 30-minute chart, confirm a market-structure shift on the
-   5-minute chart, read the tape for absorption then buyers taking control,
-   enter targeting the VAP with a stop at the swing low. Logic in
-   analysis/mtf_strategy.py.
+2. Intraday Predictions — read-only table of the latest saved Intraday
+   Prediction per interval (5m/15m/30m/1h), so it can be checked without
+   leaving this page. Training/refreshing models stays on Trading Desk.
 
 This page is display only — all detection lives in the analysis modules.
 """
@@ -35,7 +33,6 @@ from analysis.orbc_strategy import (
     ORBCConfig,
     backtest_orbc,
     latest_session_state,
-    to_market_tz,
 )
 from analysis.trendlines import detect_recent_trendlines, detect_swing_points
 from analysis.intraday_prediction import (
@@ -785,7 +782,7 @@ def render():
         logger.info(f"[strategy_lab] Ticker changed to {ticker}; loading Strategy Lab data")
         st.session_state["_strategy_lab_last_ticker"] = ticker
 
-    tab_orbc, tab_mtf = st.tabs(["ORBC (Opening Range)", "MTF"])
+    tab_orbc, tab_mtf = st.tabs(["ORBC (Opening Range)", "Intraday Predictions"])
     with tab_orbc:
         _render_orbc(ticker)
     with tab_mtf:

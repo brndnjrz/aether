@@ -3,7 +3,7 @@ Fundamental quality scoring — translates raw financial data into actionable sc
 Follows the Financial Analyst's framework: Quality, Value, Growth, Red Flags.
 """
 import logging
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, List
 from data.fundamentals import get_financials
 
 logger = logging.getLogger(__name__)

@@ -259,3 +259,62 @@ storage/
 ```
 
 Each ticker has its own model files. Training AAPL does not affect the NVDA model. The prediction log is append-only — predictions are never deleted, which allows you to review the model's signal history over time on the Prediction History chart.
+
+## How to Read Model Lab
+
+Model Lab (`pages/model_lab.py`) is where the Prediction Improvement Engine's numbers actually
+live. The same cheat sheet is available in-app via the **"How to read this page"** expander at
+the top of the page.
+
+**Performance dashboard**
+- **Accuracy / Win Rate** — % of graded (resolved) predictions that were correct. Compare this
+  to the accuracy the model *trained with* (shown on Trading Desk's Predictions tab) — if live
+  accuracy is meaningfully lower, the model has degraded since training and a retrain trigger
+  should be firing (check the Retrain Triggers table below).
+- **Precision (per direction)** — of every time the model called *this* direction, what fraction
+  were actually right. Low bullish precision means bullish calls are frequently wrong, even if
+  overall accuracy looks fine.
+- **Recall (per direction)** — of every real move in *this* direction, what fraction did the
+  model actually catch. Low bullish recall with high bearish recall means the model is missing
+  upside moves, not that it's biased toward being wrong.
+- **F1** — the balance of precision and recall in one number; useful for comparing directions at
+  a glance without eyeballing two numbers.
+- **False Positive / Negative Rate** — the error-rate framing of the same confusion matrix:
+  how often a call in this direction was wrong (FP), and how often a real move in this direction
+  was called something else (FN).
+- **Avg Profit / Signal, Avg Holding Time** — a tally of what already happened on graded
+  predictions, not a backtest or a target — read it as "this is what following every signal so
+  far would have returned," nothing more.
+- **Confidence calibration (table + chart)** — the most important section to check periodically.
+  It compares "Avg Predicted Prob." (what the model claimed) to "Realized Accuracy" (what
+  actually happened) per confidence bucket. If HIGH-confidence rows aren't meaningfully more
+  accurate than LOW-confidence rows, the confidence badge isn't earning its keep for this ticker
+  — weight the raw accuracy number instead, not the badge.
+
+**Why the model was wrong (failure analysis)**
+Every incorrect, graded prediction gets tagged with one or more categories (counter-trend, choppy
+market, volume anomaly, RSI divergence, elevated VIX regime, earnings window, or
+uncategorized). A pile-up in one category is a diagnosis, not just a tally — e.g. a run of
+`elevated_vol_regime` misses usually means the market got choppier than the training window, not
+that the model logic broke; retraining on fresher data (which now includes that regime) is
+usually the right fix. `uncategorized` misses are the ones with no explainable technical
+condition behind them — genuine model error, worth remembering if they cluster on one ticker.
+
+**Model comparison**
+An informational, read-only bake-off of XGBoost/Random Forest/Logistic Regression/Gradient
+Boosting via the same walk-forward validation training uses, plus a recommended softmax weight
+per model. Nothing here changes the deployed model — it exists to answer "would a 3rd/4th model
+actually help this ticker" before spending the extra training time deploying one. Run it
+occasionally out of curiosity, not before every trade.
+
+**Version history**
+Every retrain's replaced model is archived here. If a retrain makes live performance worse
+rather than better, roll back to the prior version with one click — it archives the current
+model first, so a rollback never discards anything.
+
+**Retrain triggers**
+The same three checks (staleness / performance drop / elevated VIX) surfaced on Trading Desk's
+Predictions tab status badge, with the reasoning spelled out per trigger. Treat "should retrain"
+as a nudge, not an alarm — check Failure Analysis first to understand *why* before clicking
+retrain on Trading Desk.
+

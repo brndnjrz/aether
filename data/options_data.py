@@ -104,7 +104,6 @@ def calculate_iv_rank(ticker: str, ttl: int = 600) -> Dict[str, Any]:
         term_structure = "Backwardation" if vol_term_ratio > 1.05 else ("Contango" if vol_term_ratio < 0.95 else "Flat")
 
         # Try to get real IV from nearest ATM option
-        real_iv = None
         atm_iv = None
         days_to_expiry = None
         try:
@@ -116,7 +115,6 @@ def calculate_iv_rank(ticker: str, ttl: int = 600) -> Dict[str, Any]:
                 if not calls.empty:
                     idx = (calls["strike"] - price).abs().idxmin()
                     atm_iv = float(calls.loc[idx, "impliedVolatility"]) * 100
-                    real_iv = atm_iv
                 selected_expiry = chain_data.get("selected_expiry")
                 if selected_expiry:
                     days_to_expiry = (pd.Timestamp(selected_expiry) - pd.Timestamp(now_et().date())).days

@@ -4,10 +4,8 @@ Used for regime detection and macro context overlay.
 """
 import time
 import logging
-import pandas as pd
-import yfinance as yf
-from typing import Dict, Any, Optional
-from data.price_data import get_price_history, get_ticker_info
+from typing import Dict, Any
+from data.price_data import get_price_history
 
 logger = logging.getLogger(__name__)
 _cache: Dict[str, Dict] = {}

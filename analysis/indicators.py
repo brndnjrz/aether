@@ -5,7 +5,7 @@ All calculations are self-contained using pandas/numpy (no pandas-ta dependency)
 import numpy as np
 import pandas as pd
 import logging
-from typing import Optional, List
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 

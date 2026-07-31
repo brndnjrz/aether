@@ -105,8 +105,10 @@ One page, four tabs:
   with real discipline against overclaiming: the winning configuration still gets the full
   walk-forward validation (not a single train/test split), a neutral zone that excludes
   flat-return days from training, and probability output deliberately clipped to 35–65% so it
-  never looks more confident than a ~52–58% historical edge actually is. Models expire after 30
-  days and need retraining. Alongside the direction call, a **Price Path** simulation
+  never looks more confident than a ~52–58% historical edge actually is. A model is flagged
+  overdue for retraining on any of three triggers — stale (30+ days old by default), a live
+  accuracy drop vs. what it trained with, or elevated market volatility (VIX) — checked on this
+  tab's status badge and, in more depth, on the **Model Lab** page (see below). Alongside the direction call, a **Price Path** simulation
   (Monte Carlo, seeded from the stock's own historical volatility and the model's own
   probability/expected-move as drift, run over the model's auto-selected horizon) reports a
   day-by-day 25th–75th percentile open/close band — a probability range, not a second
@@ -128,6 +130,18 @@ Flag/Pennant detection is unvalidated pattern geometry, same caveat as the candl
 its confidence score is an internally-consistent weighting of volume/momentum/trend/ATR/shape
 factors, not a backtested win rate; nothing in the app currently reports the historical hit rate
 of confirmed Flag/Pennant patterns the way the MACD Bullish Cross backtest does for its one rule.
+
+## 4. Model Lab — weekly model health check
+
+Once a model has been live for a while, open **Model Lab** and pick the ticker (Daily or
+Intraday tab): the performance dashboard shows whether accuracy/win-rate on *actual logged
+predictions* still matches what the model trained with, "Why the model was wrong" categorizes
+recent misses (counter-trend, choppy market, elevated VIX, earnings window, etc.) so a losing
+streak points at a reason instead of a raw number, and the Retrain Triggers table shows the same
+staleness/performance-drop/regime checks as the Predictions tab's badge, just with the detail
+behind each one. If a retrain doesn't help, Version History rolls back to the model it replaced.
+This isn't a step in a single trade's checklist — it's a periodic check (weekly is reasonable),
+separate from Steps 1-9 below.
 
 ---
 

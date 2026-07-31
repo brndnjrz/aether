@@ -1,9 +1,11 @@
 """
 Model Lab — read-only prediction performance dashboard across the daily and
 intraday models. Reads what Trading Desk has already logged and graded
-(via analysis.prediction_performance); trains or generates nothing itself,
-with one deliberate exception — Version History's rollback button, which
-copies previously-archived model files back into place (never a retrain).
+(via analysis.prediction_performance); never persists a new or changed model,
+with two deliberate exceptions — Model Comparison, which fits four models
+in-memory purely to score them (nothing is saved to storage/), and Version
+History's rollback button, which copies previously-archived model files back
+into place (a file copy, never a retrain).
 """
 import logging
 import os
@@ -338,8 +340,33 @@ def render():
     st.markdown("# Model Lab")
     st.caption(
         "Live prediction track record — reads what Trading Desk has already logged, "
-        "doesn't train or generate anything itself."
+        "never persists a new or changed model itself."
     )
+
+    with st.expander("How to read this page", expanded=False):
+        st.markdown(
+            "- **Accuracy / Win Rate** — % of graded predictions that were correct. Compare to "
+            "the accuracy the model *trained with* (Trading Desk's Predictions tab) — if live "
+            "is meaningfully lower, check Retrain Triggers below.\n"
+            "- **Precision (per direction)** — of every call in that direction, how often it was "
+            "right. **Recall** — of every real move in that direction, how many it caught. Low "
+            "recall on one side means it's missing those moves, not that it's \"biased wrong.\"\n"
+            "- **Confidence calibration** — the one worth checking regularly: compare \"Avg "
+            "Predicted Prob.\" to \"Realized Accuracy\" per bucket. If HIGH isn't meaningfully "
+            "more accurate than LOW, don't trust the confidence badge for this ticker — trust "
+            "the raw accuracy number instead.\n"
+            "- **Why the model was wrong** — every miss tagged with a reason. A pile-up in one "
+            "category (e.g. `elevated_vol_regime`) usually means the market shifted, not that "
+            "the model is broken — a retrain on fresher data is the usual fix. `uncategorized` "
+            "misses are the genuine model errors.\n"
+            "- **Model comparison** — informational only, never changes the deployed model. Run "
+            "it out of curiosity, not before every trade.\n"
+            "- **Version history** — if a retrain makes things worse, roll back with one click; "
+            "the current model is archived first, so nothing is ever discarded.\n"
+            "- **Retrain triggers** — a nudge, not an alarm. Check Failure Analysis first to "
+            "understand *why* before retraining on Trading Desk.\n\n"
+            "Full writeup: `docs/ML_PREDICTION.md` → \"How to Read Model Lab\"."
+        )
 
     ticker = st.text_input("Ticker", value=st.session_state.get("quick_lookup_ticker", "SPY")).upper().strip()
     if not ticker:

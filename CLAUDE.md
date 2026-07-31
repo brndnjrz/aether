@@ -1,6 +1,6 @@
 # Aether — Claude Code Notes
 
-Streamlit intraday/swing trading research dashboard. Five pages, all data live
+Streamlit intraday/swing trading research dashboard. Six pages, all data live
 from yfinance, all state on local disk. See `README.md` for what the app *does*
 and how a user drives it — this file is conventions, commands, and traps.
 
@@ -15,7 +15,10 @@ and how a user drives it — this file is conventions, commands, and traps.
 
 ```bash
 streamlit run app.py          # run the dashboard (localhost:8501)
-pytest tests/ -q              # full suite, ~90s, no network needed
+pytest tests/ -q              # full suite (198 tests), ~15 min, no network needed —
+                               # the ML training stages in test_ml_prediction.py /
+                               # test_intraday_prediction.py / test_model_comparison.py
+                               # dominate the runtime; run subsets while iterating
 pytest tests/test_orbc_strategy.py -q   # fast subset, ~3s
 python3 -m py_compile <files> # quick syntax check before running anything slow
 sqlite3 storage/journal.db "select * from activity_log"
@@ -113,6 +116,26 @@ sqlite3 storage/journal.db "select * from activity_log"
   sklearn/xgboost/feedparser are missing. Keep that pattern when adding heavy deps.
 - `narwhals` is pinned in `requirements.txt` on purpose — a transitive
   sklearn/plotly dep whose version drift once took down the whole Predictions tab.
+- **Model Lab (`pages/model_lab.py`) is read-only, with two exceptions.**
+  `compare_models()`/`compare_intraday_models()` fit throwaway models in-memory
+  purely to score them (nothing persisted); Version History's rollback button
+  copies archived files back into place (a file copy, never a retrain). Keep
+  both exceptions named explicitly in the page's docstring/caption — don't let
+  the "read-only" claim silently go stale as more panels get added.
+- **Retrain thresholds live in `config/settings.py`**
+  (`RETRAIN_STALENESS_DAYS`, `RETRAIN_ACCURACY_DROP_THRESHOLD`,
+  `RETRAIN_MIN_RESOLVED_FOR_DROP_CHECK`), read by `analysis/retrain_triggers.py`.
+  Don't hardcode a threshold in a page or script — that's exactly the bug this
+  module was extracted to fix (`pages/trading.py` used to own a bare `30`).
+- **`scripts/scheduled_retrain.py` is a standalone CLI, not imported by the
+  app.** It discovers tickers from `storage/*_accuracy.json` filenames — don't
+  wire it into a page; run it via cron/launchd outside the repo.
+- **Verify "unused" before deleting.** Several confirmed-dead functions
+  (`portfolio/journal.py::get_closed_performance`, `analysis/risk.py`'s
+  portfolio-level metrics/Kelly helpers) were leftovers from the cut
+  Positions/Risk Analytics tabs, invisible until grepped for real call sites
+  across `pages/`, `analysis/`, and `tests/` — a name appearing in an
+  `__init__.py`'s `__all__` is not evidence it's used.
 
 ## Docs
 

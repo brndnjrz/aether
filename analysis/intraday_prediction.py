@@ -57,7 +57,6 @@ from config.tz import MARKET_TZ, now_et_iso
 # them keeps the ensemble/validation logic identical between daily and intraday
 # without editing analysis/ml_prediction.py.
 from analysis.ml_prediction import (
-    _directional_accuracy,
     _filter_directional,
     _gbc_config,
     _logreg_config,
