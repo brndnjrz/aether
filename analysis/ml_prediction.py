@@ -194,6 +194,19 @@ HYPERPARAM_SEARCH_GRID: List[Dict[str, Any]] = [
     {},
     {"max_depth": 3, "learning_rate": 0.03, "n_estimators": 300},
     {"max_depth": 5, "learning_rate": 0.08, "n_estimators": 150},
+    {"max_depth": 4, "learning_rate": 0.02, "n_estimators": 400},
+    {"max_depth": 3, "learning_rate": 0.1, "n_estimators": 100},
+    {"max_depth": 6, "learning_rate": 0.05, "n_estimators": 200},
+]
+
+# Candidate RandomForest hyperparameter overrides, merged on top of
+# _rf_config()'s defaults. RF was never tuned before this grid existed —
+# same "first entry is the baseline" guarantee as HYPERPARAM_SEARCH_GRID.
+RF_HYPERPARAM_SEARCH_GRID: List[Dict[str, Any]] = [
+    {},
+    {"max_depth": 8, "min_samples_leaf": 10},
+    {"max_depth": 4, "min_samples_leaf": 30},
+    {"n_estimators": 200, "max_depth": 6, "min_samples_leaf": 20},
 ]
 
 # Reduced fold count used only during the search phase — cheaper than the
@@ -393,6 +406,8 @@ def _load_model_metadata(ticker: str) -> Dict[str, Any]:
     meta.setdefault("horizon_days", FORWARD_BARS)
     meta.setdefault("neutral_threshold", NEUTRAL_THRESHOLD)
     meta.setdefault("hyperparam_overrides", {})
+    meta.setdefault("rf_hyperparam_overrides", {})
+    meta.setdefault("ensemble_weights", {"xgb": 0.65, "rf": 0.35})
     return meta
 
 
@@ -532,6 +547,56 @@ def select_hyperparams(
     }
 
 
+def select_rf_hyperparams(
+    X_dir_18: pd.DataFrame,
+    y_dir: pd.Series,
+    xgb_cfg: Dict[str, Any],
+    gap: int,
+) -> Dict[str, Any]:
+    """
+    Search RF_HYPERPARAM_SEARCH_GRID for the RandomForest override set that
+    scores best, with the already-chosen xgb_cfg held fixed — the reverse
+    pairing of select_hyperparams() (which holds RF fixed while searching
+    XGB). Same reduced-fold walk-forward, same "first entry is the
+    can't-do-worse-than-baseline default" guarantee, same return shape.
+
+    Returns
+    -------
+    dict with keys: overrides (the winning dict, possibly {}), candidates
+    (list of {overrides, mean_accuracy, std_accuracy, n_folds}, best first).
+    """
+    candidates: List[Dict[str, Any]] = []
+    best: Optional[Dict[str, Any]] = None
+
+    for overrides in RF_HYPERPARAM_SEARCH_GRID:
+        rf_cfg = {**_rf_config(n_features=len(FEATURE_NAMES)), **overrides}
+        wf = _run_walk_forward(
+            X_dir_18, y_dir, xgb_cfg, rf_cfg,
+            n_splits=_SEARCH_N_SPLITS, gap=gap,
+        )
+        entry = {
+            "overrides": overrides,
+            "mean_accuracy": wf["mean_directional_accuracy"],
+            "std_accuracy": wf["std_directional_accuracy"],
+            "n_folds": wf["n_folds"],
+        }
+        candidates.append(entry)
+
+        if wf["n_folds"] == 0:
+            continue
+        if best is None or entry["mean_accuracy"] > best["mean_accuracy"]:
+            best = entry
+
+    if best is None or best["mean_accuracy"] < _MIN_SEARCH_ACCURACY:
+        logger.warning(f"select_rf_hyperparams: no candidate cleared {_MIN_SEARCH_ACCURACY} accuracy — falling back to default RF hyperparameters")
+        best = {"overrides": RF_HYPERPARAM_SEARCH_GRID[0]}
+
+    return {
+        "overrides": best["overrides"],
+        "candidates": sorted(candidates, key=lambda c: c.get("mean_accuracy", 0.0), reverse=True),
+    }
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
@@ -587,8 +652,10 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
         "horizon_days": None,
         "neutral_threshold_pct": None,
         "hyperparam_overrides": {},
+        "rf_hyperparam_overrides": {},
         "label_search": [],
         "hyperparam_search": [],
+        "rf_hyperparam_search": [],
         "error": None,
     }
 
@@ -657,7 +724,13 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
     logger.info("train_model: %s hyperparam overrides selected — %s", ticker, hp_overrides or "defaults")
 
     xgb_cfg = {**_xgb_config(scale_pos_weight=spw), **hp_overrides}
-    rf_cfg = _rf_config(n_features=len(FEATURE_NAMES))
+
+    # ── Search for the best RandomForest hyperparameters with xgb_cfg fixed ────
+    rf_hp_choice = select_rf_hyperparams(X_dir_18, y_dir, xgb_cfg, gap=horizon_days)
+    rf_hp_overrides = rf_hp_choice["overrides"]
+    logger.info("train_model: %s RF hyperparam overrides selected — %s", ticker, rf_hp_overrides or "defaults")
+
+    rf_cfg = {**_rf_config(n_features=len(FEATURE_NAMES)), **rf_hp_overrides}
 
     # ── Full walk-forward validation BEFORE fitting the final model ───────────
     logger.info("train_model: running full walk-forward validation for %s", ticker)
@@ -699,6 +772,7 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
             "horizon_days": horizon_days,
             "neutral_threshold": neutral_threshold,
             "hyperparam_overrides": hp_overrides,
+            "rf_hyperparam_overrides": rf_hp_overrides,
         }
         with open(_STORAGE_DIR / f"{ticker}_accuracy.json", "w") as f_acc:
             json.dump(acc_record, f_acc)
@@ -725,8 +799,10 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
         "horizon_days": horizon_days,
         "neutral_threshold_pct": round(neutral_threshold * 100, 2),
         "hyperparam_overrides": hp_overrides,
+        "rf_hyperparam_overrides": rf_hp_overrides,
         "label_search": label_choice["candidates"],
         "hyperparam_search": hp_choice["candidates"],
+        "rf_hyperparam_search": rf_hp_choice["candidates"],
         "error": None,
     })
     return result
@@ -804,6 +880,7 @@ def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
         "horizon_days": None,
         "neutral_threshold_pct": None,
         "hyperparam_overrides": {},
+        "rf_hyperparam_overrides": {},
         "indicator_snapshot": {},
         "error": None,
     }
@@ -856,6 +933,7 @@ def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     result["horizon_days"] = horizon_days
     result["neutral_threshold_pct"] = round(neutral_threshold * 100, 2)
     result["hyperparam_overrides"] = metadata["hyperparam_overrides"]
+    result["rf_hyperparam_overrides"] = metadata["rf_hyperparam_overrides"]
 
     # ── Load models ───────────────────────────────────────────────────────────
     try:
@@ -1287,6 +1365,7 @@ def evaluate_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, 
     horizon_days = metadata["horizon_days"]
     neutral_threshold = metadata["neutral_threshold"]
     hp_overrides = metadata["hyperparam_overrides"]
+    rf_hp_overrides = metadata["rf_hyperparam_overrides"]
     out["horizon_days"] = horizon_days
 
     try:
@@ -1315,7 +1394,7 @@ def evaluate_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, 
 
     spw = balance["recommended_scale_pos_weight"]
     xgb_cfg = {**_xgb_config(scale_pos_weight=spw), **hp_overrides}
-    rf_cfg = _rf_config(n_features=len(FEATURE_NAMES))
+    rf_cfg = {**_rf_config(n_features=len(FEATURE_NAMES)), **rf_hp_overrides}
 
     # Use only the 18 core features, consistent with train_model() and inference
     X_dir_18 = X_dir[FEATURE_NAMES]

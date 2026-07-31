@@ -393,6 +393,48 @@ def test_train_returns_metrics_and_persists_a_loadable_model(intraday_indicators
     assert meta["horizon_bars"] == result["horizon_bars"]
 
 
+def test_train_intraday_model_runs_hyperparam_search_via_daily_import(intraday_indicators_df, isolated_intraday_storage, monkeypatch):
+    """Proves reuse, not reimplementation: train_intraday_model() must call
+    ml_prediction.select_hyperparams()/select_rf_hyperparams() rather than
+    forking its own search grid."""
+    import analysis.ml_prediction as ml_prediction
+
+    calls = {"select_hyperparams": 0, "select_rf_hyperparams": 0}
+    real_select_hyperparams = ml_prediction.select_hyperparams
+    real_select_rf_hyperparams = ml_prediction.select_rf_hyperparams
+
+    def spy_select_hyperparams(*args, **kwargs):
+        calls["select_hyperparams"] += 1
+        return real_select_hyperparams(*args, **kwargs)
+
+    def spy_select_rf_hyperparams(*args, **kwargs):
+        calls["select_rf_hyperparams"] += 1
+        return real_select_rf_hyperparams(*args, **kwargs)
+
+    monkeypatch.setattr("analysis.intraday_prediction.select_hyperparams", spy_select_hyperparams)
+    monkeypatch.setattr("analysis.intraday_prediction.select_rf_hyperparams", spy_select_rf_hyperparams)
+
+    result = train_intraday_model("TEST", "15m", df=intraday_indicators_df)
+
+    assert result["error"] is None
+    assert calls["select_hyperparams"] == 1
+    assert calls["select_rf_hyperparams"] == 1
+
+
+def test_train_intraday_model_persists_hyperparam_overrides(intraday_indicators_df, isolated_intraday_storage):
+    from analysis.ml_prediction import HYPERPARAM_SEARCH_GRID, RF_HYPERPARAM_SEARCH_GRID
+
+    result = train_intraday_model("TEST", "15m", df=intraday_indicators_df)
+
+    assert result["error"] is None
+    assert result["hyperparam_overrides"] in HYPERPARAM_SEARCH_GRID
+    assert result["rf_hyperparam_overrides"] in RF_HYPERPARAM_SEARCH_GRID
+
+    meta = load_metadata("TEST", "15m")
+    assert meta["hyperparam_overrides"] == result["hyperparam_overrides"]
+    assert meta["rf_hyperparam_overrides"] == result["rf_hyperparam_overrides"]
+
+
 def test_train_reports_structured_error_on_thin_history(isolated_intraday_storage):
     from analysis.indicators import calculate_indicators
 

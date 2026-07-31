@@ -85,6 +85,91 @@ def test_train_model_pure_random_walk_is_not_reliable(isolated_storage):
     assert result["is_reliable"] is False
 
 
+# ── select_rf_hyperparams() ──────────────────────────────────────────────────
+
+def _build_dir_18(df):
+    from analysis.ml_prediction import FEATURE_NAMES, _filter_directional, _xgb_config
+    from data.feature_engineering import build_features, class_balance_check
+
+    X, y = build_features(df, ticker="ZZRFHP", forward_bars=5, neutral_threshold=0.005)
+    X_dir, y_dir = _filter_directional(X, y)
+    X_dir_18 = X_dir[FEATURE_NAMES]
+    balance = class_balance_check(y_dir)
+    xgb_cfg = _xgb_config(scale_pos_weight=balance["recommended_scale_pos_weight"])
+    return X_dir_18, y_dir, xgb_cfg
+
+
+def test_select_rf_hyperparams_never_scores_worse_than_baseline(synthetic_indicators_df):
+    from analysis.ml_prediction import RF_HYPERPARAM_SEARCH_GRID, select_rf_hyperparams
+
+    X_dir_18, y_dir, xgb_cfg = _build_dir_18(synthetic_indicators_df)
+    choice = select_rf_hyperparams(X_dir_18, y_dir, xgb_cfg, gap=5)
+
+    baseline = next(c for c in choice["candidates"] if c["overrides"] == RF_HYPERPARAM_SEARCH_GRID[0])
+    best = choice["candidates"][0]
+    assert best["mean_accuracy"] >= baseline["mean_accuracy"]
+
+
+def test_select_rf_hyperparams_candidates_sorted_best_first(synthetic_indicators_df):
+    from analysis.ml_prediction import select_rf_hyperparams
+
+    X_dir_18, y_dir, xgb_cfg = _build_dir_18(synthetic_indicators_df)
+    choice = select_rf_hyperparams(X_dir_18, y_dir, xgb_cfg, gap=5)
+
+    accuracies = [c["mean_accuracy"] for c in choice["candidates"]]
+    assert accuracies == sorted(accuracies, reverse=True)
+
+
+def test_train_model_persists_rf_hyperparam_overrides(synthetic_indicators_df, isolated_storage):
+    from analysis.ml_prediction import RF_HYPERPARAM_SEARCH_GRID, train_model
+
+    result = train_model("ZZRFTRAIN", synthetic_indicators_df)
+
+    assert result["error"] is None
+    assert result["rf_hyperparam_overrides"] in RF_HYPERPARAM_SEARCH_GRID
+    assert len(result["rf_hyperparam_search"]) == len(RF_HYPERPARAM_SEARCH_GRID)
+
+    import json
+    with open(isolated_storage / "ZZRFTRAIN_accuracy.json") as f:
+        saved = json.load(f)
+    assert saved["rf_hyperparam_overrides"] == result["rf_hyperparam_overrides"]
+
+
+def test_load_model_metadata_backfills_rf_hyperparam_overrides_for_legacy_files(isolated_storage):
+    """A pre-Phase-5 accuracy.json has no rf_hyperparam_overrides key —
+    _load_model_metadata() must backfill {} rather than KeyError."""
+    import json
+    from analysis.ml_prediction import _load_model_metadata
+
+    legacy_record = {
+        "ticker": "ZZOLDACC", "directional_accuracy": 0.55, "accuracy_std": 0.05,
+        "mean_auc": 0.56, "is_reliable": True, "trained_at": "2026-01-01T00:00:00+00:00",
+        "horizon_days": 5, "neutral_threshold": 0.005, "hyperparam_overrides": {},
+    }
+    with open(isolated_storage / "ZZOLDACC_accuracy.json", "w") as f:
+        json.dump(legacy_record, f)
+
+    meta = _load_model_metadata("ZZOLDACC")
+    assert meta["rf_hyperparam_overrides"] == {}
+    assert meta["ensemble_weights"] == {"xgb": 0.65, "rf": 0.35}
+
+
+def test_broadened_hyperparam_grid_still_falls_back_to_defaults_on_pure_random_walk(isolated_storage):
+    """The larger XGB/RF search grids must not rubber-stamp a pure random
+    walk as reliable — same drift=0.0 trick as the existing reliability-gate
+    test, now covering the RF search stage too."""
+    from analysis.indicators import calculate_indicators
+    from analysis.ml_prediction import RF_HYPERPARAM_SEARCH_GRID, train_model
+    from tests.conftest import _make_synthetic_ohlcv
+
+    random_walk_df = calculate_indicators(_make_synthetic_ohlcv(seed=11, drift=0.0))
+    result = train_model("ZZRFRANDOM", random_walk_df)
+
+    assert result["error"] is None
+    assert result["is_reliable"] is False
+    assert result["rf_hyperparam_overrides"] in RF_HYPERPARAM_SEARCH_GRID
+
+
 # ── predict() ────────────────────────────────────────────────────────────────
 
 def test_predict_auto_trains_when_no_model_on_disk(synthetic_indicators_df, isolated_storage):

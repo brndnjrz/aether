@@ -64,6 +64,8 @@ from analysis.ml_prediction import (
     _to_binary_labels,
     _xgb_config,
     _STORAGE_DIR,
+    select_hyperparams,
+    select_rf_hyperparams,
 )
 from data.feature_engineering import class_balance_check
 
@@ -614,8 +616,16 @@ def train_intraday_model(
     X, y_dir = choice["X"], choice["y"]
     horizon_bars = choice["horizon_bars"]
     balance = class_balance_check(y_dir)
-    xgb_cfg = _xgb_config(scale_pos_weight=balance["recommended_scale_pos_weight"])
-    rf_cfg = _rf_config(n_features=len(INTRADAY_FEATURE_NAMES))
+
+    # ── Hyperparameter search — same grids/functions ml_prediction.py's daily
+    # model uses, imported read-only, not a duplicated search. ─────────────
+    hp_choice = select_hyperparams(X, y_dir, scale_pos_weight=balance["recommended_scale_pos_weight"], gap=horizon_bars)
+    hp_overrides = hp_choice["overrides"]
+    xgb_cfg = {**_xgb_config(scale_pos_weight=balance["recommended_scale_pos_weight"]), **hp_overrides}
+
+    rf_hp_choice = select_rf_hyperparams(X, y_dir, xgb_cfg, gap=horizon_bars)
+    rf_hp_overrides = rf_hp_choice["overrides"]
+    rf_cfg = {**_rf_config(n_features=len(INTRADAY_FEATURE_NAMES)), **rf_hp_overrides}
 
     wf = _run_walk_forward(X, y_dir, xgb_cfg, rf_cfg, n_splits=10, gap=horizon_bars)
     if wf["n_folds"] == 0:
@@ -653,6 +663,8 @@ def train_intraday_model(
         "trained_at": now_iso,
         "n_train": len(X),
         "tradeability": tradeability,
+        "hyperparam_overrides": hp_overrides,
+        "rf_hyperparam_overrides": rf_hp_overrides,
     }
     try:
         joblib.dump(xgb_final, _xgb_path(ticker, interval))
@@ -677,6 +689,8 @@ def train_intraday_model(
         "n_validation_samples": wf["n_validation_samples"],
         "class_balance": balance,
         "label_search": choice["candidates"],
+        "hyperparam_search": hp_choice["candidates"],
+        "rf_hyperparam_search": rf_hp_choice["candidates"],
         "session_mask_dropped": choice["info"]["dropped_to_session_mask"],
     })
     return result
