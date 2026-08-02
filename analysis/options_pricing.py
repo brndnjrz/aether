@@ -233,6 +233,7 @@ def _degraded_options_verdict(reason: str, **passthrough: Any) -> Dict[str, Any]
         "days_to_expiry": None,
         "expiry_date": None,
         "quote_source": None,
+        "iv_points_to_erase_edge": None,
         "reason": reason,
     }
     out.update(passthrough)
@@ -251,6 +252,7 @@ def assess_options_tradeability(
     option_bid: Optional[float] = None,
     option_ask: Optional[float] = None,
     theta_per_day: Optional[float] = None,
+    vega: Optional[float] = None,
     theta_basis: Optional[str] = None,
     fallback_spread_pct: Optional[float] = None,
     expiry_date: Optional[str] = None,
@@ -281,9 +283,14 @@ def assess_options_tradeability(
     - **Gamma ignored.** Delta is held constant across the horizon. Fine for
       small moves; optimistic on large ones (in your favour on a winner,
       against you on a loser).
-    - **Vega ignored, and this is the big one.** An IV crush after a correct
-      directional call can erase the gain entirely. A "tradeable" verdict here
-      assumes IV holds. See Roadmap Item 11.
+    - **Vega is not forecast, only inverted.** An IV crush after a correct
+      directional call can erase the gain entirely, and nothing here predicts IV.
+      What it can do without inventing a number is report the breakeven: pass
+      `vega` and `iv_points_to_erase_edge` says how many volatility points of IV
+      decline would wipe out the modelled edge. That is arithmetic, not a
+      forecast — an actual IV forecast needs its own calibration study (how far
+      does SPY ATM IV really move after a 0.35% 75-minute move?), which is the
+      remaining half of Roadmap Item 11.
     - **Single ATM contract.** No spreads, no multi-leg structures; selling
       premium has an entirely different cost profile.
 
@@ -383,9 +390,43 @@ def assess_options_tradeability(
         "dominant_cost": "theta" if theta_drag_pct >= spread_cost_pct else "spread",
         "is_tradeable": bool(net_edge_pct > 0),
         "theta_basis": theta_basis,
+        "iv_points_to_erase_edge": _iv_points_to_erase_edge(
+            net_edge_pct=net_edge_pct, option_mid=option_mid, vega=vega,
+        ),
         "reason": None,
         **common,
     }
+
+
+def _iv_points_to_erase_edge(
+    *, net_edge_pct: float, option_mid: float, vega: Optional[float],
+) -> Optional[float]:
+    """
+    How many volatility points of IV decline would wipe out the modelled edge.
+
+    `vega` from `black_scholes_greeks` is the price change per **one percentage
+    point** of IV, so:
+
+        edge_dollars = net_edge_pct / 100 * option_mid
+        iv_points    = edge_dollars / vega
+
+    Returns None when vega is unavailable or the edge is already negative — there
+    is no edge left to erase, and printing a number there would imply one.
+
+    This is the honest half of the vega question: a breakeven, computed from a
+    Greek the app already has, with no assumption about how IV will actually
+    behave. Forecasting the IV move is deferred (Roadmap Item 11).
+    """
+    if vega is None or net_edge_pct <= 0:
+        return None
+    try:
+        vega = abs(float(vega))
+    except (TypeError, ValueError):
+        return None
+    if vega <= 0:
+        return None
+    edge_dollars = net_edge_pct / 100.0 * option_mid
+    return round(edge_dollars / vega, 3)
 
 
 def sweep_expiries(
@@ -432,6 +473,7 @@ def sweep_expiries(
             option_ask=q.get("ask"),
             delta=q.get("delta"),
             theta_per_day=q.get("theta_per_day"),
+            vega=q.get("vega"),
             horizon_minutes=horizon_minutes,
             days_to_expiry=q.get("days_to_expiry", dte),
             theta_basis=theta_basis,

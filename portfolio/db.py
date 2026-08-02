@@ -84,6 +84,10 @@ def init_db():
                 price REAL NOT NULL,
                 filled_at TEXT NOT NULL,
                 notes TEXT,
+                -- Roadmap Item 12: which model signal, if any, motivated this
+                -- fill. Format "<horizon>|<prediction ISO timestamp>", e.g.
+                -- "15m|2026-08-03T10:30:00-04:00". NULL means discretionary.
+                prediction_ref TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -96,6 +100,36 @@ def init_db():
                 added_date TEXT DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        _migrate(conn)
         conn.commit()
     _initialized = True
     logger.info(f"Initialized portfolio DB schema at {DB_PATH}")
+
+
+# Additive column migrations. CREATE TABLE IF NOT EXISTS above is a no-op on an
+# existing database, so a column added to that DDL never reaches a DB created
+# before it — storage/journal.db holds real trade history and is not recreated.
+# Each entry is (table, column, type); applied only when absent, so this is
+# idempotent and safe to run on every startup.
+_MIGRATIONS = [
+    # Roadmap Item 12 — links a fill back to the prediction that motivated it.
+    ("option_fills", "prediction_ref", "TEXT"),
+]
+
+
+def _migrate(conn):
+    for table, column, coltype in _MIGRATIONS:
+        try:
+            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        except Exception as exc:
+            logger.debug(f"_migrate: could not inspect {table}: {exc}")
+            continue
+        if not existing:
+            continue                      # table absent; the DDL above will create it
+        if column in existing:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+            logger.info(f"_migrate: added {table}.{column}")
+        except Exception as exc:
+            logger.warning(f"_migrate: failed adding {table}.{column}: {exc}")

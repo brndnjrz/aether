@@ -476,6 +476,7 @@ def compare_horizons(
             "net_edge_pct": None, "dominant_cost": None, "cost_model": None,
             "calibrated": "unknown (0)", "verdict": "Not trained",
             "expiry_date": None, "horizon_minutes": None,
+            "iv_points_to_erase_edge": None,
         }
 
     for interval in INTERVAL_SPECS:
@@ -498,6 +499,7 @@ def compare_horizons(
                 "cost_model": "shares" if stored else None,
                 "best_dte": None,
                 "expiry_date": None,
+                "iv_points_to_erase_edge": None,
                 "calibrated": _calibration_verdict(metrics),
             }
             _apply_options_sweep(
@@ -537,7 +539,8 @@ def compare_horizons(
                     "cost_model": None,
                     "best_dte": None,
                     "expiry_date": None,
-                    "calibrated": _calibration_verdict(metrics),
+                    "iv_points_to_erase_edge": None,
+                "calibrated": _calibration_verdict(metrics),
                 }
                 _apply_options_sweep(
                     row,
@@ -684,4 +687,7 @@ def _apply_options_sweep(
             "cost_model": "options",
             "best_dte": sweep.get("best_dte"),
             "expiry_date": best.get("expiry_date"),
+            # How much of an IV crush would erase the edge. Arithmetic, not a
+            # forecast — see options_pricing._iv_points_to_erase_edge.
+            "iv_points_to_erase_edge": best.get("iv_points_to_erase_edge"),
         })

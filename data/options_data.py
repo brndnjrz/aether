@@ -376,6 +376,7 @@ def get_expiry_ladder_quotes(
             "ask": ask if ask > 0 else None,
             "delta": leg.get("delta"),
             "theta_per_day": leg.get("theta"),
+            "vega": leg.get("vega"),
             "iv": leg.get("iv"),
             "days_to_expiry": actual_dte,
             "expiry_date": expiry_str,

@@ -282,6 +282,59 @@ def test_put_delta_sign_does_not_flip_elasticity():
     assert call["elasticity"] == put["elasticity"]
 
 
+# ── vega breakeven (Item 11's honest half) ────────────────────────────────────
+
+def test_iv_breakeven_is_none_without_vega():
+    """No vega supplied means no breakeven — do not invent one."""
+    assert _thirty_dte()["iv_points_to_erase_edge"] is None
+
+
+def test_iv_breakeven_inverts_vega_against_the_edge():
+    """
+    net edge 0.1459% of a $16 contract = $0.02334 of edge. With vega 0.0234
+    (price change per 1 vol point), a ~1.0-point IV decline erases it.
+    """
+    v = _thirty_dte(vega=0.0234)
+    expected = v["net_edge_pct"] / 100 * 16.00 / 0.0234
+    assert v["iv_points_to_erase_edge"] == pytest.approx(expected, abs=1e-3)
+    assert v["iv_points_to_erase_edge"] == pytest.approx(1.0, abs=0.15)
+
+
+def test_iv_breakeven_is_none_when_there_is_no_edge_left_to_erase():
+    """A negative edge has nothing to wipe out; a number there would imply one."""
+    v = _zero_dte(vega=0.05)
+    assert v["net_edge_pct"] < 0
+    assert v["iv_points_to_erase_edge"] is None
+
+
+def test_larger_vega_means_a_smaller_iv_move_erases_the_edge():
+    low = _thirty_dte(vega=0.01)["iv_points_to_erase_edge"]
+    high = _thirty_dte(vega=0.05)["iv_points_to_erase_edge"]
+    assert high < low
+
+
+def test_iv_breakeven_ignores_vega_sign():
+    assert _thirty_dte(vega=0.0234)["iv_points_to_erase_edge"] == pytest.approx(
+        _thirty_dte(vega=-0.0234)["iv_points_to_erase_edge"]
+    )
+
+
+@pytest.mark.parametrize("bad_vega", [0.0, "abc", None])
+def test_unusable_vega_yields_no_breakeven(bad_vega):
+    assert _thirty_dte(vega=bad_vega)["iv_points_to_erase_edge"] is None
+
+
+def test_sweep_passes_each_rungs_vega_through():
+    quotes = {
+        30: {"mid": 16.00, "bid": 15.97, "ask": 16.03, "delta": 0.50,
+             "theta_per_day": -0.20, "vega": 0.0234, "days_to_expiry": 30.0},
+    }
+    out = sweep_expiries(
+        ACC, SIGMA_035, underlying_price=SPY, horizon_minutes=H15M, quotes=quotes,
+    )
+    assert out["by_dte"][30]["iv_points_to_erase_edge"] is not None
+
+
 # ── sweep ─────────────────────────────────────────────────────────────────────
 
 def _ladder():

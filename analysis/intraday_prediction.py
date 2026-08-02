@@ -876,6 +876,8 @@ def predict_intraday(
     df: Optional[pd.DataFrame] = None,
     auto_train: bool = True,
     round_trip_cost_pct: float = 0.02,
+    *,
+    persist: bool = True,
 ) -> Dict[str, Any]:
     """
     Direction prediction for the most recent intraday bar.
@@ -983,7 +985,8 @@ def predict_intraday(
         "indicator_snapshot": indicator_snapshot,
         "ensemble_weights": ensemble_weights,
     }
-    save_intraday_prediction(ticker, interval, result)
+    if persist:
+        save_intraday_prediction(ticker, interval, result)
     logger.info(
         "predict_intraday: %s %s direction=%s prob=%.4f confidence=%s",
         ticker, interval, direction, ensemble, confidence,

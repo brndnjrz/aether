@@ -587,6 +587,10 @@ def _render_horizon_scoreboard(ticker: str):
             ),
             "Net edge": f"{net:+.3f}%" if net is not None else "—",
             "Dominant cost": r["dominant_cost"] or "—",
+            "IV crush to erase": (
+                f"{r['iv_points_to_erase_edge']:.1f} vol pts"
+                if r.get("iv_points_to_erase_edge") is not None else "—"
+            ),
             "Calibrated": r["calibrated"],
             "Verdict": r["verdict"],
         })

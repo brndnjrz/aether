@@ -1205,7 +1205,9 @@ def _summarize_similar_setups(subset_ret: np.ndarray, direction: str) -> Dict[st
     }
 
 
-def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+def predict(
+    ticker: str, df: Optional[pd.DataFrame] = None, *, persist: bool = True,
+) -> Dict[str, Any]:
     """
     Load saved models and produce a directional prediction for the latest bar.
 
@@ -1476,7 +1478,12 @@ def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     })
 
     # ── Persist prediction ────────────────────────────────────────────────────
-    save_prediction(ticker, result)
+    # persist=False exists for automated callers (alert sweeps, scanners). Every
+    # row appended here counts toward the live win rate that Model Lab, the
+    # retrain triggers, and the horizon scoreboard all read, so a background loop
+    # writing on every poll would silently corrupt all three.
+    if persist:
+        save_prediction(ticker, result)
 
     logger.info(
         f"predict: {ticker} complete — direction={direction} probability={result['probability']} "

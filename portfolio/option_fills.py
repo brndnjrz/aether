@@ -11,15 +11,24 @@ logger = logging.getLogger(__name__)
 
 
 def add_fill(ticker: str, strike: float, option_type: str, expiry_date: str,
-             side: str, qty: int, price: float, filled_at: str, notes: str = ""):
+             side: str, qty: int, price: float, filled_at: str, notes: str = "",
+             prediction_ref: Optional[str] = None):
+    """
+    `prediction_ref` (Roadmap Item 12) records which model signal motivated the
+    fill, as "<horizon>|<prediction ISO timestamp>". None means discretionary —
+    and that distinction is the point: it is what lets
+    analysis/trade_attribution.py compare following the model against overriding
+    it, using real fills rather than reconstructed outcomes.
+    """
     init_db()
     with get_conn() as conn:
         cur = conn.execute(
             """INSERT INTO option_fills
-               (ticker, strike, option_type, expiry_date, side, qty, price, filled_at, notes)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (ticker, strike, option_type, expiry_date, side, qty, price, filled_at,
+                notes, prediction_ref)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (ticker.upper().strip(), strike, option_type.lower(), expiry_date,
-             side.lower(), qty, price, filled_at, notes.strip()),
+             side.lower(), qty, price, filled_at, notes.strip(), prediction_ref),
         )
         conn.commit()
         logger.info(
@@ -51,16 +60,18 @@ def remove_fill(fill_id: int):
 
 
 def update_fill(fill_id: int, ticker: str, strike: float, option_type: str, expiry_date: str,
-                 side: str, qty: int, price: float, filled_at: str, notes: str = ""):
+                 side: str, qty: int, price: float, filled_at: str, notes: str = "",
+                 prediction_ref: Optional[str] = None):
     init_db()
     with get_conn() as conn:
         conn.execute(
             """UPDATE option_fills
                SET ticker = ?, strike = ?, option_type = ?, expiry_date = ?,
-                   side = ?, qty = ?, price = ?, filled_at = ?, notes = ?
+                   side = ?, qty = ?, price = ?, filled_at = ?, notes = ?,
+                   prediction_ref = ?
                WHERE id = ?""",
             (ticker.upper().strip(), strike, option_type.lower(), expiry_date,
-             side.lower(), qty, price, filled_at, notes.strip(), fill_id),
+             side.lower(), qty, price, filled_at, notes.strip(), prediction_ref, fill_id),
         )
         conn.commit()
         logger.info(f"Updated option fill id={fill_id} ticker={ticker.upper().strip()}")

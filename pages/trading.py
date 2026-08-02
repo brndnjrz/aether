@@ -2059,6 +2059,46 @@ def _render_horizon_cockpit():
             for w in consensus["warnings"]:
                 st.caption(f"— {w}")
 
+    _render_consensus_chat(ticker, consensus)
+
+
+def _render_consensus_chat(ticker: str, consensus: dict):
+    """
+    Ask questions about the horizon readings (Roadmap Item 13).
+
+    Grounded strictly on the consensus dict already rendered above — the model gets
+    that payload and nothing else. No chart, no news, no price history. That
+    constraint is the whole design: ungrounded, an LLM will narrate a VWAP reclaim
+    that never happened, which is worse than no answer at all.
+    """
+    if not ai_available():
+        return
+
+    from ai.stock_brief import generate_consensus_answer
+
+    with st.expander("Ask about these readings", expanded=False):
+        st.caption(
+            "Answers come only from the table above — the model is given the consensus "
+            "numbers and explicitly told to say what is missing rather than fill gaps. "
+            "It has no chart and no news feed."
+        )
+        question = st.text_input(
+            "Question",
+            placeholder="e.g. Why is 15m bullish but not tradeable?",
+            key="cockpit_chat_q",
+        )
+        if st.button("Ask", key="cockpit_chat_btn") and question.strip():
+            logger.info(f"[trading] cockpit chat asked for {ticker}: {question[:80]}")
+            with st.spinner("Reading the consensus…"):
+                answer = generate_consensus_answer(ticker, question.strip(), consensus)
+            if answer:
+                st.markdown(format_ai_markdown(answer))
+            else:
+                st.error(
+                    "AI generation failed — check logs (the provider may be unreachable "
+                    "or unable to answer within its token budget)."
+                )
+
 
 def _acc_with_n(h: dict) -> str:
     """Live accuracy is meaningless without its sample size, so they render together."""

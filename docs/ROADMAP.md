@@ -1,12 +1,36 @@
 # Aether Roadmap — SPY Horizon Cockpit
 
-**Bottom line:** the app has five direction models (5m / 15m / 30m / 1h / daily) and no
-way to see them at once; it tells you when to get in but never when to get out; and its
-"is this tradeable after costs" check is modeled on trading SPY shares when the actual
-instrument is SPY options. Everything in v2.0 addresses one of those three gaps.
+> **Status: all 14 items implemented** on branch `feat/horizon-cockpit`.
+> Keep this document as the design record — the *why* behind each item, the
+> decisions settled before building, the ideas deliberately rejected, and the four
+> traps the implementation had to avoid. Read it that way, not as pending work.
+>
+> Two things did not land as originally written, both deliberately:
+>
+> - **Item 11 (vega)** ships only its honest half. `iv_points_to_erase_edge`
+>   reports how many volatility points of IV decline would wipe out the modelled
+>   edge — arithmetic from a Greek the app already had. *Forecasting* the IV move
+>   still needs the calibration study Item 11 names (how far does SPY ATM IV
+>   actually move after a 0.35% 75-minute move?); inventing that number instead
+>   would have been [trap 1](#trap-1--hardcoded-signal-weights-are-false-precision).
+> - **Item 12's analysis is gated, not live.** Logging and comparison are both
+>   built, but `compare_followed_vs_discretionary()` refuses to report until both
+>   arms clear their minimums — see
+>   [trap 3](#trap-3--personalized-learning-needs-hundreds-of-trades). The gate is
+>   the feature.
+>
+> **Verification caveat.** No environment on the development machine has the full
+> `requirements.txt` (`~/anaconda3/envs/stock-app/` is empty), so tests that
+> actually train a model could not be run locally: 392 of 436 pass, and all 44
+> failures share one cause — a missing `xgboost` — with zero assertion failures.
+> Run `pytest tests/ -q` in a complete env before trusting the suite, and treat
+> anything touching live options quotes as unexercised until it has run against a
+> real chain during market hours.
 
-This is a planning document, not a spec of shipped behavior. Anything described here in
-future tense does not exist yet. See `README.md` for what the app currently does.
+**Bottom line:** the app had five direction models (5m / 15m / 30m / 1h / daily) and no
+way to see them at once; it told you when to get in but never when to get out; and its
+"is this tradeable after costs" check was modelled on trading SPY shares when the actual
+instrument is SPY options. Everything in v2.0 addressed one of those three gaps.
 
 ## Table of Contents
 
