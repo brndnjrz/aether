@@ -144,3 +144,19 @@ usage), `docs/ORBC_PLAYBOOK.md` (ORBC rules + design decisions + trading routine
 `docs/UI_DESIGN_SPEC.md` (theme tokens — global stylesheet lives only in `app.py`),
 `docs/VERIFICATION_CHECKLIST.md` (manual checks; its line numbers drift).
 `docs/DATA_STORAGE.md` and `docs/MONOREPO_EXTRACTION.md` are gitignored/local-only.
+
+`docs/ROADMAP.md` is **planned work, not shipped behavior** — don't read it as
+describing what the app does. It records the SPY-options use case, settled design
+decisions (cockpit placement, read-only refresh, options cost basis), items
+explicitly rejected and why, and four traps to avoid while building. Two things in
+it are load-bearing for anyone touching the prediction models:
+
+- `assess_tradeability()` models costs in **underlying** percentage points, which is
+  correct for shares and wrong for the options actually being traded — it ignores
+  delta leverage and has no theta term at all. Treat its current "tradeable" verdicts
+  as unreliable until Item 3 lands.
+- `predict()` / `predict_intraday()` call `save_*_prediction()` unconditionally, so
+  **any** automated caller (auto-refresh, alert loop, scanner) silently inflates the
+  prediction log and corrupts the live win rate that Model Lab, the retrain triggers,
+  and the trust scoreboard all read. Keep generation behind an explicit user action,
+  or add `persist=False` first.

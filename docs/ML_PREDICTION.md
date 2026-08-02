@@ -13,7 +13,7 @@ The **Predictions** tab (Trading Desk page, `pages/trading.py`) runs a machine-l
 
 Once you click **Generate Prediction**, five sections render in order:
 
-1. **Direction Signal** — a gauge chart of the ensemble bull probability, deliberately windowed to 35-65% rather than 0-100% so the display never implies more confidence than the walk-forward accuracy supports. The 47-53% band is shaded as the neutral dead-band — inside it no directional call is issued. Alongside the gauge: a confidence badge (HIGH/MODERATE/LOW, see thresholds below), **Expected 5-Day Move** (median historical 5-day return in past setups where the model made the same call — a look-back statistic, not a forecast), and **Walk-Forward Accuracy** with a delta against the 50% coin-flip baseline. A callout below restates the accuracy as a plain-language "edge" (e.g. "+4.2% above coin-flip") and warns not to size a position larger than your standard allocation off this signal alone.
+1. **Direction Signal** — a gauge chart of the ensemble bull probability, deliberately drawn on a 35-65% axis rather than 0-100% so the display never implies more confidence than the walk-forward accuracy supports. The 45-55% band is shaded as the neutral dead-band — inside it no directional call is issued. Alongside the gauge: a confidence badge (HIGH/MODERATE/LOW, see thresholds below), **Expected 5-Day Move** (median historical 5-day return in past setups where the model made the same call — a look-back statistic, not a forecast), and **Walk-Forward Accuracy** with a delta against the 50% coin-flip baseline. A callout below restates the accuracy as a plain-language "edge" (e.g. "+4.2% above coin-flip") and warns not to size a position larger than your standard allocation off this signal alone.
 2. **5-Day Price Path (Simulated)** — a Monte Carlo band chart and table of simulated daily open/close prices for the next 5 trading days. See [5-Day Price Path Simulation](#5-day-price-path-simulation) below for how this is computed and why it is not the same thing as a price forecast.
 3. **Feature Importance** — a horizontal bar chart of the top 8 of the 18 features by XGBoost gain (how much decision weight that feature contributed across the model's splits). This is what explains *why* the current prediction leans the way it does — e.g. `price_vs_sma20` and `rsi_norm` dominating points to a trend/momentum-driven call, while `vol_ratio` and `hl_range_pct` dominating points to a volatility-driven one. Rankings can shift between training runs; a large shift signals the model's regime sensitivity, not a bug.
 4. **Model Performance** — the walk-forward metrics in full: a reliability verdict and reason string, directional accuracy, ROC-AUC, total out-of-sample validation predictions vs. total training samples used, in-sample Sharpe of the raw signal (explicitly labeled a sanity check only — not for live position sizing), accuracy standard deviation across folds, and the training label's class balance (bullish % vs bearish %, flagged if skewed past 35/65 since `scale_pos_weight` is auto-adjusted for that).
@@ -46,7 +46,7 @@ The combined probability is then mapped to a direction:
 - `P_bull < 0.45` → **BEARISH**
 - `0.45 ≤ P_bull ≤ 0.55` → **NEUTRAL** (dead-band; no directional call)
 
-The display gauge is capped at 35–65% to prevent conveying false precision. Raw model output beyond these bounds does not meaningfully distinguish between different confidence levels given the amount of noise in financial data.
+The display gauge uses a 35–65% axis to avoid conveying false precision: raw model output beyond those bounds does not meaningfully distinguish between different confidence levels given the amount of noise in financial data. This is an axis choice, not a transform — the probability returned by `predict()` and written to the prediction log is the unmodified ensemble output.
 
 ### Model comparison (informational)
 
@@ -140,9 +140,11 @@ BEARISH — bull probability < 45%
 
 | Confidence | Bull Probability Range | Meaning |
 |-----------|----------------------|---------|
-| HIGH | < 35% or > 65% (clipped to display range) | Strong signal; model is well outside the neutral zone |
-| MODERATE | 45–55% or 55–65% boundary | Some directional lean; treat as supporting evidence only |
-| LOW | 47–53% | Near-neutral; signal is noise; do not trade on this alone |
+| HIGH | > 65% or < 35% | Strong signal; model is well outside the neutral zone |
+| MODERATE | 55–65% or 35–45% | Some directional lean; treat as supporting evidence only |
+| LOW | 45–55% | Near-neutral; signal is noise; do not trade on this alone |
+
+These are the exact boundaries `predict()` uses (`ml_prediction.py`, "Signal derivation"). Note that the LOW band and the NEUTRAL dead-band are the same range — a LOW-confidence reading and a NEUTRAL direction are two descriptions of one state.
 
 In practice, most signals will be LOW or MODERATE confidence. HIGH confidence signals are rare, and that is expected — they represent setups where multiple technical features are aligned, which happens infrequently.
 
@@ -197,7 +199,7 @@ The 50% baseline is the "coin flip" — what you would achieve by predicting bul
 **Structural limitations:**
 
 - The model is trained on technical features only; fundamentals, earnings expectations, and sector momentum are not inputs
-- Probabilities are clipped to 35–65% because the raw model output beyond these bounds does not reliably distinguish between different future outcomes given financial data's signal-to-noise ratio
+- The probability gauge is drawn on a 35–65% axis because raw model output beyond those bounds does not reliably distinguish between different future outcomes given financial data's signal-to-noise ratio. The axis is a display choice only — the probability itself is never clipped, and HIGH confidence is *defined* as a reading outside that range
 - Walk-forward accuracy from the training period may not hold in the current market regime; accuracy degrades when market conditions shift significantly from the training window
 - The 5-Day Price Path is a volatility simulation seeded from the stock's own historical volatility and the classifier's directional bias, not a separately backtested or validated forecasting model — it has no walk-forward accuracy figure of its own, and its overnight-gap modeling is a simplification, not a fitted gap distribution
 

@@ -104,8 +104,8 @@ One page, four tabs:
   scored via reduced-fold walk-forward, rather than one fixed 5-day config for every ticker. Built
   with real discipline against overclaiming: the winning configuration still gets the full
   walk-forward validation (not a single train/test split), a neutral zone that excludes
-  flat-return days from training, and probability output deliberately clipped to 35–65% so it
-  never looks more confident than a ~52–58% historical edge actually is. A model is flagged
+  flat-return days from training, and a probability gauge deliberately drawn on a 35–65% axis
+  so it never looks more confident than a ~52–58% historical edge actually is. A model is flagged
   overdue for retraining on any of three triggers — stale (30+ days old by default), a live
   accuracy drop vs. what it trained with, or elevated market volatility (VIX) — checked on this
   tab's status badge and, in more depth, on the **Model Lab** page (see below). Alongside the direction call, a **Price Path** simulation

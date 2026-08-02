@@ -77,3 +77,35 @@ RETRAIN_ACCURACY_DROP_THRESHOLD = 0.05   # trigger if live accuracy falls this
                                           # far below the trained-in accuracy
 RETRAIN_MIN_RESOLVED_FOR_DROP_CHECK = 20  # don't judge a drop on too few resolved predictions
 
+# ── Options cost model (Roadmap Item 3) ──────────────────────────────────────
+# analysis/intraday_prediction.assess_tradeability() prices costs in UNDERLYING
+# percentage points, which is right for trading shares and wrong for contracts:
+# it ignores delta leverage and has no theta term. assess_options_tradeability()
+# in analysis/options_pricing.py is the contract-aware version; these are its
+# defaults. See docs/ROADMAP.md for the derivation.
+OPTIONS_COST_MODEL_DEFAULT = "options"    # "options" | "shares"
+
+# Expiry ladder swept per signal horizon. Each rung is snapped to the nearest
+# LISTED expiry at fetch time, so these are targets, not guarantees.
+OPTIONS_EXPIRY_LADDER_DTE = [0, 2, 7, 30]
+
+# Pro-rating theta: "trading" spreads a day's decay over the 390-minute session
+# (most decay is realized during trading hours); "calendar" spreads it over
+# 1440 minutes. "trading" is the more conservative intraday read.
+OPTIONS_THETA_BASIS = "trading"
+
+# Below this many days to expiry, closed-form Black-Scholes theta is unstable
+# (it diverges as T -> 0), so the cost model switches to an empirical
+# sqrt-of-time-remaining decay on the contract's extrinsic value instead.
+OPTIONS_MIN_DTE_FOR_BS_THETA = 1.0
+
+# Used only when no live chain is available (market closed, fetch failure).
+# Expressed as a fraction of the contract's mid price for one round trip.
+# Deliberately pessimistic — a fallback should never flatter the verdict.
+OPTIONS_FALLBACK_SPREAD_PCT = 0.02        # 2% of mid
+
+# Stop distance for an intraday signal, as a multiple of the average absolute
+# move over that signal's own horizon. The daily-ATR stop (1.5 x ATR) stays in
+# place for swing signals; see Roadmap Item 2B.
+HORIZON_STOP_ATR_MULTIPLE = 1.25
+

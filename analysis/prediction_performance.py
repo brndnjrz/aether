@@ -334,3 +334,310 @@ def compute_intraday_prediction_metrics(
     metrics["ticker"] = ticker
     metrics["interval"] = interval
     return metrics
+
+
+# ── Cross-horizon comparison (Roadmap Item 4) ────────────────────────────────
+#
+# Model Lab answers "how is the 15m model doing" only after you pick 15m. It
+# never answered "WHICH horizon should I trade," which is the actual decision.
+# compare_horizons() puts all five side by side and, when options quotes are
+# supplied, sweeps an expiry ladder per horizon so the grid shows both halves of
+# the question at once: which horizon, and which expiry to trade it with.
+#
+# Deliberately distinct from analysis.interval_consensus.build_consensus():
+# that reports what is LIVE RIGHT NOW (the latest logged prediction, its expiry,
+# whether it is stale). This reports the TRACK RECORD, and needs no current
+# prediction at all — the cost sweep is anchored to the model's trained-in
+# accuracy, not to whatever it happened to say most recently.
+
+DAILY_HORIZON_KEY = "daily"
+
+# Reliability gate used by both trainers (ml_prediction: mean_acc >= 0.52).
+# A horizon below it whose costs also fail is hopeless; above it, the model has
+# a real edge that costs are eating — a materially different diagnosis.
+MIN_USEFUL_ACCURACY = 0.52
+
+# A calibration verdict needs enough rows in BOTH the high and low buckets;
+# below this the comparison is noise and is reported as unknown rather than
+# guessed at.
+MIN_N_PER_CONFIDENCE_BUCKET = 10
+
+
+def _calibration_verdict(metrics: Dict[str, Any]) -> str:
+    """
+    Does HIGH confidence actually land more often than LOW for this horizon?
+
+    This is the column that decides whether the confidence badge is safe to size
+    on at all — the app's confidence tiers are distance from the neutral band, a
+    spread measure, not a probability of being right.
+    """
+    by_conf = (metrics.get("calibration") or {}).get("by_confidence") or {}
+    high, low = by_conf.get("high") or {}, by_conf.get("low") or {}
+    n_high, n_low = high.get("n") or 0, low.get("n") or 0
+    acc_high, acc_low = high.get("realized_accuracy"), low.get("realized_accuracy")
+
+    if n_high < MIN_N_PER_CONFIDENCE_BUCKET or n_low < MIN_N_PER_CONFIDENCE_BUCKET:
+        return f"unknown ({min(n_high, n_low)})"
+    if acc_high is None or acc_low is None:
+        return "unknown (—)"
+    return "yes" if acc_high > acc_low else "no"
+
+
+def _horizon_sigma_from_metadata(meta: Dict[str, Any]) -> Optional[float]:
+    """
+    Recover the volatility anchor the shares cost model was built on, so the
+    options model prices the same move rather than re-deriving one from price
+    data (which this module is not allowed to fetch).
+
+        avg_move_pct = horizon_sigma * 100 * 0.8   =>   sigma = avg / 80
+    """
+    trade = meta.get("tradeability") or {}
+    avg_move_pct = trade.get("avg_move_pct")
+    if not avg_move_pct or float(avg_move_pct) <= 0:
+        return None
+    return float(avg_move_pct) / 100.0 / 0.8
+
+
+def _stage_verdict(row: Dict[str, Any]) -> str:
+    """
+    Explicit rule chain, evaluated in order — never a score. Returns the sentinel
+    "candidate" for rows that survive every gate; those get ranked by net edge
+    afterwards, which cannot be decided per-row.
+    """
+    from config.settings import (
+        RETRAIN_ACCURACY_DROP_THRESHOLD,
+        RETRAIN_MIN_RESOLVED_FOR_DROP_CHECK,
+    )
+
+    trained = row.get("trained_accuracy")
+    live = row.get("live_accuracy")
+    net = row.get("net_edge_pct")
+    n = row.get("n_resolved") or 0
+
+    if trained is None:
+        return "Not trained"
+    if n < RETRAIN_MIN_RESOLVED_FOR_DROP_CHECK:
+        return "Insufficient data"
+    if net is not None and net <= 0:
+        # The distinction that matters most for an options trader: a real edge
+        # that costs eat is a different problem from no edge at all, and has a
+        # different fix (buy more time, or trade the underlying).
+        return "Do not trade" if trained <= MIN_USEFUL_ACCURACY else "Uneconomic"
+    if live is not None and (trained - live) >= RETRAIN_ACCURACY_DROP_THRESHOLD:
+        return "Degraded, retrain"
+    return "candidate"
+
+
+def compare_horizons(
+    ticker: str,
+    *,
+    ladder_quotes: Optional[Dict[Any, Dict[str, Any]]] = None,
+    underlying_price: Optional[float] = None,
+    include_daily: bool = True,
+) -> Dict[str, Any]:
+    """
+    Score every horizon against every other, one row each.
+
+    Parameters
+    ----------
+    ladder_quotes : optional expiry-ladder quotes from
+        `data.options_data.get_expiry_ladder_quotes(...)["quotes"]`. Supplied ->
+        each horizon gets an options cost verdict and the `grid` is populated.
+        Omitted -> `net_edge_pct` falls back to the stored shares verdict and
+        `grid` is empty, with `cost_model` saying which was used.
+    underlying_price : required alongside `ladder_quotes` for elasticity.
+
+    Returns
+    -------
+    {
+      "ticker": str,
+      "rows": [{horizon, trained_accuracy, accuracy_std, live_accuracy,
+                n_resolved, best_dte, net_edge_pct, dominant_cost, cost_model,
+                calibrated, verdict, expiry_date}],
+      "grid": {horizon: {dte: net_edge_pct | None}},
+      "ladder": [dte, ...],
+      "warnings": [str],
+    }
+
+    Never raises — a horizon that cannot be read becomes a row with a
+    "Not trained" verdict and a warning.
+    """
+    ticker = ticker.upper().strip()
+    rows: List[Dict[str, Any]] = []
+    grid: Dict[str, Dict[Any, Optional[float]]] = {}
+    warnings: List[str] = []
+
+    from analysis.intraday_prediction import INTERVAL_SPECS, load_metadata, model_exists
+
+    def _blank(label: str) -> Dict[str, Any]:
+        return {
+            "horizon": label, "trained_accuracy": None, "accuracy_std": None,
+            "live_accuracy": None, "n_resolved": 0, "best_dte": None,
+            "net_edge_pct": None, "dominant_cost": None, "cost_model": None,
+            "calibrated": "unknown (0)", "verdict": "Not trained",
+            "expiry_date": None, "horizon_minutes": None,
+        }
+
+    for interval in INTERVAL_SPECS:
+        try:
+            if not model_exists(ticker, interval):
+                rows.append(_blank(interval))
+                continue
+            meta = load_metadata(ticker, interval)
+            metrics = compute_intraday_prediction_metrics(ticker, interval)
+            stored = meta.get("tradeability") or {}
+            row = {
+                "horizon": interval,
+                "trained_accuracy": meta.get("directional_accuracy"),
+                "accuracy_std": meta.get("accuracy_std"),
+                "live_accuracy": metrics.get("win_rate"),
+                "n_resolved": metrics.get("n_resolved", 0),
+                "horizon_minutes": meta.get("horizon_minutes"),
+                "net_edge_pct": stored.get("net_edge_pct"),
+                "dominant_cost": None,
+                "cost_model": "shares" if stored else None,
+                "best_dte": None,
+                "expiry_date": None,
+                "calibrated": _calibration_verdict(metrics),
+            }
+            _apply_options_sweep(
+                row, meta=meta, ladder_quotes=ladder_quotes,
+                underlying_price=underlying_price, grid=grid,
+            )
+            rows.append(row)
+        except Exception as exc:
+            logger.warning("compare_horizons: %s %s failed: %s", ticker, interval, exc)
+            rows.append(_blank(interval))
+            warnings.append(f"{interval}: could not read ({exc}).")
+
+    if include_daily:
+        try:
+            from analysis.ml_prediction import _load_model_metadata, _rf_path, _xgb_path
+
+            if not (_xgb_path(ticker).exists() and _rf_path(ticker).exists()):
+                rows.append(_blank(DAILY_HORIZON_KEY))
+            else:
+                meta = _load_model_metadata(ticker)
+                metrics = compute_daily_prediction_metrics(ticker)
+                horizon_days = meta.get("horizon_days") or 5
+                row = {
+                    "horizon": DAILY_HORIZON_KEY,
+                    "trained_accuracy": meta.get("directional_accuracy"),
+                    "accuracy_std": meta.get("accuracy_std"),
+                    "live_accuracy": metrics.get("win_rate"),
+                    "n_resolved": metrics.get("n_resolved", 0),
+                    # 1440 min/day: the daily model's horizon in the same units
+                    # the options theta model consumes.
+                    "horizon_minutes": float(horizon_days) * 1440,
+                    # The daily trainer persists no tradeability record, so there
+                    # is no shares fallback to inherit -- only a live sweep can
+                    # price it. None here means "unknown", never "zero".
+                    "net_edge_pct": None,
+                    "dominant_cost": None,
+                    "cost_model": None,
+                    "best_dte": None,
+                    "expiry_date": None,
+                    "calibrated": _calibration_verdict(metrics),
+                }
+                _apply_options_sweep(
+                    row,
+                    meta={
+                        **meta,
+                        "tradeability": {
+                            # Daily sigma scaled to the horizon by sqrt(t); the
+                            # neutral threshold is the model's own per-bar band.
+                            "avg_move_pct": (
+                                float(meta["neutral_threshold"]) * 100 * 0.8
+                                * (float(horizon_days) ** 0.5)
+                                if meta.get("neutral_threshold") else None
+                            ),
+                        },
+                    },
+                    ladder_quotes=ladder_quotes,
+                    underlying_price=underlying_price,
+                    grid=grid,
+                )
+                rows.append(row)
+        except Exception as exc:
+            logger.warning("compare_horizons: %s daily failed: %s", ticker, exc)
+            rows.append(_blank(DAILY_HORIZON_KEY))
+            warnings.append(f"daily: could not read ({exc}).")
+
+    # Stage every verdict, then rank the survivors — Primary/Secondary is a
+    # relative call that cannot be made one row at a time.
+    for row in rows:
+        row["verdict"] = _stage_verdict(row)
+
+    candidates = [r for r in rows if r["verdict"] == "candidate"]
+    intraday_candidates = [r for r in candidates if r["horizon"] != DAILY_HORIZON_KEY]
+    intraday_candidates.sort(
+        key=lambda r: (r["net_edge_pct"] is None, -(r["net_edge_pct"] or 0.0))
+    )
+    for i, row in enumerate(intraday_candidates):
+        row["verdict"] = "Primary" if i == 0 else "Secondary"
+    for row in candidates:
+        if row["horizon"] == DAILY_HORIZON_KEY:
+            # A multi-day model is context for an intraday session, not a
+            # competitor to it — ranking them against each other would invite
+            # comparing a 5-day call to a 75-minute one.
+            row["verdict"] = "Swing context"
+
+    if ladder_quotes is None:
+        warnings.append(
+            "No options quotes supplied — net edge falls back to the shares model "
+            "(2 bps round trip), which ignores delta leverage and theta entirely."
+        )
+    thin = [r["horizon"] for r in rows if r["verdict"] == "Insufficient data"]
+    if thin:
+        warnings.append(f"Too few resolved predictions to judge: {', '.join(thin)}.")
+
+    return {
+        "ticker": ticker,
+        "rows": rows,
+        "grid": grid,
+        "ladder": sorted(ladder_quotes) if ladder_quotes else [],
+        "warnings": warnings,
+    }
+
+
+def _apply_options_sweep(
+    row: Dict[str, Any],
+    *,
+    meta: Dict[str, Any],
+    ladder_quotes: Optional[Dict[Any, Dict[str, Any]]],
+    underlying_price: Optional[float],
+    grid: Dict[str, Dict[Any, Optional[float]]],
+) -> None:
+    """
+    Overwrite `row`'s cost fields with an options verdict and fill this horizon's
+    row of `grid`. No-op when quotes, price, accuracy, or the volatility anchor
+    are missing — the shares fallback already in `row` then stands, labelled.
+    """
+    if not ladder_quotes or not underlying_price:
+        return
+    accuracy = meta.get("directional_accuracy")
+    horizon_minutes = row.get("horizon_minutes")
+    sigma = _horizon_sigma_from_metadata(meta)
+    if accuracy is None or not horizon_minutes or sigma is None:
+        return
+
+    from analysis.options_pricing import sweep_expiries
+
+    sweep = sweep_expiries(
+        float(accuracy), sigma,
+        underlying_price=float(underlying_price),
+        horizon_minutes=float(horizon_minutes),
+        quotes=ladder_quotes,
+    )
+    grid[row["horizon"]] = {
+        dte: v.get("net_edge_pct") for dte, v in sweep["by_dte"].items()
+    }
+    best = sweep.get("best") or {}
+    if best:
+        row.update({
+            "net_edge_pct": best.get("net_edge_pct"),
+            "dominant_cost": best.get("dominant_cost"),
+            "cost_model": "options",
+            "best_dte": sweep.get("best_dte"),
+            "expiry_date": best.get("expiry_date"),
+        })

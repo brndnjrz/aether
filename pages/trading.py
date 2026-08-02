@@ -557,6 +557,18 @@ def _render_daytrading():
         ec3.metric("Stop", f"${sug_stop:.2f}", f"-{stop_pct:.1f}%" if direction_label == "LONG" else f"+{stop_pct:.1f}%", delta_color="inverse")
         ec4.metric("Target", f"${sug_target:.2f}", f"{rr:.1f}:1 R:R")
         st.caption(f"Stop = 1.5× ATR (${atr:.2f}) from entry. Target = {target_source}. Position sizing not included — use the Quick Risk Calculator below.{flag_note}")
+        if has_intraday:
+            # The ATR here is the DAILY ATR, so this is a swing-scale stop. On a
+            # 5m/15m read it will almost never be touched inside the window the
+            # signals actually describe, which makes the R:R above optimistic.
+            # The horizon-scaled version lives on the intraday prediction, where
+            # a horizon exists to scale to. See Roadmap Item 2B.
+            st.caption(
+                f"Note: that stop is **{1.5 * atr / current_price * 100:.1f}%** away and is "
+                f"derived from the *daily* ATR — a swing-scale stop, not a {interval} one. "
+                "For a stop scaled to a specific intraday horizon, see Predictions → "
+                "Intraday → Exit plan."
+            )
 
     if analyze:
         log_key = (ticker, interval, direction_label, sug_entry, sug_stop, sug_target)
@@ -1057,18 +1069,22 @@ def _render_prediction_card(result: dict):
         gauge={
             "axis": {
                 "range": [35, 65],
-                "tickvals": [35, 40, 47, 50, 53, 60, 65],
-                "ticktext": ["35%", "40%", "47%", "50%", "53%", "60%", "65%"],
+                "tickvals": [35, 40, 45, 50, 55, 60, 65],
+                "ticktext": ["35%", "40%", "45%", "50%", "55%", "60%", "65%"],
                 "tickfont": {"size": 11, "color": "#aaa"},
             },
             "bar": {"color": cfg["gauge_color"], "thickness": 0.25},
             "bgcolor": "rgba(0,0,0,0)",
             "borderwidth": 0,
+            # Shaded bands must match predict()'s actual dead-band of
+            # [0.45, 0.55] (ml_prediction.py). They previously showed 47-53,
+            # so a 46% reading rendered inside a red "bearish" band while the
+            # model itself was calling it NEUTRAL.
             "steps": [
                 {"range": [35, 40], "color": "rgba(239,83,80,0.35)"},
-                {"range": [40, 47], "color": "rgba(239,83,80,0.15)"},
-                {"range": [47, 53], "color": "rgba(158,158,158,0.15)"},
-                {"range": [53, 60], "color": "rgba(38,166,154,0.15)"},
+                {"range": [40, 45], "color": "rgba(239,83,80,0.15)"},
+                {"range": [45, 55], "color": "rgba(158,158,158,0.15)"},
+                {"range": [55, 60], "color": "rgba(38,166,154,0.15)"},
                 {"range": [60, 65], "color": "rgba(38,166,154,0.35)"},
             ],
             "threshold": {"line": {"color": "#ffffff", "width": 3}, "thickness": 0.75, "value": gauge_pct},
@@ -1085,7 +1101,7 @@ def _render_prediction_card(result: dict):
 
     with col_gauge:
         st.plotly_chart(fig_gauge, use_container_width=True)
-        st.caption("Neutral zone: 47–53% — no directional call issued. Display range capped at 35–65% to prevent false precision.")
+        st.caption("Neutral zone: 45–55% — no directional call issued. Shown on a 35–65% axis so the display never implies more precision than the model supports.")
 
     with col_stats:
         st.markdown("#### Signal Details")
@@ -1537,8 +1553,10 @@ def _render_predictions_disclaimer():
         modest edge (typically 52–58% accuracy).
         It cannot predict news events, earnings surprises, or macro regime changes.
         Past walk-forward accuracy is <b>not</b> a guarantee of future performance.
-        Probability values are capped at 35–65% — any raw model output beyond these bounds
-        is clipped to prevent conveying false precision.<br><br>
+        The probability gauge is drawn on a 35–65% axis so the display never implies
+        more precision than the model supports — the underlying probability itself is
+        not clipped, and a reading outside that range is what the HIGH confidence
+        tier is defined by.<br><br>
         <b>This output is for research purposes only.</b>
         Position sizing decisions should use the Risk page — not this signal alone.
         </div>
@@ -1771,6 +1789,8 @@ def _render_intraday_predictions():
             f"Signal from the {result['bar_timestamp']} bar at "
             f"{result['price_at_prediction']:.2f} · neutral band ±{result['threshold_pct']:.3f}%"
         )
+
+        _render_intraday_exit_plan(result, interval)
         log_activity("intraday_prediction_generated", ticker, result)
 
     st.markdown("---")
@@ -1811,18 +1831,315 @@ def _render_intraday_predictions():
         st.dataframe(display, hide_index=True, width="stretch")
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# ── Horizon Cockpit (Roadmap Item 1) ─────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+
+_DIRECTION_ICONS = {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪"}
+
+
+@st.cache_data(ttl=600)
+def _load_ladder_quotes(ticker: str):
+    """
+    Expiry-ladder ATM quotes for the options cost model.
+
+    TTL matches OPTIONS_CACHE_TTL (600s) and `get_expiry_ladder_quotes` fetches
+    one chain per distinct expiry — four rungs is four fetches that then serve
+    every horizon, so this must be called once per render, never once per row.
+    """
+    from data.options_data import get_expiry_ladder_quotes
+
+    return get_expiry_ladder_quotes(ticker)
+
+
+def _render_horizon_cockpit():
+    """
+    Every horizon's current read in one table: direction, live accuracy, when the
+    signal expires, and whether it can pay for itself.
+
+    Read-only. `build_consensus()` never predicts or writes — see its module
+    docstring on why auto-generating predictions would corrupt the live win rate
+    that Model Lab and the retrain triggers depend on. Refreshing is the explicit
+    button below.
+    """
+    from analysis.interval_consensus import build_consensus
+
+    ticker = (st.session_state.get("predictions_ticker") or "SPY").upper().strip()
+
+    st.markdown("#### Horizon Cockpit")
+    st.caption(
+        f"Every model's current read on **{ticker}**, side by side — reads saved "
+        "predictions only, and never generates one on its own. Change the ticker in "
+        "either mode below and this follows."
+    )
+
+    ctl1, ctl2 = st.columns([2, 1])
+    with ctl1:
+        price_with_options = st.checkbox(
+            "Price with live options quotes",
+            value=st.session_state.get("cockpit_use_options", False),
+            key="cockpit_use_options",
+            help=(
+                "Off: costs come from the stored shares model (2 bps round trip), which "
+                "ignores delta leverage and has no theta term — wrong for contracts. "
+                "On: fetches an ATM expiry ladder and prices each horizon as an actual "
+                "option, sweeping 0/2/7/30 DTE. Costs four chain fetches, cached 10 min."
+            ),
+        )
+    with ctl2:
+        refresh = st.button(
+            "Refresh all horizons", key="cockpit_refresh", width="stretch",
+            help=(
+                "Regenerates the intraday prediction for every interval and logs each "
+                "one. Deliberately manual: an automatic refresh would append to the "
+                "prediction log on every page view and distort the live win rate."
+            ),
+        )
+
+    if refresh:
+        logger.info(f"[trading] cockpit 'Refresh all horizons' pressed for {ticker}")
+        from analysis.intraday_prediction import INTERVAL_SPECS, predict_intraday
+
+        progress = st.progress(0.0)
+        for i, iv in enumerate(INTERVAL_SPECS):
+            with st.spinner(f"Predicting {iv} direction for {ticker}…"):
+                result = predict_intraday(ticker, iv)
+            if result.get("error"):
+                st.caption(f"{iv}: {result['error']}")
+            else:
+                log_activity("intraday_prediction_generated", ticker, result)
+            progress.progress((i + 1) / len(INTERVAL_SPECS))
+        progress.empty()
+
+    ladder_quotes = None
+    underlying_price = None
+    if price_with_options:
+        with st.spinner("Fetching ATM expiry ladder…"):
+            ladder = _load_ladder_quotes(ticker)
+        if ladder.get("error"):
+            st.warning(f"Options quotes unavailable ({ladder['error']}) — falling back to the shares cost model.")
+        else:
+            ladder_quotes = ladder.get("quotes") or None
+            underlying_price = ladder.get("underlying_price")
+            if ladder_quotes:
+                rungs = ", ".join(
+                    f"{q['requested_dte']:g}d→{q['expiry_date']}" for q in ladder_quotes.values()
+                )
+                sources = {q["quote_source"] for q in ladder_quotes.values()}
+                st.caption(
+                    f"Ladder: {rungs}. Quote source: {', '.join(sorted(sources))}."
+                    + ("  Model prices used where the book was empty." if "model_price" in sources else "")
+                )
+            for skip in ladder.get("skipped", []):
+                st.caption(f"Skipped {skip['requested_dte']:g}d rung — {skip['reason']}")
+
+    consensus = build_consensus(
+        ticker, ladder_quotes=ladder_quotes, underlying_price=underlying_price,
+    )
+
+    from analysis.horizon_clock import describe_remaining
+
+    rows = []
+    for h in consensus["horizons"]:
+        if not h["has_model"]:
+            rows.append({
+                "Horizon": h["horizon"], "Signal": "— not trained", "Prob": "—",
+                "Conf": "—", "Live acc (n)": "—", "Expires": "—",
+                "Net edge": "—", "Cost": "—", "Age": "—",
+            })
+            continue
+        if not h["has_prediction"]:
+            rows.append({
+                "Horizon": h["horizon"], "Signal": "— no prediction", "Prob": "—",
+                "Conf": "—",
+                "Live acc (n)": _acc_with_n(h), "Expires": "—",
+                "Net edge": "—", "Cost": "—", "Age": "—",
+            })
+            continue
+
+        direction = (h["direction"] or "neutral").lower()
+        icon = _DIRECTION_ICONS.get(direction, "⚪")
+        signal = f"{icon} {direction.upper()}"
+        if h["is_expired"]:
+            signal = f"⌛ {direction.upper()} (expired)"
+        elif h["crosses_session_close"]:
+            signal = f"{icon} {direction.upper()} (never graded)"
+
+        if h["crosses_session_close"]:
+            expires = "past the close"
+        elif h["expires_at_str"]:
+            expires = f"{h['expires_at_str'].split(' ', 1)[1] if h['horizon'] != 'daily' else h['expires_at_str']}"
+        else:
+            expires = "—"
+
+        net = h["net_edge_pct"]
+        rows.append({
+            "Horizon": h["horizon"],
+            "Signal": signal,
+            "Prob": f"{h['probability'] * 100:.0f}%" if h["probability"] is not None else "—",
+            "Conf": (h["confidence"] or "—").title(),
+            "Live acc (n)": _acc_with_n(h),
+            "Expires": expires,
+            "Net edge": f"{net:+.3f}%" if net is not None else "—",
+            "Cost": (
+                ("options" if h["cost_model"] == "options" else "shares")
+                + (f" · {h['dominant_cost']}" if h["dominant_cost"] else "")
+                + (f" · best {h['best_dte']:g}d" if h["best_dte"] is not None else "")
+                if h["cost_model"] else "—"
+            ),
+            "Age": describe_remaining(-(h["prediction_age_minutes"] or 0)).replace("expired ", "").replace(" ago", "")
+                   if h["prediction_age_minutes"] is not None else "—",
+        })
+
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+    a = consensus["alignment"]
+    live_total = a["n_bullish"] + a["n_bearish"] + a["n_neutral"]
+    if live_total == 0:
+        st.info("No live predictions across any horizon — press **Refresh all horizons** to generate them.")
+    else:
+        verdict = {
+            "bullish": "All live horizons point bullish",
+            "bearish": "All live horizons point bearish",
+            "mixed": "Horizons disagree",
+            "none": "No directional call on any live horizon",
+        }[a["net_direction"]]
+        st.markdown(
+            f"**{verdict}** — {a['n_bullish']} bullish / {a['n_bearish']} bearish / "
+            f"{a['n_neutral']} neutral across {live_total} live horizon(s)."
+        )
+        if a["tightest_tradeable"]:
+            tight = next(h for h in consensus["horizons"] if h["horizon"] == a["tightest_tradeable"])
+            st.success(
+                f"Tightest tradeable horizon: **{a['tightest_tradeable']}** — expires "
+                f"{tight['expires_at_str']} ({describe_remaining(tight['minutes_remaining'])})."
+            )
+        elif a["net_direction"] in ("bullish", "bearish"):
+            st.warning(
+                "No horizon both agrees with the net direction and clears its costs.",
+                icon="⚠️",
+            )
+        if a["agree_but_uneconomic"]:
+            # The point of the whole panel: the horizon you are most likely to
+            # act on is often the one least able to pay for itself.
+            st.error(
+                f"Agree directionally but do **not** clear costs: "
+                f"**{', '.join(a['agree_but_uneconomic'])}**. Treat these as information, "
+                f"not trades — a statistically real edge can still lose money.",
+                icon="💸",
+            )
+
+    if consensus["warnings"]:
+        with st.expander(f"{len(consensus['warnings'])} note(s)", expanded=False):
+            for w in consensus["warnings"]:
+                st.caption(f"— {w}")
+
+
+def _acc_with_n(h: dict) -> str:
+    """Live accuracy is meaningless without its sample size, so they render together."""
+    acc, n = h["live_accuracy"], h["n_resolved"] or 0
+    if acc is None:
+        return f"— ({n})"
+    return f"{acc * 100:.1f}% ({n})"
+
+
+def _render_intraday_exit_plan(result: dict, interval: str):
+    """
+    The exit half of an intraday signal (Roadmap Items 2A + 2B).
+
+    Two things the app used to leave implicit:
+
+    1. **When the signal expires.** resolve_intraday_predictions() grades this
+       call against the close exactly `horizon_bars` bars later. The model has
+       validated evidence about that window and none about the bar after it, so
+       the horizon is not a suggestion — it is the edge of the evidence.
+    2. **A stop scaled to that window.** The Day Trading card's 1.5 x daily ATR
+       stop is a swing-scale stop; against a 75-minute horizon it would never be
+       touched, making any R:R computed from it meaningless.
+    """
+    from analysis.horizon_clock import describe_remaining, intraday_expiry
+    from analysis.intraday_prediction import INTERVAL_SPECS
+    from analysis.risk import horizon_stop
+
+    st.markdown("##### Exit plan")
+
+    interval_minutes = INTERVAL_SPECS[interval]["minutes"]
+    clock = intraday_expiry(
+        result.get("bar_timestamp"), result.get("horizon_minutes") or 0, interval_minutes,
+    )
+
+    price = result.get("price_at_prediction")
+    direction = result.get("direction", "neutral")
+    avg_move_pct = (result.get("tradeability") or {}).get("avg_move_pct")
+    stop = horizon_stop(price, avg_move_pct, direction=direction) if price and avg_move_pct else {}
+
+    e1, e2, e3 = st.columns(3)
+    if clock["expires_at_str"]:
+        e1.metric(
+            "Signal expires", clock["expires_at_str"].split(" ", 1)[1],
+            describe_remaining(clock["minutes_remaining"]),
+            delta_color="off",
+        )
+    else:
+        e1.metric("Signal expires", "—", "no bar timestamp")
+
+    if stop:
+        e2.metric(
+            "Horizon stop", f"${stop['stop_price']:.2f}",
+            f"{stop['stop_pct']:.2f}% away", delta_color="off",
+        )
+        # Target at 1R against the horizon stop. Deliberately not a bigger
+        # multiple: the model predicts direction over a fixed window, so there is
+        # no evidence supporting a target the horizon cannot reach.
+        target = (
+            price + stop["distance"] if direction in ("bullish",) else price - stop["distance"]
+        )
+        e3.metric("1R target", f"${target:.2f}", "1:1 within the horizon", delta_color="off")
+    else:
+        e2.metric("Horizon stop", "—", "no volatility anchor")
+
+    if clock["crosses_session_close"]:
+        st.error(
+            "This signal's horizon runs past the 4:00 PM close. It will never be graded — "
+            "forward returns that span the overnight gap were excluded from training, so "
+            "resolve_intraday_predictions() skips it permanently. Not a tradeable signal.",
+            icon="🚫",
+        )
+    elif clock["is_expired"]:
+        st.warning(
+            f"Already past its horizon ({describe_remaining(clock['minutes_remaining'])}). "
+            "Generate a fresh prediction rather than acting on this one.",
+            icon="⌛",
+        )
+
+    if stop:
+        st.caption(
+            f"Stop basis: {stop['basis']} — not the daily ATR, which is a swing-scale "
+            f"stop and would sit far outside a {result.get('horizon_minutes')}-minute window. "
+            f"Flat by {clock['expires_at_str'] or 'the horizon'} either way: past that point "
+            "the model has no validated edge."
+        )
+
+
 def _render_predictions():
     """
     Dispatcher for the Predictions tab. Defaults to Daily, which renders the
     original code path unchanged — the intraday model lives in its own module
     (analysis/intraday_prediction.py) and its own storage files, so selecting it
     cannot affect daily models or the Research page.
+
+    The Horizon Cockpit sits above the mode toggle because it spans both: it is
+    the one view that answers "which horizon should I be trading right now."
     """
     st.subheader("AI Price Predictions")
 
     if not _ML_AVAILABLE:
         st.info("ML predictions require the `scikit-learn`, `xgboost`, and `narwhals` packages. Run `pip install -r requirements.txt`.")
         return
+
+    _render_horizon_cockpit()
+
+    st.markdown("---")
 
     horizon_mode = st.radio(
         "Prediction horizon",
@@ -2021,7 +2338,7 @@ def _render_daily_predictions():
     if cached_result and not cached_result.get("error"):
         with st.expander("How to read this", expanded=False):
             st.markdown(
-                "- **Gauge** — bull probability, deliberately capped at 35–65% so it never "
+                "- **Gauge** — bull probability, drawn on a 35–65% axis so it never "
                 "implies more confidence than the walk-forward accuracy supports. 45–55% is the "
                 "neutral dead-band — no directional call there.\n"
                 "- **Confidence badge** — HIGH/MODERATE/LOW reflects how far the probability sits "
@@ -2085,7 +2402,9 @@ def _render_daily_predictions():
                   into training features
                 - Reliability threshold: mean accuracy ≥ 52% AND std ≤ 8% across folds
                 - Neutral dead-band: bull probability in [0.45, 0.55] → signal = NEUTRAL
-                - Probability display range: capped to [35%, 65%]
+                - Probability display axis: [35%, 65%] — the gauge's axis only; the
+                  probability itself is never clipped (HIGH confidence is *defined* as
+                  falling outside that range)
 
                 **Feature engineering:**
                 - 18 features derived from `calculate_indicators()` output (no external data sources)

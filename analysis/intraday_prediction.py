@@ -1078,7 +1078,18 @@ def compare_intraday_models(
 
 _HISTORY_COLS = ["date", "direction", "probability", "confidence",
                  "horizon_minutes", "actual_outcome", "correct", "price_at_prediction",
-                 "indicator_snapshot"]
+                 "indicator_snapshot",
+                 # bar_timestamp and horizon_bars are written by every
+                 # save_intraday_prediction() call but were absent from this list,
+                 # so the final df[_HISTORY_COLS] slice silently dropped them —
+                 # the same failure mode documented in
+                 # ml_prediction.get_prediction_history(). analysis/horizon_clock.py
+                 # needs bar_timestamp to compute when a signal expires, and
+                 # resolve_intraday_predictions() already keys off it.
+                 "bar_timestamp", "horizon_bars",
+                 # Stored shares-model cost verdict. Kept so the consensus view can
+                 # fall back to it when no live options chain is available.
+                 "tradeability"]
 
 
 def save_intraday_prediction(ticker: str, interval: str, prediction: Dict[str, Any]) -> None:

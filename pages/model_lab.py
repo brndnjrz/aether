@@ -1,11 +1,24 @@
 """
 Model Lab — read-only prediction performance dashboard across the daily and
 intraday models. Reads what Trading Desk has already logged and graded
-(via analysis.prediction_performance); never persists a new or changed model,
-with two deliberate exceptions — Model Comparison, which fits four models
-in-memory purely to score them (nothing is saved to storage/), and Version
-History's rollback button, which copies previously-archived model files back
-into place (a file copy, never a retrain).
+(via analysis.prediction_performance); never persists a new or changed model.
+
+Deliberate exceptions to "read-only", kept named here so the claim cannot go
+stale as panels are added:
+
+1. **Model Comparison** fits four models in-memory purely to score them —
+   nothing is written to storage/.
+2. **Version History's rollback** copies previously-archived model files back
+   into place (a file copy, never a retrain).
+3. **Failure Analysis's "recompute legacy" checkbox** re-fetches price history
+   for rows logged before indicator snapshots existed. Opt-in, network.
+4. **Horizon Scoreboard's "price with live options quotes" checkbox** fetches an
+   ATM expiry ladder so costs can be priced as options rather than shares.
+   Opt-in, network, cached — reads only, writes nothing.
+
+Nothing here trains, predicts, or appends to a prediction log. That matters
+beyond tidiness: predict()/predict_intraday() persist unconditionally, so a page
+that generated predictions would inflate the very win rate this page reports.
 """
 import logging
 import os
@@ -28,9 +41,19 @@ from analysis.intraday_prediction import (
     get_version_history as get_intraday_version_history,
     rollback_to_version as rollback_intraday_version,
 )
-from analysis.prediction_performance import compute_daily_prediction_metrics, compute_intraday_prediction_metrics
+from analysis.prediction_performance import (
+    MIN_N_PER_CONFIDENCE_BUCKET,
+    MIN_USEFUL_ACCURACY,
+    compare_horizons,
+    compute_daily_prediction_metrics,
+    compute_intraday_prediction_metrics,
+)
 from analysis.prediction_errors import categorize_incorrect_predictions, aggregate_failure_categories
 from analysis.retrain_triggers import check_all_retrain_triggers
+from config.settings import (
+    RETRAIN_ACCURACY_DROP_THRESHOLD,
+    RETRAIN_MIN_RESOLVED_FOR_DROP_CHECK,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -336,6 +359,126 @@ def _render_intraday_performance_dashboard(ticker: str, interval: str):
     _render_retrain_triggers(ticker, interval=interval)
 
 
+def _render_horizon_scoreboard(ticker: str):
+    """
+    Which horizon should I trade, and which expiry should I buy to trade it?
+
+    Every column here already existed somewhere in the app — the walk-forward
+    numbers in each model's accuracy file, live accuracy in the per-interval
+    dashboards, costs in the tradeability record. What was missing was seeing
+    them in one place, because "how is the 15m model doing" is a different
+    question from "is 15m the horizon I should be using at all."
+    """
+    st.markdown("### Horizon Scoreboard")
+    st.caption(
+        "All five models ranked against each other. Walk-forward is what the model "
+        "trained with; Live is what it has actually done since. Verdicts follow a "
+        "fixed rule chain, not a score — see the expander below."
+    )
+
+    use_options = st.checkbox(
+        "Price with live options quotes",
+        value=False,
+        key="scoreboard_use_options",
+        help=(
+            "Off: net edge comes from the stored shares model (2 bps round trip), "
+            "which ignores delta leverage and has no theta term — wrong for "
+            "contracts. On: fetches an ATM expiry ladder and prices every horizon "
+            "as an option across 0/2/7/30 DTE, filling the grid below. Network, "
+            "cached 10 minutes."
+        ),
+    )
+
+    ladder_quotes = None
+    underlying_price = None
+    if use_options:
+        from data.options_data import get_expiry_ladder_quotes
+
+        with st.spinner("Fetching ATM expiry ladder…"):
+            ladder = get_expiry_ladder_quotes(ticker)
+        if ladder.get("error"):
+            st.warning(f"Options quotes unavailable ({ladder['error']}) — showing the shares cost model.")
+        else:
+            ladder_quotes = ladder.get("quotes") or None
+            underlying_price = ladder.get("underlying_price")
+
+    result = compare_horizons(
+        ticker, ladder_quotes=ladder_quotes, underlying_price=underlying_price,
+    )
+
+    rows = []
+    for r in result["rows"]:
+        net = r["net_edge_pct"]
+        rows.append({
+            "Horizon": r["horizon"],
+            "Walk-fwd": _pct(r["trained_accuracy"]),
+            "Std": _pct(r["accuracy_std"]),
+            "Live acc": _pct(r["live_accuracy"]),
+            "N": r["n_resolved"] or 0,
+            "Best expiry": (
+                f"{r['best_dte']:g} DTE" if r["best_dte"] is not None else "—"
+            ),
+            "Net edge": f"{net:+.3f}%" if net is not None else "—",
+            "Dominant cost": r["dominant_cost"] or "—",
+            "Calibrated": r["calibrated"],
+            "Verdict": r["verdict"],
+        })
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+    if result["grid"]:
+        with st.expander("Net edge % — every horizon x expiry combination", expanded=True):
+            ladder = result["ladder"]
+            grid_rows = []
+            for r in result["rows"]:
+                cells = result["grid"].get(r["horizon"])
+                if not cells:
+                    continue
+                row = {"Horizon": r["horizon"]}
+                for dte in ladder:
+                    v = cells.get(dte)
+                    row[f"{dte:g} DTE"] = f"{v:+.2f}%" if v is not None else "—"
+                grid_rows.append(row)
+            if grid_rows:
+                st.dataframe(pd.DataFrame(grid_rows), hide_index=True, width="stretch")
+                st.caption(
+                    "Leverage and theta both scale inversely with time to expiry, so "
+                    "they partly cancel — which is why the sign can flip across a row. "
+                    "Expect a diagonal: the shorter the signal horizon, the more time "
+                    "you have to buy to outrun decay."
+                )
+            else:
+                st.caption("No horizon had both a trained model and a volatility anchor to price against.")
+
+    with st.expander("How the verdict is decided", expanded=False):
+        st.markdown(
+            "Evaluated in order, first match wins:\n\n"
+            "1. **Not trained** — no model on disk.\n"
+            f"2. **Insufficient data** — fewer than {RETRAIN_MIN_RESOLVED_FOR_DROP_CHECK} "
+            "resolved predictions. Economics can't be judged on a handful.\n"
+            "3. **Do not trade** — negative net edge *and* walk-forward accuracy at or "
+            f"below {MIN_USEFUL_ACCURACY * 100:.0f}% (the reliability gate). No real edge, "
+            "and costs fail too.\n"
+            "4. **Uneconomic** — negative net edge but accuracy *above* the gate. The "
+            "model works; the instrument is wrong. Usually fixed by buying more time "
+            "(a longer expiry), not by retraining.\n"
+            f"5. **Degraded, retrain** — live accuracy has fallen "
+            f"{RETRAIN_ACCURACY_DROP_THRESHOLD * 100:.0f}+ points below trained-in.\n"
+            "6. **Primary / Secondary** — survivors, ranked by net edge.\n"
+            "7. **Swing context** — the daily model, never ranked against intraday "
+            "horizons; a 5-day call and a 75-minute call are not substitutes.\n\n"
+            "**Calibrated** asks whether HIGH confidence has actually landed more often "
+            "than LOW for that horizon. Confidence here is *distance from the neutral "
+            "band*, not a probability of being right — if this column says `no`, ignore "
+            f"the badge and use raw accuracy. `unknown (n)` means under "
+            f"{MIN_N_PER_CONFIDENCE_BUCKET} rows in one of the buckets."
+        )
+
+    if result["warnings"]:
+        with st.expander(f"{len(result['warnings'])} note(s)", expanded=False):
+            for w in result["warnings"]:
+                st.caption(f"— {w}")
+
+
 def render():
     st.markdown("# Model Lab")
     st.caption(
@@ -345,6 +488,10 @@ def render():
 
     with st.expander("How to read this page", expanded=False):
         st.markdown(
+            "- **Horizon Scoreboard** (top) — the panel that answers *which* horizon to "
+            "trade, rather than how one horizon is doing. Read the Verdict column first: "
+            "`Uneconomic` means the model works but the instrument/expiry is wrong, which "
+            "is a different fix from `Do not trade`.\n"
             "- **Accuracy / Win Rate** — % of graded predictions that were correct. Compare to "
             "the accuracy the model *trained with* (Trading Desk's Predictions tab) — if live "
             "is meaningfully lower, check Retrain Triggers below.\n"
@@ -372,6 +519,10 @@ def render():
     if not ticker:
         st.info("Enter a ticker to get started.")
         return
+
+    # Spans both models, so it sits above the tabs rather than inside either.
+    _render_horizon_scoreboard(ticker)
+    st.markdown("---")
 
     tab_daily, tab_intraday = st.tabs(["Daily Model", "Intraday Model"])
     with tab_daily:
