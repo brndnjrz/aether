@@ -25,6 +25,7 @@ import os
 import sys
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -54,6 +55,7 @@ from config.settings import (
     RETRAIN_ACCURACY_DROP_THRESHOLD,
     RETRAIN_MIN_RESOLVED_FOR_DROP_CHECK,
 )
+from config.tz import MARKET_TZ
 
 logger = logging.getLogger(__name__)
 
@@ -321,6 +323,10 @@ def _render_daily_performance_dashboard(ticker: str):
     _render_dashboard(metrics, ticker, "daily")
     if metrics["n_resolved"] > 0:
         st.markdown("---")
+        _render_accuracy_trend(
+            ticker, history, "daily", version_history=get_daily_version_history(ticker),
+        )
+        st.markdown("---")
         _render_failure_analysis(ticker, "daily", history)
     st.markdown("---")
     _render_model_comparison(ticker, "daily", compare_models, "model_lab_compare_daily")
@@ -342,6 +348,11 @@ def _render_intraday_performance_dashboard(ticker: str, interval: str):
     _render_dashboard(metrics, ticker, f"{interval} intraday")
     if metrics["n_resolved"] > 0:
         st.markdown("---")
+        _render_accuracy_trend(
+            ticker, history, f"{interval}_intraday",
+            version_history=get_intraday_version_history(ticker, interval),
+        )
+        st.markdown("---")
         _render_failure_analysis(ticker, f"{interval}_intraday", history, interval=interval)
     st.markdown("---")
     _render_model_comparison(
@@ -357,6 +368,162 @@ def _render_intraday_performance_dashboard(ticker: str, interval: str):
     )
     st.markdown("---")
     _render_retrain_triggers(ticker, interval=interval)
+
+
+def _render_accuracy_trend(ticker: str, history: pd.DataFrame, model_label: str,
+                           version_history: pd.DataFrame = None):
+    """
+    Rolling hit rate over time, with retrain dates marked (Roadmap Item 8).
+
+    A single accuracy number cannot tell "steady at 55%" from "was 62%, now 48%",
+    and those call for different actions. Marking retrains makes each one's effect
+    visible rather than inferred.
+    """
+    from analysis.prediction_performance import DEFAULT_ROLLING_WINDOW, rolling_accuracy
+
+    st.markdown("**Accuracy over time**")
+    trend = rolling_accuracy(history)
+    if trend.empty:
+        st.caption("No resolved predictions yet — nothing to trend.")
+        return
+    if len(trend) < 3:
+        st.caption(f"Only {len(trend)} resolved prediction(s) — not enough points to trend yet.")
+        return
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=trend["date"], y=(trend["accuracy"] * 100).round(1),
+        mode="lines+markers", name=f"Rolling {DEFAULT_ROLLING_WINDOW}-prediction accuracy",
+        line=dict(color="#42a5f5", width=2), marker=dict(size=5),
+        customdata=trend["n_window"],
+        hovertemplate="%{x|%Y-%m-%d %H:%M}<br>Accuracy: %{y:.1f}%<br>Window: %{customdata:.0f} preds<extra></extra>",
+    ))
+    fig.add_hline(
+        y=50, line_dash="dash", line_color="rgba(158,158,158,0.6)",
+        annotation_text="coin flip", annotation_position="right",
+    )
+
+    if version_history is not None and not version_history.empty:
+        for _, v in version_history.iterrows():
+            when = v.get("archived_at")
+            if not when:
+                continue
+            try:
+                ts = pd.Timestamp(when)
+            except (ValueError, TypeError):
+                continue
+            if ts.tz is None:
+                ts = ts.tz_localize(MARKET_TZ)
+            fig.add_vline(
+                x=ts.tz_convert("UTC"), line_dash="dot", line_width=1,
+                line_color="rgba(255,152,0,0.7)",
+            )
+
+    fig.update_layout(
+        template="plotly_dark" if st.context.theme.type == "dark" else "plotly_white",
+        height=280, margin=dict(l=0, r=0, t=10, b=0),
+        yaxis=dict(title="Hit rate %", range=[0, 100]),
+        xaxis=dict(title=""),
+        showlegend=False,
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        f"Rolling window of {DEFAULT_ROLLING_WINDOW} resolved predictions (fewer early on — "
+        "hover for the window size at each point). Orange dotted lines mark retrains, so a "
+        "retrain that made things worse is visible rather than inferred."
+    )
+
+
+def _render_agreement_backtest(ticker: str):
+    """
+    Does waiting for a second horizon to confirm actually improve the hit rate?
+    (Roadmap Item 7.)
+
+    Click-to-run: it reads two prediction logs and joins them, which is cheap, but
+    the result is only meaningful once both logs have accumulated, so there is no
+    point computing it on every page load.
+    """
+    from analysis.interval_consensus import backtest_agreement
+
+    st.markdown("**Does two-horizon confirmation help?**")
+    st.caption(
+        "Compares the base horizon's hit rate when a second horizon agreed against its "
+        "hit rate overall. If confirmation measurably helps, \"wait for a second "
+        "horizon\" becomes a measured rule rather than a hunch."
+    )
+
+    intervals = list(INTERVAL_SPECS)
+    c1, c2, c3 = st.columns([1, 1, 1])
+    base = c1.selectbox("Base horizon", intervals, index=intervals.index("15m"),
+                        key="agree_base")
+    confirm_options = [i for i in intervals if i != base]
+    confirm = c2.selectbox("Confirmed by", confirm_options,
+                           index=min(confirm_options.index("30m") if "30m" in confirm_options else 0,
+                                     len(confirm_options) - 1),
+                           key="agree_confirm")
+    tolerance = c3.number_input(
+        "Join tolerance (min)", min_value=1, max_value=240, value=30, step=5,
+        key="agree_tolerance",
+        help=(
+            "Two predictions count as concurrent within this many minutes. Predictions "
+            "are logged by hand, so they rarely line up exactly."
+        ),
+    )
+
+    if not st.button(f"Run agreement backtest for {ticker}", key="agree_run"):
+        return
+
+    result = backtest_agreement(
+        ticker, base_interval=base, confirm_interval=confirm,
+        tolerance_minutes=float(tolerance),
+    )
+
+    baseline = result["baseline_accuracy"]
+    if baseline is None:
+        st.info("Not enough resolved predictions on the base horizon yet.")
+        for w in result["warnings"]:
+            st.caption(f"— {w}")
+        return
+
+    m1, m2 = st.columns(2)
+    m1.metric(f"{base} alone", _pct(baseline), f"{result['n_base_resolved']} resolved")
+    lift = result["agreement_lift"]
+    m2.metric(
+        f"{base} when {confirm} agreed",
+        _pct(result["buckets"]["agree"]["accuracy"]),
+        f"{lift * 100:+.1f} pts vs alone" if lift is not None else "not enough pairs",
+    )
+
+    st.dataframe(
+        pd.DataFrame([
+            {
+                "Bucket": name.title(),
+                "N": b["n"],
+                "Hit rate": _pct(b["accuracy"]),
+            }
+            for name, b in result["buckets"].items()
+        ]),
+        hide_index=True, width="stretch",
+    )
+
+    if lift is not None:
+        if lift > 0.02:
+            st.success(
+                f"Confirmation helped by {lift * 100:+.1f} points on this sample. Waiting for "
+                f"{confirm} costs only theta, so this may be worth the delay.",
+            )
+        elif lift < -0.02:
+            st.warning(
+                f"Confirmation *hurt* by {lift * 100:+.1f} points on this sample — waiting "
+                f"filtered out more winners than losers.",
+            )
+        else:
+            st.info("No meaningful difference on this sample.")
+
+    with st.expander("Why this is not a clean backtest", expanded=False):
+        for w in result["warnings"]:
+            st.caption(f"— {w}")
 
 
 def _render_horizon_scoreboard(ticker: str):
@@ -522,6 +689,8 @@ def render():
 
     # Spans both models, so it sits above the tabs rather than inside either.
     _render_horizon_scoreboard(ticker)
+    st.markdown("---")
+    _render_agreement_backtest(ticker)
     st.markdown("---")
 
     tab_daily, tab_intraday = st.tabs(["Daily Model", "Intraday Model"])

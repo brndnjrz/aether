@@ -600,6 +600,50 @@ def compare_horizons(
     }
 
 
+DEFAULT_ROLLING_WINDOW = 20
+
+
+def rolling_accuracy(
+    history: pd.DataFrame, *, window: int = DEFAULT_ROLLING_WINDOW,
+) -> pd.DataFrame:
+    """
+    Rolling hit rate over resolved predictions, oldest-first (Roadmap Item 8).
+
+    A single current accuracy number cannot distinguish "steady at 55%" from
+    "was 62%, now 48%" — and those call for different actions. Plotting this
+    against retrain dates also makes each retrain's effect visible instead of
+    inferred.
+
+    Only resolved, directional rows count, matching every other metric here.
+    Returns columns `date`, `accuracy`, `n_window`, and an empty frame (with
+    those columns) when there is nothing to roll over — never raises.
+    """
+    cols = ["date", "accuracy", "n_window"]
+    if history is None or history.empty or "correct" not in history.columns:
+        return pd.DataFrame(columns=cols)
+
+    resolved = history[history["correct"].notna()].copy()
+    if "direction" in resolved.columns:
+        resolved = resolved[resolved["direction"].isin(["bullish", "bearish"])]
+    if resolved.empty or "date" not in resolved.columns:
+        return pd.DataFrame(columns=cols)
+
+    resolved = resolved[resolved["date"].notna()].sort_values("date")
+    if resolved.empty:
+        return pd.DataFrame(columns=cols)
+
+    correct = resolved["correct"].astype(bool).astype(float)
+    # min_periods=1 so the line starts immediately rather than after `window`
+    # rows; n_window is returned alongside so a 3-sample point is visibly thin
+    # rather than looking as solid as a 20-sample one.
+    effective = min(int(window), len(resolved))
+    return pd.DataFrame({
+        "date": resolved["date"].values,
+        "accuracy": correct.rolling(effective, min_periods=1).mean().values,
+        "n_window": correct.rolling(effective, min_periods=1).count().values,
+    })
+
+
 def _apply_options_sweep(
     row: Dict[str, Any],
     *,

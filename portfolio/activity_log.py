@@ -63,3 +63,31 @@ def get_recent_activity(limit: int = 10) -> List[Dict]:
         ).fetchall()
         logger.debug(f"get_recent_activity(limit={limit}): {len(rows)} rows")
         return [dict(r) for r in rows]
+
+
+def get_events_by_type(
+    event_type: str, ticker: Optional[str] = None, limit: int = 1000,
+) -> List[Dict]:
+    """
+    All rows of one event type, newest first.
+
+    Added for analysis/signal_attribution.py, which needs the full
+    `day_trading_analyze` history to fit signal weights — pulling that via
+    get_recent_activity() would mean over-fetching a mixed log and filtering in
+    Python, and would silently truncate once other event types outnumbered it.
+    """
+    init_db()
+    sql = "SELECT * FROM activity_log WHERE event_type = ?"
+    params: List = [event_type]
+    if ticker:
+        sql += " AND ticker = ?"
+        params.append(ticker.upper())
+    sql += " ORDER BY logged_at DESC LIMIT ?"
+    params.append(limit)
+
+    with get_conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+        logger.debug(
+            f"get_events_by_type({event_type}, ticker={ticker}, limit={limit}): {len(rows)} rows"
+        )
+        return [dict(r) for r in rows]

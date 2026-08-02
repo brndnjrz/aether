@@ -1165,6 +1165,46 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
     return result
 
 
+MIN_SIMILAR_SETUPS_FOR_WIN_RATE = 20
+
+
+def _summarize_similar_setups(subset_ret: np.ndarray, direction: str) -> Dict[str, Any]:
+    """
+    Distribution of forward returns across every historical bar where this model
+    made the same directional call (Roadmap Item 6).
+
+    `subset_ret` is a fraction-return array; everything returned is in percent.
+
+    Two honesty constraints:
+
+    - **In-sample.** These bars come from the model's own training history, so the
+      win rate is optimistic — the same caveat the "Signal Sharpe (IS)" metric
+      carries. `is_in_sample` is always True; it exists so the UI cannot forget.
+    - **`win_rate` is None below MIN_SIMILAR_SETUPS_FOR_WIN_RATE matches.** A rate
+      over 6 samples reads as precision it does not have. `n` is always reported,
+      so a thin sample is visible rather than hidden.
+    """
+    returns_pct = subset_ret * 100.0
+    wins = returns_pct > 0 if direction == "bullish" else returns_pct < 0
+    n = int(len(returns_pct))
+
+    return {
+        "n": n,
+        "is_thin": bool(n < MIN_SIMILAR_SETUPS_FOR_WIN_RATE),
+        "win_rate": (
+            round(float(wins.mean()), 4) if n >= MIN_SIMILAR_SETUPS_FOR_WIN_RATE else None
+        ),
+        "mean_pct": round(float(np.mean(returns_pct)), 2),
+        "median_pct": round(float(np.median(returns_pct)), 2),
+        "p25_pct": round(float(np.percentile(returns_pct, 25)), 2),
+        "p75_pct": round(float(np.percentile(returns_pct, 75)), 2),
+        "worst_pct": round(float(np.min(returns_pct)), 2),
+        "best_pct": round(float(np.max(returns_pct)), 2),
+        "returns_pct": [round(float(r), 3) for r in returns_pct],
+        "is_in_sample": True,
+    }
+
+
 def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     """
     Load saved models and produce a directional prediction for the latest bar.
@@ -1230,6 +1270,7 @@ def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
         "direction": "neutral",
         "probability": 0.50,
         "expected_move_pct": None,
+        "similar_setups": None,
         "confidence": "low",
         "top_features": {},
         "model_accuracy": 0.0,
@@ -1369,10 +1410,20 @@ def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     except Exception as exc:
         logger.debug(f"predict: top_features computation skipped for {ticker}: {exc}")
 
-    # ── Expected move estimate ────────────────────────────────────────────────
+    # ── Expected move estimate + similar historical setups ───────────────────
     # Uses the same horizon_days/neutral_threshold this model was trained with,
     # so the N-day forward return matches the model's own label definition.
+    #
+    # The `predicted_mask` below IS a similar-setups search: every historical bar
+    # where this model would have made the same directional call. It was already
+    # being computed and then thrown away except for its median, so
+    # similar_setups reports the rest of the distribution (Roadmap Item 6).
+    #
+    # In-sample by construction — the model is scoring bars from its own training
+    # history, so the win rate here is optimistic in the same way the "Signal
+    # Sharpe (IS)" metric is. Flagged as such rather than presented as a forecast.
     expected_move_pct = None
+    similar_setups = None
     try:
         X_full, y_full = build_features(
             df, ticker=ticker,
@@ -1393,6 +1444,7 @@ def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
             subset_ret = subset_ret[~np.isnan(subset_ret)]
             if len(subset_ret) >= 5:
                 expected_move_pct = round(float(np.median(subset_ret)) * 100, 2)
+                similar_setups = _summarize_similar_setups(subset_ret, direction)
     except Exception as exc:
         logger.debug(f"predict: expected_move_pct computation skipped for {ticker}: {exc}")   # non-critical
 
@@ -1416,6 +1468,7 @@ def predict(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
         "direction": direction,
         "probability": round(ensemble_prob, 4),
         "expected_move_pct": expected_move_pct,
+        "similar_setups": similar_setups,
         "confidence": confidence,
         "top_features": top_features,
         "price_at_prediction": float(df["Close"].iloc[-1]),
