@@ -4,6 +4,18 @@ The **Predictions** tab (Trading Desk page, `pages/trading.py`) runs a machine-l
 
 ## Using the Predictions Tab
 
+> **Above everything described below sits the Horizon Cockpit** — all five models
+> (5m/15m/30m/1h/daily) in one table, with live accuracy, expiry, and whether each
+> clears its costs. This document covers the *daily* model in depth; for the
+> cross-horizon view, the options cost model, and the exit clock, see `README.md`
+> (AI & ML Model Overview) and `docs/ROADMAP.md` for the design record.
+>
+> One caveat that changes how you read every number here: the tradeability verdict
+> baked into the intraday model prices costs in **underlying** percentage points,
+> which is correct for shares and wrong for options. Use
+> `options_pricing.assess_options_tradeability()` (Model Lab's scoreboard) when the
+> instrument is contracts.
+
 **Controls:**
 - **Ticker Symbol** — any symbol; defaults to `AAPL` and persists across reruns in session state.
 - **Train / Update Model** — fetches 2 years of daily bars, builds the 18-feature matrix, runs the 10-fold walk-forward validation described below, then fits the final model on all available directional history and saves it to `storage/`. Takes roughly 10-20 seconds. Requires at least 60 bars of history, and at least 50 directional (non-neutral) samples after the neutral-zone filter — tickers with too little history or an IPO within the lookback window will error out here.

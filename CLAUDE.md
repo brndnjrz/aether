@@ -15,10 +15,11 @@ and how a user drives it — this file is conventions, commands, and traps.
 
 ```bash
 streamlit run app.py          # run the dashboard (localhost:8501)
-pytest tests/ -q              # full suite (198 tests), ~15 min, no network needed —
+pytest tests/ -q              # full suite (436 tests), ~15 min, no network needed —
                                # the ML training stages in test_ml_prediction.py /
                                # test_intraday_prediction.py / test_model_comparison.py
                                # dominate the runtime; run subsets while iterating
+pytest tests/test_horizon_clock.py tests/test_options_tradeability.py -q   # ~2s
 pytest tests/test_orbc_strategy.py -q   # fast subset, ~3s
 python3 -m py_compile <files> # quick syntax check before running anything slow
 sqlite3 storage/journal.db "select * from activity_log"

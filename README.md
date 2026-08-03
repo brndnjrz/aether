@@ -43,10 +43,10 @@ Not a brokerage. Doesn't execute trades. Not financial advice.
 |------|--------------|
 | **Dashboard** (`pages/home.py`) | Live market overview — index prices, VIX, S&P regime banner, sector performance, open positions summary |
 | **Research** (`pages/research.py`) | Full single-stock deep dive: fundamental scorecard, technical chart, ML direction signal, options IV, news sentiment, and an AI investment brief |
-| **Options Log** (`pages/portfolio.py`) | The trade journal: manual fill entry → automatic FIFO round-trip P&L, hold-time/entry-hour/ticker/option-type/day-of-week win-rate analytics, and a cumulative P&L equity curve |
-| **Trading Desk** (`pages/trading.py`) | Four tabs in one page — **Day Trading** (market-status banner, intraday signals, candlestick pattern read, Flag/Pennant continuation-pattern detection with confidence scoring, suggested entry/stop/target, AI brief, MACD backtest), **Options** (chain, IV Rank, GARCH forward-vol forecast, Greeks, P&L diagrams, AI brief), **News** (headline sentiment), **Predictions** (ML direction signal + simulated price path) |
+| **Options Log** (`pages/portfolio.py`) | The trade journal. Manual fill entry → FIFO round-trip P&L, win-rate analytics by hold time/entry hour/ticker/option type/day of week, cumulative P&L curve, and **Model vs. Discretionary** — did following a signal beat overriding it |
+| **Trading Desk** (`pages/trading.py`) | Four tabs. **Day Trading** (status banner, intraday signals, candlestick + Flag/Pennant detection with confidence scoring, suggested entry/stop/target; Market Regime / Risk Calculator / Oscillators / Backtest / Signal Weights / AI Brief as sub-tabs), **Options** (chain, IV Rank, GARCH forward vol, Greeks, P&L diagrams, AI brief), **News** (headline sentiment), **Predictions** (**Horizon Cockpit** across all five models, then daily or intraday signal + price path + similar setups + exit plan) |
 | **Strategy Lab** (`pages/strategy_lab.py`) | **ORBC** (Opening Range Breakout Confirmation: requires a 2nd consecutive close outside the opening range before signalling, in `analysis/orbc_strategy.py`) with a Live Scanner and Backtest sub-tab, plus a read-only **Intraday Predictions** reference panel (latest saved intraday prediction per interval, so it can be checked without leaving this page) |
-| **Model Lab** (`pages/model_lab.py`) | Read-only prediction track record for the daily and intraday ML models — precision/recall/F1/calibration, why-it-was-wrong failure analysis, an informational 4-model comparison, version history with rollback, and retrain-trigger status. Reads what Trading Desk has already logged; the **Prediction Improvement Engine** (see [AI & ML Model Overview](#ai--ml-model-overview)) |
+| **Model Lab** (`pages/model_lab.py`) | Read-only track record for both models. **Horizon Scoreboard** (which horizon to trade, with a horizon×expiry net-edge grid), agreement backtest, precision/recall/F1/calibration, accuracy-over-time, why-it-was-wrong failure analysis, 4-model comparison, version history with rollback, retrain triggers. Reads what Trading Desk logged; the **Prediction Improvement Engine** (see [AI & ML Model Overview](#ai--ml-model-overview)) |
 
 Every Analyze click, options view, and prediction on the Trading Desk logs to a local activity log — later surfaced by Options Log's "what were you looking at" picker and the Dashboard's Recent Activity feed.
 
@@ -127,6 +127,48 @@ Also: drops `day_of_week` (near-useless in a 60-day window), adds time-of-day, V
 
 **Caveat:** intraday direction prediction is a harder problem than daily — order-flow shops attack it with data this app doesn't have. Expect 50–53% accuracy, and expect costs to eat most of it.
 
+### Horizon Cockpit — all five models at once
+
+**The app has five direction models. Until this, comparing them meant changing a dropdown four times and holding the results in your head.**
+
+The cockpit (top of Trading Desk → Predictions, `analysis/interval_consensus.py`) puts 5m / 15m / 30m / 1h / daily in one table: direction, probability, confidence, **live** accuracy paired with its sample size, when the signal expires, and whether it clears its own costs.
+
+**Why it matters:** the horizon you're most likely to act on is often the one least able to pay for itself. The cockpit names those explicitly — "agree directionally but do **not** clear costs."
+
+- **Read-only by construction.** `predict()` and `predict_intraday()` persist unless told otherwise, so a view that generated predictions on render would inflate the log and corrupt the live win rate Model Lab, the retrain triggers, and the scoreboard all read. One explicit **Refresh all horizons** button instead.
+- **Alignment, not a score.** Unanimous / mixed / none, plus the tightest *tradeable* agreeing horizon. Expired signals don't vote.
+- **Ask about these readings** — an optional AI Q&A grounded strictly on that table. No chart, no news feed. Ungrounded, an LLM narrates a VWAP reclaim that never happened.
+
+### Every signal expires
+
+**A prediction's horizon isn't a suggestion — it's the edge of the evidence.**
+
+`resolve_intraday_predictions()` grades a 15m/5-bar call against the close exactly 75 minutes later. The model has validated evidence about that window and none about the bar after it. `analysis/horizon_clock.py` now says so:
+
+- **Expiry in ET on every signal**, with a countdown, and an explicit expired state.
+- **Bars are labeled at their start**, so the exit bar's close lands one interval past `horizon_minutes` alone. Getting this wrong puts expiry a full bar early.
+- **Horizons crossing the 4:00 PM close are never gradeable** — forward returns spanning the overnight gap were excluded from training, so `resolve_intraday_predictions()` skips them permanently. That's a dead state, not a pending one.
+- **Stops scaled to the horizon.** The Day Trading card's `1.5 × daily ATR` is a swing stop; against 75 minutes it would never be touched, making its R:R fiction. The intraday exit plan uses the average move over that signal's own horizon instead.
+
+### Options cost model — the correction that mattered most
+
+**`assess_tradeability()` prices costs in *underlying* percentage points. Right for shares. Wrong three ways for contracts.**
+
+| Problem | Effect on the verdict |
+|---|---|
+| Payoff is leveraged ~19x at 30 DTE, **~100x at 0DTE** (`\|delta\| × S / P`) | Understates gross edge by 1–2 orders of magnitude |
+| A 1–2¢ spread on a $3 contract is 0.5–1%, not 0.02% | Overstates it |
+| No theta term at all | Overstates it, badly, near expiry |
+
+Leverage helps, spread and theta hurt — so raising a constant couldn't fix it. `assess_options_tradeability()` models all three and returns each term separately.
+
+**Why that separation matters:** `dominant_cost` names what actually kills the edge. Spread-dominated is fixable with better fills. **Theta-dominated means the expiry is wrong for the horizon** — a different action entirely.
+
+- **The verdict flips across the ladder.** Leverage and theta both scale inversely with time to expiry, so they partly cancel. `sweep_expiries()` runs 0/2/7/30 DTE; Model Lab renders the full horizon×expiry grid. Expect a diagonal — shorter signals need longer expiries to outrun decay.
+- **0DTE theta is guarded.** Black-Scholes theta diverges as `T → 0`, so under 1 DTE the model switches to an empirical sqrt-extrinsic decay and labels which method it used.
+- **Vega is inverted, not forecast.** `iv_points_to_erase_edge` says how much IV crush would wipe out the edge. Predicting the IV move needs its own calibration study (`docs/ROADMAP.md`, Item 11) and is deliberately not faked.
+- Ships **alongside** the shares verdict, labeled by `cost_model`, so the difference is visible rather than swapped in silently.
+
 ### Prediction Improvement Engine
 
 Both models are wrapped in a closed loop that tracks, explains, and maintains their own accuracy over time — surfaced on the **Model Lab** page (`pages/model_lab.py`):
@@ -138,8 +180,12 @@ Both models are wrapped in a closed loop that tracks, explains, and maintains th
 - **Hyperparameter search** — both XGBoost and Random Forest configs are auto-selected per ticker from a small grid, scored via a reduced-fold walk-forward; always falls back to library defaults if nothing in the grid beats them.
 - **Model versioning** — every retrain archives the model it replaces under `storage/versions/{TICKER}/`, with a rollback button in Model Lab that copies an older version's files back into place (a file copy, never a retrain).
 - **Retrain triggers** (`analysis/retrain_triggers.py`) — staleness, a live-accuracy drop vs. the trained-in accuracy, and elevated VIX are checked on both Trading Desk's status badge and Model Lab, plus a standalone `scripts/scheduled_retrain.py` CLI for cron-driven sweeps.
+- **Horizon Scoreboard** (`compare_horizons()`) — all five models ranked in one table. Verdict is an ordered rule chain, never a score, and it separates **Do not trade** (no edge) from **Uneconomic** (real edge, costs eat it) because those have different fixes. The `Calibrated` column asks whether HIGH confidence has actually beaten LOW — if `no`, ignore the badge and use raw accuracy.
+- **Accuracy over time** (`rolling_accuracy()`) — rolling 20-prediction hit rate with retrain dates marked. A single number can't tell "steady at 55%" from "was 62%, now 48%", and those call for different actions.
+- **Agreement backtest** (`backtest_agreement()`) — did waiting for a second horizon to confirm actually improve the hit rate? Buckets into agree / conflict / unconfirmed. Carries a permanent caveat: predictions exist only where you pressed a button, so it's a correlation in your own history, not a controlled backtest.
+- **Similar setups** — `predict()` already found every historical bar where the model made the same call, to take the median as `expected_move_pct`. Now reports the full distribution too. In-sample, and labeled as such.
 
-Full technical writeup, including the exact formulas and storage layout: `docs/ML_PREDICTION.md`.
+Full technical writeup, including the exact formulas and storage layout: `docs/ML_PREDICTION.md`. Design record for the cockpit work, including ideas explicitly rejected: `docs/ROADMAP.md`.
 
 ## Setup Environment Using Anaconda
 
@@ -213,6 +259,7 @@ Enter a ticker + lookback period — loads automatically, no button to click.
 The trade journal — the only page where you log trades. Enter each options fill as your broker reports it; `portfolio/round_trips.py` FIFO-matches buys against sells into round trips with P&L and hold time.
 
 - **Pattern-finding analytics** — a cumulative P&L equity curve, win rate by hold-time bucket, entry hour, option type, and day of week, and a per-ticker performance breakdown (total/avg P&L, win rate).
+- **Model vs. Discretionary** — tag a fill with the signal that motivated it, and this compares round trips you opened on a model call against ones you didn't. **Every other number in the app grades the model; this grades the decision.** Stays silent until 40 round trips with 15 per arm — at 20 trades "I lose on countertrend setups" is noise that reads as self-knowledge. Leaving a fill untagged is a real data point, not a missing one.
 - **Equity positions have no logging UI** — options fills only. Formerly "Portfolio," with Positions / Risk Analytics / Position Sizer tabs; those tracked equity positions with no UI to ever add one, and the Position Sizer duplicated Trading Desk's own Quick Risk Calculator, so all three were cut.
 
 **Example:** after your broker fills a `SPY 15Feb25 590C` buy and, three days later, the matching sell, log both fills under the **Fill Ledger** as they happen. Once both sides are in, the FIFO matcher turns them into one round trip on the **Round Trips** table and folds it into **Win Rate** (e.g. "60% win rate on holds under 1 day") and the cumulative P&L equity curve — the picture of *your own* trading, not the model's.
@@ -224,12 +271,13 @@ Four tabs:
 - **Day Trading** — VWAP deviation, momentum, volume ratio, trend alignment (all interval-aware except Trend Alignment, which stays on daily SMA20/50/200 + EMA50 by design), candlestick pattern detection, and Flag/Pennant continuation-pattern detection (`analysis/flag_pennant_detection.py` + `flag_pennant_scoring.py`) drawn directly on the chart with a 0–100 confidence score. Signals combine into a Suggested Entry/Stop/Target card via majority vote, plus an AI Day Trading Brief and a MACD-cross backtest.
 - **Options** — IV Rank/Percentile, a GARCH(1,1) forward volatility forecast vs. ATM IV, the full chain, P&L diagrams, Black-Scholes Greeks, and an AI Options Brief.
 - **News** — headline sentiment for the entered ticker, same VADER scoring as Research.
-- **Predictions** — train/retrain the ML ensemble, generate a direction signal + simulated price path. A **Prediction horizon** toggle switches between **Daily (swing)** — the original model, unchanged — and **Intraday (15-min bars)**, a separate model with its own features, labels, and storage. See [AI & ML Model Overview](#ai--ml-model-overview) and `docs/ML_PREDICTION.md`.
+- **Predictions** — opens with the **Horizon Cockpit** (all five models side by side; see [above](#horizon-cockpit--all-five-models-at-once)). Below it, a **Prediction horizon** toggle switches between **Daily (swing)** — the original model, unchanged — and **Intraday (15-min bars)**, a separate model with its own features, labels, and storage. Both add an **exit plan**: when the signal expires and a stop scaled to that horizon.
 
 **Examples:**
-- **Day Trading** — enter `AAPL`, check the Suggested Entry/Stop/Target card; if it agrees with a Flag/Pennant pattern drawn on the chart at a confidence ≥ 70, that's a stronger case than either signal alone. Click **Run Backtest** to sanity-check the MACD-cross rule on AAPL's own recent history first.
-- **Options** — same ticker, Options tab: check IV Rank — a rank above ~70 with GARCH forecasting lower forward vol than current ATM IV is the setup for selling premium (credit spread/covered call), not buying it.
-- **Predictions** — first time on a ticker, click **Train / Update Model** (~10–20s), then **Generate Prediction**. A HIGH-confidence BULLISH call with a positive walk-forward accuracy delta is worth weighing; a LOW-confidence or NEUTRAL result means don't trade off this signal today. Toggle to **Intraday (15-min bars)** for a same-day read instead of a 5-day one.
+- **Start here.** Open Predictions and read the cockpit before anything else. If it says *"Agree directionally but do not clear costs: 5m, 15m"*, the setup that looks strongest is the one that can't pay for itself. Check **Price with live options quotes** to cost it as contracts rather than shares.
+- **Day Trading** — enter `AAPL`, check the Suggested Entry/Stop/Target card; if it agrees with a Flag/Pennant pattern drawn on the chart at confidence ≥ 70, that's a stronger case than either alone. Sub-tabs hold Market Regime, Risk Calculator, Oscillators, the MACD backtest, and **Signal Weights** (fitted from your own logged Analyze clicks — blank until 30 have resolved, by design).
+- **Options** — check IV Rank: above ~70 with GARCH forecasting lower forward vol than current ATM IV is the setup for *selling* premium, not buying it.
+- **Predictions** — first time on a ticker, **Train / Update Model** (~10–20s), then **Generate Prediction**. A HIGH-confidence BULLISH call with a positive walk-forward delta is worth weighing; LOW or NEUTRAL means don't trade it today. Then read the exit plan — **flat by the expiry time**, because past it the model has no validated edge.
 
 Day-by-day, week-by-week rhythm: `docs/workflow.md`.
 
@@ -253,15 +301,20 @@ Full rule set + daily routine: `docs/ORBC_PLAYBOOK.md`.
 
 ### Model Lab
 
-Read-only prediction track record for the daily and intraday ML models — the **Prediction Improvement Engine**'s dashboard. It doesn't fetch, train, or predict on its own; it reads and analyzes what Trading Desk has already logged and graded (two exceptions: Model Comparison fits throwaway models purely to score them, and Version History's rollback button copies files). Enter a ticker, then pick **Daily Model** or **Intraday Model**.
+Read-only track record for both ML models — the **Prediction Improvement Engine**'s dashboard. It never trains, predicts, or writes a prediction. Four opt-in exceptions, all read-only: Model Comparison fits throwaway models purely to score them, Version History's rollback copies archived files, Failure Analysis's "recompute legacy" checkbox re-fetches price history, and the Scoreboard's "live options quotes" checkbox fetches an expiry ladder.
 
-- **Performance dashboard** — accuracy, win rate, precision/recall/F1/false-positive-rate/false-negative-rate per direction (with a confusion matrix), average profit per signal, average holding time, and confidence calibration (does HIGH confidence actually land higher accuracy than LOW?).
-- **Failure analysis ("Why the model was wrong")** — every incorrect prediction categorized against the technical/volatility/earnings context it was made in (counter-trend, choppy market, volume anomaly, RSI divergence, elevated VIX regime, earnings window), as a bar chart + detail table. An opt-in checkbox recomputes categories for predictions logged before this feature shipped (fetches network data); predictions with a saved snapshot need no network at all.
-- **Model comparison** — click **Run comparison** to score XGBoost, Random Forest, Logistic Regression, and Gradient Boosting against each other via the same walk-forward validation training uses, with a recommended softmax weighting. Informational only — never changes the deployed model.
-- **Version history** — every retrain's replaced model is archived here; roll back to any prior version with one click (archives the current model first, so nothing is discarded).
-- **Retrain triggers** — staleness, live-accuracy drop, and elevated-VIX status, the same three checks Trading Desk's Predictions status badge uses.
+**Start at the top.** The Horizon Scoreboard answers *which* horizon to trade; the tabs below answer *how one is doing*.
 
-**Example:** after a few weeks of live `TSLA` predictions, open Model Lab → Daily Model. If Win Rate is well below the walk-forward accuracy the model trained with, check **Retrain Triggers** — a performance-drop flag there means it's time to hit Trading Desk's **Train / Update Model**. Before you do, check **Failure Analysis** first: if most misses cluster under "elevated_vol_regime," the model isn't broken, the market just got choppier than its training window — retraining on fresher data (which now includes that regime) is exactly the fix. If a retrain makes things worse, **Version History** lets you roll back to the version you just replaced.
+- **Horizon Scoreboard** — five rows: walk-forward accuracy, std, live accuracy with N, best expiry, net edge, dominant cost, IV crush to erase, calibrated?, verdict. Plus a **horizon × expiry grid** of net edge. Verdict is an ordered rule chain, not a score — and **Uneconomic** (real edge, costs eat it) is a different diagnosis from **Do not trade** (no edge).
+- **Agreement backtest** — did a second horizon confirming actually raise the hit rate?
+- **Performance dashboard** — accuracy, win rate, precision/recall/F1/FPR/FNR per direction with a confusion matrix, avg profit per signal, avg holding time, and confidence calibration.
+- **Accuracy over time** — rolling 20-prediction hit rate, retrain dates marked.
+- **Failure analysis ("Why the model was wrong")** — each miss tagged against its technical/volatility/earnings context (counter-trend, choppy, volume anomaly, RSI divergence, elevated VIX, earnings window).
+- **Model comparison** — XGBoost vs RF vs LogReg vs GradientBoosting on the same walk-forward. Informational; never changes the deployed model.
+- **Version history** — roll back any retrain in one click (archives the current model first, so nothing is discarded).
+- **Retrain triggers** — staleness, live-accuracy drop, elevated VIX. Same three checks Trading Desk's badge uses.
+
+**Example:** after a few weeks of live `SPY` predictions, open Model Lab. If the Scoreboard says 15m is **Uneconomic** while 30m is **Primary**, the 15m model isn't broken — its costs are, and the grid will show which expiry fixes it. If a horizon reads **Degraded, retrain**, check **Failure Analysis** first: misses clustering under `elevated_vol_regime` mean the market shifted, not the model, and retraining on fresher data is the fix. If that retrain makes things worse, **Version History** rolls it back.
 
 ## Architecture & Workflow
 
@@ -276,7 +329,9 @@ No central orchestrator. `app.py` sets page config, theme, and the sidebar, then
 
 - **`storage/journal.db`** (SQLite, via `portfolio/db.py`) — positions, activity log, options fills
 - **`storage/{TICKER}_*`** — trained models, walk-forward accuracy, prediction history — one set per trained ticker
-- **`storage/versions/{TICKER}/`** — archived prior model versions + an append-only rollback log; **`storage/retrain_log.jsonl`** — `scripts/scheduled_retrain.py`'s sweep log
+- **`storage/versions/{TICKER}/`** — archived prior model versions + an append-only rollback log; **`storage/retrain_log.jsonl`** and **`storage/alerts.jsonl`** — the two cron sweeps' logs
+
+**One writer, one judge.** Trading Desk is the only page that logs predictions; Model Lab only reads and grades them. `predict()`/`predict_intraday()` persist unless passed `persist=False`, so any automated caller would otherwise inflate the live win rate that Model Lab, the retrain triggers, and the Horizon Scoreboard all read. `scripts/alert_sweep.py` is the one automated caller and passes it.
 
 No request/response API layer — Streamlit's script-rerun model *is* the request cycle. `st.session_state` carries state (e.g. the quick-lookup ticker) across page switches.
 
@@ -310,17 +365,21 @@ aether/
 │   ├── backtest.py            # Generic long-only backtest engine + MACD bullish-cross signal
 │   ├── ml_prediction.py       # XGBoost + RF ensemble (daily): train, predict, evaluate, compare_models, versioning
 │   ├── intraday_prediction.py # Separate intraday (15m) direction model — own features/labels/storage
-│   ├── prediction_performance.py  # Precision/recall/F1/calibration metrics over logged, graded predictions
+│   ├── interval_consensus.py  # Horizon Cockpit: cross-horizon read + agreement backtest (read-only)
+│   ├── horizon_clock.py       # When a signal expires; flags horizons that can never be graded
+│   ├── signal_attribution.py  # Signal weights fitted from logged history (refuses under 30 events)
+│   ├── trade_attribution.py   # Model-driven vs discretionary round trips (gated on sample size)
+│   ├── prediction_performance.py  # Precision/recall/F1/calibration, compare_horizons, rolling_accuracy
 │   ├── prediction_errors.py       # Categorizes incorrect predictions against their technical/vol/earnings context
 │   ├── retrain_triggers.py        # Staleness, live-accuracy-drop, and elevated-VIX retrain checks
 │   ├── price_projection.py    # Monte Carlo price-path simulation
-│   ├── options_pricing.py     # Black-Scholes pricing, Greeks, implied-vol solver
+│   ├── options_pricing.py     # Black-Scholes pricing, Greeks, IV solver, options cost model + expiry sweep
 │   ├── volatility_forecast.py # GARCH(1,1) forward volatility forecast
 │   ├── sentiment.py           # VADER headline sentiment scoring
 │   ├── fundamental_score.py   # Quality/Value/Growth scoring engine
 │   ├── regime.py              # Market regime detection (trend vs. 200-day MA)
 │   ├── regime_markov.py       # Markov-chain regime model — persistence, forecast, stationary distribution
-│   └── risk.py                # Portfolio risk metrics, position sizing, stress tests
+│   └── risk.py                # Position sizing, horizon-scaled stops, contract-level loss
 ├── data/
 │   ├── price_data.py          # Price history and current price via yfinance
 │   ├── fundamentals.py        # Balance sheet, income statement, FCF via yfinance
@@ -337,12 +396,14 @@ aether/
 │   ├── activity_log.py         # Records Day Trading / Options / Prediction view events
 │   ├── option_fills.py         # Options fill ledger CRUD
 │   └── round_trips.py          # FIFO buy/sell matcher → round trips with P&L, hold time
-├── scripts/
-│   └── scheduled_retrain.py    # Standalone CLI — cron-driven retrain sweep, not imported by the app
+├── scripts/                 # Standalone CLIs — cron-driven, never imported by the app
+│   ├── scheduled_retrain.py    # Retrain sweep
+│   └── alert_sweep.py          # Alert conditions -> storage/alerts.jsonl (uses persist=False)
 ├── docs/
 │   ├── workflow.md                    # Day-by-day and week-by-week usage workflow
 │   ├── ORBC_PLAYBOOK.md               # ORBC rules, design decisions, and daily trading routine
 │   ├── ML_PREDICTION.md               # Full technical writeup of the ML ensemble + Prediction Improvement Engine
+│   ├── ROADMAP.md                     # Design record for the Horizon Cockpit work (+ ideas rejected, and why)
 │   ├── Identifying-Chart-Patterns.md  # Flag/Pennant pattern reference
 │   └── VERIFICATION_CHECKLIST.md      # Manual verification steps for a few past fixes
 ├── tests/
@@ -362,6 +423,7 @@ aether/
     ├── {TICKER}_accuracy.json
     ├── {TICKER}_predictions.jsonl
     ├── retrain_log.jsonl
+    ├── alerts.jsonl
     └── versions/{TICKER}/        # Archived prior model versions + rollback history
 ```
 
@@ -393,7 +455,7 @@ Cache TTLs (`config/settings.py`): price data 5 min, fundamentals 1 hour, option
 
 Reliability rests on three mechanisms:
 
-**1. A `pytest` regression suite** (`tests/`, 198 tests, run with `pytest tests/ -q` — no network access needed):
+**1. A `pytest` regression suite** (`tests/`, 436 tests, run with `pytest tests/ -q` — no network access needed):
 
 - `test_ml_prediction.py` — the daily model end-to-end: an import-crash guard (the exact failure that silently killed the Predictions tab for 11 days), train/predict/evaluate on synthetic data, the reliability gate correctly rejecting a pure random walk, hyperparameter search, and the predict → save → history persistence round-trip.
 - `test_orbc_strategy.py` — the ORBC confirmation state machine against hand-built sessions: a single breakout close never signals, a close back inside resets the count, filters fall through from the 2nd to the 3rd close, and short P&L carries the correct sign.
@@ -401,6 +463,12 @@ Reliability rests on three mechanisms:
 - `test_prediction_performance.py` / `test_prediction_errors.py` — the Model Lab metric math (precision/recall/F1/calibration) and the failure-categorization rule set, from the Prediction Improvement Engine.
 - `test_model_comparison.py` — the 4-model walk-forward bake-off, and a bit-for-bit reproduction guard proving the learned ensemble weight never changes the original 65/35 XGB/RF blend's math.
 - `test_model_versioning.py` / `test_retrain_triggers.py` / `test_scheduled_retrain.py` — model version archive/rollback, the three retrain triggers, and the standalone cron sweep script.
+- `test_horizon_clock.py` / `test_options_tradeability.py` / `test_interval_consensus.py` / `test_horizon_scoreboard.py` / `test_horizon_stops.py` — the cockpit work: expiry math (including start-labeled bars and horizons that can never be graded), the options cost model's three terms plus the 0DTE theta guard and expiry sweep, cockpit alignment and its read-only guarantee, the scoreboard's verdict rule chain, and horizon-scaled stops.
+- `test_agreement_backtest.py` / `test_accuracy_trend.py` / `test_signal_attribution.py` / `test_trade_attribution.py` — agreement buckets, rolling accuracy, and the two **refusal** paths: fitted signal weights return nothing under 30 events, and model-vs-discretionary stays silent under 40 round trips. Those refusals are tested as features.
+
+Every clock test injects `now` explicitly — a test that read the wall clock would pass or fail depending on the hour it ran.
+
+**Known gap:** anything touching a **live options chain** is unexercised. `get_expiry_ladder_quotes` has never seen a real chain — the math behind it is unit-tested with injected Greeks, but ladder-snapping and empty-book fallbacks want one session of real data. Check the scoreboard grid during market hours before trusting it.
 
 **2. The ML model self-gates on quality.** Walk-forward validation must clear 52% mean directional accuracy with std-dev ≤ 8% across folds — a model that doesn't clear the bar is reported as such instead of silently saved.
 
@@ -429,9 +497,19 @@ ollama pull llama3.2
 # Install dependencies
 pip install -r requirements.txt
 
-# Run the regression test suite
+# Run the regression test suite (436 tests, ~15 min — run subsets while iterating)
 pytest tests/ -q
+pytest tests/test_horizon_clock.py tests/test_options_tradeability.py -q   # fast, ~2s
+
+# Cron-driven sweeps (standalone CLIs, never imported by the app)
+python3 scripts/scheduled_retrain.py --dry-run
+python3 scripts/alert_sweep.py --dry-run
+python3 scripts/alert_sweep.py --tickers SPY --include-fresh   # uses persist=False
 
 # Inspect the local database directly
 sqlite3 storage/journal.db "select * from activity_log"
+sqlite3 storage/journal.db "select filled_at, ticker, prediction_ref from option_fills"
+
+# Alerts written by the sweep
+tail -20 storage/alerts.jsonl
 ```
