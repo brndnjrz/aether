@@ -69,6 +69,14 @@ IVR_HIGH = 50
 IVR_LOW = 30
 IV_RV_PREMIUM_THRESHOLD = 1.15  # IV 15% > RV = potentially rich premium
 
+# Minimum accuracy a model must add over the naive "always predict the more
+# common direction" baseline before it counts as reliable. The flat 52% floor
+# alone is not a bar: once the neutral band drops small moves, bull-market drift
+# puts the majority class at 54-60% on a trending ticker, so a 55% model can look
+# reliable while losing to a constant guess. Read by
+# ml_prediction._summarize_fold_scores.
+MIN_EDGE_OVER_BASELINE = 0.02
+
 STORAGE_DIR = os.path.join(os.path.dirname(__file__), "..", "storage")
 
 # Model retraining triggers (Prediction Improvement Engine, Phase 8)

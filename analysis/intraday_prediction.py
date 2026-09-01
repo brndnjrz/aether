@@ -59,11 +59,14 @@ from config.tz import MARKET_TZ, now_et_iso
 from analysis.ml_prediction import (
     _filter_directional,
     _gbc_config,
+    _jsonl_lock,
     _logreg_config,
     _price_sanity_error,
     _rf_config,
+    _rewrite_jsonl_atomic,
     _run_walk_forward,
     _run_walk_forward_multi,
+    _score_ensemble_weights,
     _softmax_ensemble_weights,
     _to_binary_labels,
     _xgb_config,
@@ -107,6 +110,13 @@ MIN_ROWS_REQUIRED: int = 200
 MIN_DIRECTIONAL_SAMPLES: int = 150
 _SEARCH_N_SPLITS: int = 4
 _MIN_SEARCH_ACCURACY: float = 0.50
+
+# Bump whenever the feature normalization changes in a way that makes an
+# existing model's learned splits invalid. predict_intraday() refuses to load a
+# model saved under an older value rather than silently mispredicting against
+# z-scores it was never fitted on. v2: normalize before neutral-filtering, so
+# training and inference share one reference population.
+FEATURE_NORM_VERSION: int = 2
 
 # Feature list for intraday models. Independent of feature_engineering's
 # FEATURE_NAMES, which must stay frozen for daily model compatibility.
@@ -174,9 +184,11 @@ _VERSION_HISTORY_COLUMNS = [
 ]
 
 
-def _versions_dir(ticker: str, interval: str) -> Path:
+def _versions_dir(ticker: str, interval: str, create: bool = False) -> Path:
+    """Path accessor — see ml_prediction._versions_dir. create=True only writes."""
     d = _STORAGE_DIR / "versions" / f"{ticker.upper()}_{_interval_tag(interval)}"
-    d.mkdir(parents=True, exist_ok=True)
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
     return d
 
 
@@ -212,7 +224,7 @@ def _archive_current_version(ticker: str, interval: str, acc_record: Dict[str, A
         return 0
 
     version = _next_version_number(ticker, interval)
-    versions_dir = _versions_dir(ticker, interval)
+    versions_dir = _versions_dir(ticker, interval, create=True)
     try:
         shutil.copy2(xgb_path, versions_dir / f"v{version}_xgb.pkl")
         shutil.copy2(rf_path, versions_dir / f"v{version}_rf.pkl")
@@ -278,7 +290,7 @@ def rollback_to_version(ticker: str, interval: str, version: int) -> Dict[str, A
         "new_current_version_archived": None, "error": None,
     }
 
-    versions_dir = _versions_dir(ticker, interval)
+    versions_dir = _versions_dir(ticker, interval, create=True)
     src_xgb = versions_dir / f"v{version}_xgb.pkl"
     src_rf = versions_dir / f"v{version}_rf.pkl"
     src_acc = versions_dir / f"v{version}_accuracy.json"
@@ -577,6 +589,37 @@ def normalize_intraday_features(X: pd.DataFrame, window: int) -> pd.DataFrame:
     return result.astype("float32").fillna(0.0)
 
 
+def _normalized_feature_frame(df: pd.DataFrame, norm_window: int) -> pd.DataFrame:
+    """
+    The one place the normalized feature matrix is built, for training *and*
+    inference. Both paths must normalize over the same population or the
+    z-scores they produce are not comparable.
+
+    normalize_intraday_features is a rolling z-score over `norm_window` *rows*,
+    so its output depends on which rows it is handed. Training used to normalize
+    the neutral-filtered subset while inference normalized every bar: the same
+    260-row window then covered ~37 days of disproportionately volatile bars in
+    training but ~11 days of all bars at inference, so one atr_pct reading
+    mapped to a different z-score in each path — off by ~0.5 sd on 39% of bars.
+    Rows are filtered *after* normalizing now, never before.
+    """
+    market_df = _to_market_tz(df)
+    featured = _add_intraday_features(market_df)[INTRADAY_FEATURE_NAMES]
+    featured = featured.replace([np.inf, -np.inf], np.nan).ffill().dropna()
+    return normalize_intraday_features(featured, window=norm_window)
+
+
+def _align_to_normalized(
+    normed_full: pd.DataFrame,
+    X_dir: pd.DataFrame,
+    y_dir: pd.Series,
+) -> Tuple[pd.DataFrame, pd.Series]:
+    """Pull the training rows' z-scores out of the full normalized frame."""
+    X_norm = normed_full.reindex(X_dir.index)
+    keep = X_norm.notna().all(axis=1)
+    return X_norm.loc[keep], y_dir.loc[keep]
+
+
 # ── Cost-aware reliability ───────────────────────────────────────────────────
 
 def assess_tradeability(
@@ -645,6 +688,11 @@ def select_intraday_label_scheme(
     candidates: List[Dict[str, Any]] = []
     best: Optional[Dict[str, Any]] = None
     norm_window = INTERVAL_SPECS[interval]["bars_per_session"] * 10
+    # Normalized once over every bar rather than per-candidate over each
+    # candidate's filtered subset. Candidates differ only in how they label
+    # bars, so the feature z-scores are shared — and normalizing the full frame
+    # is what keeps them comparable to inference (_normalized_feature_frame).
+    normed_full = _normalized_feature_frame(df, norm_window)
 
     for horizon_bars in HORIZON_SEARCH_GRID:
         for sigma_multiple in SIGMA_MULTIPLE_GRID:
@@ -664,7 +712,9 @@ def select_intraday_label_scheme(
             if len(X_dir) < MIN_DIRECTIONAL_SAMPLES:
                 continue
 
-            X_norm = normalize_intraday_features(X_dir, window=norm_window)
+            X_norm, y_dir = _align_to_normalized(normed_full, X_dir, y_dir)
+            if len(X_norm) < MIN_DIRECTIONAL_SAMPLES:
+                continue
             balance = class_balance_check(y_dir)
             xgb_cfg = _xgb_config(scale_pos_weight=balance["recommended_scale_pos_weight"])
             rf_cfg = _rf_config(n_features=len(INTRADAY_FEATURE_NAMES))
@@ -682,7 +732,7 @@ def select_intraday_label_scheme(
                 "mean_accuracy": wf["mean_directional_accuracy"],
                 "std_accuracy": wf["std_directional_accuracy"],
                 "n_folds": wf["n_folds"],
-                "n_directional": len(X_dir),
+                "n_directional": len(X_norm),
                 "neutral_pct": balance["neutral_pct"],
                 "_X": X_norm,
                 "_y": y_dir,
@@ -701,6 +751,7 @@ def select_intraday_label_scheme(
             df, ticker=ticker, horizon_bars=5, sigma_multiple=0.75, interval=interval,
         )
         X_dir, y_dir = _filter_directional(X, y)
+        X_dir, y_dir = _align_to_normalized(normed_full, X_dir, y_dir)
         if len(X_dir) < MIN_DIRECTIONAL_SAMPLES:
             raise ValueError(
                 f"Only {len(X_dir)} directional samples at the default label scheme "
@@ -710,7 +761,7 @@ def select_intraday_label_scheme(
             "horizon_bars": 5,
             "sigma_multiple": 0.75,
             "threshold_pct": info["threshold_pct"],
-            "_X": normalize_intraday_features(X_dir, window=norm_window),
+            "_X": X_dir,
             "_y": y_dir,
             "_info": info,
         }
@@ -798,6 +849,10 @@ def train_intraday_model(
     ensemble_weights = _softmax_ensemble_weights({
         name: m["mean_directional_accuracy"] for name, m in wf_multi["per_model"].items()
     })
+    # Score the blend that predict_intraday() will actually run, not the fixed
+    # 0.65/0.35 one used to validate. tradeability below reads this accuracy, so
+    # the cost check was previously being fed a different model's number.
+    wf = _score_ensemble_weights(wf_multi, ensemble_weights)
 
     tradeability = assess_tradeability(
         wf["mean_directional_accuracy"], choice["info"]["horizon_sigma"], round_trip_cost_pct,
@@ -833,6 +888,9 @@ def train_intraday_model(
         "hyperparam_overrides": hp_overrides,
         "rf_hyperparam_overrides": rf_hp_overrides,
         "ensemble_weights": ensemble_weights,
+        "feature_norm_version": FEATURE_NORM_VERSION,
+        "baseline_accuracy": wf.get("baseline_accuracy"),
+        "edge_over_baseline": wf.get("edge_over_baseline"),
     }
     try:
         # Archive whatever model is currently deployed BEFORE overwriting it —
@@ -910,6 +968,33 @@ def predict_intraday(
             return {"error": train_result["error"], "ticker": ticker, "interval": interval}
 
     meta = load_metadata(ticker, interval)
+
+    # A model fitted under an older normalization learned splits on z-scores
+    # that this code no longer produces, so its predictions would be confident
+    # and wrong with nothing to show it. Refuse rather than degrade.
+    saved_norm_version = int(meta.get("feature_norm_version") or 1)
+    if saved_norm_version < FEATURE_NORM_VERSION:
+        if not auto_train:
+            return {
+                "error": (
+                    f"The saved {interval} model for {ticker} was trained under feature "
+                    f"normalization v{saved_norm_version}; this build produces v"
+                    f"{FEATURE_NORM_VERSION} z-scores. Retrain it — its current signals "
+                    "are not valid."
+                ),
+                "ticker": ticker, "interval": interval, "needs_retrain": True,
+            }
+        logger.warning(
+            "predict_intraday: %s %s model is norm v%d (need v%d) — retraining",
+            ticker, interval, saved_norm_version, FEATURE_NORM_VERSION,
+        )
+        train_result = train_intraday_model(
+            ticker, interval, df=df, round_trip_cost_pct=round_trip_cost_pct,
+        )
+        if train_result.get("error"):
+            return {"error": train_result["error"], "ticker": ticker, "interval": interval}
+        meta = load_metadata(ticker, interval)
+
     horizon_bars = int(meta.get("horizon_bars") or 5)
     sigma_multiple = float(meta.get("sigma_multiple") or 0.75)
     norm_window = INTERVAL_SPECS[interval]["bars_per_session"] * 10
@@ -923,11 +1008,11 @@ def predict_intraday(
         return {"error": str(exc), "ticker": ticker, "interval": interval}
 
     # The most recent bar has no label (its forward window hasn't happened), so
-    # build the inference row from the full feature frame rather than from X.
+    # the inference row comes from the full feature frame rather than from X.
+    # Same helper the training path normalizes with — that shared call is the
+    # only thing keeping these z-scores comparable, so don't inline it again.
     market_df = _to_market_tz(df)
-    featured = _add_intraday_features(market_df)[INTRADAY_FEATURE_NAMES]
-    featured = featured.replace([np.inf, -np.inf], np.nan)
-    normed = normalize_intraday_features(featured.ffill().dropna(), window=norm_window)
+    normed = _normalized_feature_frame(df, norm_window)
     if normed.empty:
         return {"error": "Not enough warm-up data to build an inference row.",
                 "ticker": ticker, "interval": interval}
@@ -940,9 +1025,17 @@ def predict_intraday(
     except Exception as exc:
         return {"error": f"Could not load model: {exc}", "ticker": ticker, "interval": interval}
 
-    xgb_prob = float(xgb_model.predict_proba(latest)[0, 1])
-    rf_prob = float(rf_model.predict_proba(latest)[0, 1])
     ensemble_weights = meta.get("ensemble_weights") or {"xgb": 0.65, "rf": 0.35}
+    try:
+        xgb_prob = float(xgb_model.predict_proba(latest)[0, 1])
+        rf_prob = float(rf_model.predict_proba(latest)[0, 1])
+    except Exception as exc:
+        # A feature-count change between fit and now raises here. The daily
+        # module returns an error dict for this; do the same rather than letting
+        # a ValueError escape a function documented never to raise.
+        logger.error("predict_intraday: %s %s inference failed: %s", ticker, interval, exc)
+        return {"error": f"Model inference error: {exc}. Retrain this model.",
+                "ticker": ticker, "interval": interval, "needs_retrain": True}
     ensemble = ensemble_weights.get("xgb", 0.65) * xgb_prob + ensemble_weights.get("rf", 0.35) * rf_prob
 
     if ensemble >= 0.55:
@@ -1110,6 +1203,11 @@ def save_intraday_prediction(ticker: str, interval: str, prediction: Dict[str, A
             "confidence": prediction.get("confidence"),
             "horizon_bars": prediction.get("horizon_bars"),
             "horizon_minutes": prediction.get("horizon_minutes"),
+            # The neutral band this model was trained under. resolve_* grades
+            # against it so live accuracy measures the same population training
+            # scored — without it the two numbers are not comparable and their
+            # gap drives a retrain that can never close it.
+            "threshold_pct": prediction.get("threshold_pct"),
             "model_accuracy": prediction.get("model_accuracy"),
             "price_at_prediction": prediction.get("price_at_prediction"),
             "indicator_snapshot": prediction.get("indicator_snapshot"),
@@ -1197,6 +1295,7 @@ def resolve_intraday_predictions(ticker: str, interval: str = DEFAULT_INTERVAL) 
     pending = [
         r for r in records
         if r.get("correct") is None
+        and not r.get("neutral_outcome")
         and r.get("direction") in ("bullish", "bearish")
         and r.get("price_at_prediction") is not None
         and r.get("bar_timestamp")
@@ -1226,8 +1325,20 @@ def resolve_intraday_predictions(ticker: str, interval: str = DEFAULT_INTERVAL) 
             continue
 
         horizon = int(record.get("horizon_bars") or 5)
-        positions = price_df.index.get_indexer([bar_ts], method="nearest")
+        # A tolerance is mandatory here: get_indexer(method="nearest") only ever
+        # returns -1 when one is supplied, so without it a prediction whose bar
+        # has aged out of the refetch window silently snaps to the nearest
+        # surviving bar — in either direction — and gets graded against
+        # unrelated prices. Half a bar keeps it to the intended bar or nothing.
+        positions = price_df.index.get_indexer(
+            [bar_ts], method="nearest",
+            tolerance=pd.Timedelta(minutes=spec["minutes"]) / 2,
+        )
         if len(positions) == 0 or positions[0] < 0:
+            logger.debug(
+                "resolve_intraday_predictions: %s %s bar %s not in the fetched "
+                "window — left unresolved", ticker, interval, bar_ts,
+            )
             continue
         start = int(positions[0])
         end = start + horizon
@@ -1238,16 +1349,67 @@ def resolve_intraday_predictions(ticker: str, interval: str = DEFAULT_INTERVAL) 
 
         entry = float(record["price_at_prediction"])
         exit_price = float(price_df["Close"].iloc[end])
-        actual_pct = round((exit_price - entry) / entry * 100, 4)
+        actual_raw = (exit_price - entry) / entry * 100
+        actual_pct = round(actual_raw, 4)
         record["actual_outcome"] = actual_pct
+
+        # Grade inside the same neutral band the labels were built with. An
+        # outcome smaller than the band was excluded from training entirely, so
+        # scoring it here would measure something training never claimed.
+        threshold_pct = record.get("threshold_pct")
+        if threshold_pct is None:
+            threshold_pct = (load_metadata(ticker, interval) or {}).get("threshold_pct")
+        if threshold_pct is not None and abs(actual_raw) <= float(threshold_pct):
+            record["correct"] = None
+            record["neutral_outcome"] = True
+            resolved += 1
+            continue
+
+        # Sign the unrounded return. Rounding first sent any move under
+        # 0.00005% to exactly 0.0, which failed both comparisons below and was
+        # recorded as incorrect no matter which way price actually went.
         record["correct"] = bool(
-            actual_pct > 0 if record["direction"] == "bullish" else actual_pct < 0
+            actual_raw > 0 if record["direction"] == "bullish" else actual_raw < 0
         )
         resolved += 1
 
-    if resolved:
-        with open(path, "w") as f:
-            for r in records:
-                f.write(json.dumps(r) + "\n")
-        logger.debug("resolve_intraday_predictions: %s %s resolved %d", ticker, interval, resolved)
-    return resolved
+    if not resolved:
+        return 0
+
+    # Re-read under the lock and apply by predicted_at — see the daily twin in
+    # ml_prediction.resolve_predictions. Writing back the pre-fetch snapshot
+    # dropped any prediction appended during the fetch, and open(path, "w")
+    # left the log empty if anything failed mid-write.
+    updates = {
+        r["predicted_at"]: {
+            k: r[k] for k in ("actual_outcome", "correct", "neutral_outcome") if k in r
+        }
+        for r in pending
+        if r.get("predicted_at")
+        and (r.get("correct") is not None or r.get("neutral_outcome"))
+    }
+
+    applied = 0
+    with _jsonl_lock(path):
+        current: List[Dict[str, Any]] = []
+        with open(path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    current.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        for rec in current:
+            update = updates.get(rec.get("predicted_at"))
+            if update and rec.get("correct") is None and not rec.get("neutral_outcome"):
+                rec.update(update)
+                applied += 1
+        if applied:
+            _rewrite_jsonl_atomic(path, current)
+
+    logger.debug(
+        "resolve_intraday_predictions: %s %s resolved %d", ticker, interval, applied
+    )
+    return applied

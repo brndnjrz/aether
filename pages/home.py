@@ -40,12 +40,26 @@ def render():
         "Bear Market": "error",
     }
     banner_type = regime_colors.get(regime_label, "info")
+    # VIX may be unavailable; render that rather than a placeholder 20.0.
+    vix_current = vix.get("current")
+    vix_text = (
+        f"VIX: {vix_current:.1f} ({vix.get('regime') or 'N/A'})" if vix_current is not None
+        else "VIX: unavailable"
+    )
+    banner_body = (
+        f"Market Regime: **{regime_label}** | S&P 500 "
+        f"{regime.get('pct_from_200ma', 0):+.1f}% vs 200MA | {vix_text}"
+    )
     if banner_type == "success":
-        st.success(f"🟢 Market Regime: **{regime_label}** | S&P 500 {regime.get('pct_from_200ma', 0):+.1f}% vs 200MA | VIX: {vix.get('current', 20):.1f} ({vix.get('regime', 'N/A')})")
+        st.success(f"🟢 {banner_body}")
     elif banner_type == "warning":
-        st.warning(f"🟡 Market Regime: **{regime_label}** | S&P 500 {regime.get('pct_from_200ma', 0):+.1f}% vs 200MA | VIX: {vix.get('current', 20):.1f} ({vix.get('regime', 'N/A')})")
+        st.warning(f"🟡 {banner_body}")
     elif banner_type == "error":
-        st.error(f"🔴 Market Regime: **{regime_label}** | S&P 500 {regime.get('pct_from_200ma', 0):+.1f}% vs 200MA | VIX: {vix.get('current', 20):.1f} ({vix.get('regime', 'N/A')})")
+        st.error(f"🔴 {banner_body}")
+    else:
+        # Previously rendered nothing at all when the regime was Unknown, so a
+        # failed regime fetch made the banner silently vanish.
+        st.info(f"⚪ {banner_body}")
 
     # ── Index Cards ───────────────────────────────────────────────────────
     st.markdown("---")
@@ -54,8 +68,13 @@ def render():
         change = data.get("change_pct", 0)
         cols[i].metric(name, f"{data['price']:,.0f}", f"{change:+.2f}%")
 
-    vix_change = vix.get("current", 20) - vix.get("week_ago", 20)
-    cols[-1].metric("VIX", f"{vix.get('current', 20):.2f}", f"{vix_change:+.2f}")
+    vix_week_ago = vix.get("week_ago")
+    if vix_current is None:
+        cols[-1].metric("VIX", "—", help="Fetch failed — no value available.")
+    elif vix_week_ago is None:
+        cols[-1].metric("VIX", f"{vix_current:.2f}")
+    else:
+        cols[-1].metric("VIX", f"{vix_current:.2f}", f"{vix_current - vix_week_ago:+.2f}")
 
     # ── Regime Markov ─────────────────────────────────────────────────────
     # Reuses the same Markov model Trading Desk runs per-ticker, applied to the

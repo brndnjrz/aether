@@ -268,17 +268,21 @@ def _render_intraday_predictions_reference(ticker: str):
             untrained.append(interval)
             rows.append({
                 "Interval": interval, "Status": "— No model trained",
-                "Direction": "—", "Confidence": "—", "Probability": "—",
-                "Model Accuracy": "—", "Generated": "—",
+                "Direction": "—", "Confidence": "—", "P(call)": "—",
+                "Model Accuracy": "—", "Net edge": "—", "Generated": "—",
             })
             continue
 
-        history = get_intraday_prediction_history(ticker, interval)
+        # resolve=False: this panel is read-only, and resolve=True (the default)
+        # fires a fresh intraday fetch per interval on every rerun — four network
+        # round trips just to render a table — and rewrites the prediction log
+        # while doing it. Resolution belongs to Model Lab and the cron sweep.
+        history = get_intraday_prediction_history(ticker, interval, resolve=False)
         if history.empty:
             rows.append({
                 "Interval": interval, "Status": "— Trained, no prediction yet",
-                "Direction": "—", "Confidence": "—", "Probability": "—",
-                "Model Accuracy": "—", "Generated": "—",
+                "Direction": "—", "Confidence": "—", "P(call)": "—",
+                "Model Accuracy": "—", "Net edge": "—", "Generated": "—",
             })
             continue
 
@@ -288,12 +292,45 @@ def _render_intraday_predictions_reference(ticker: str):
         icon = _DIRECTION_ICONS.get(direction, "⚪")
         accuracy = meta.get("directional_accuracy")
         generated = latest["date"]
+        # The logged probability is P(bullish), so a bearish call at 0.22 is 78%
+        # confidence in the direction it actually called, not 22%. Showing the
+        # raw value renders a strong bearish signal as "BEARISH | High | 22%",
+        # which reads as weak. Same correction prediction_performance.py applies
+        # for calibration.
+        raw_prob = latest["probability"]
+        if pd.notna(raw_prob):
+            directional_prob = (1 - raw_prob) if direction == "bearish" else raw_prob
+            prob_display = f"{directional_prob * 100:.0f}%"
+        else:
+            prob_display = "—"
+
+        # Accuracy alone doesn't say whether a signal survives spread. The model's
+        # own cost check is already stored at train time; surface its verdict here
+        # rather than leaving a 53%-accurate, cost-negative signal looking green.
+        tradeability = meta.get("tradeability") or {}
+        net_edge = tradeability.get("net_edge_pct")
+        if net_edge is None:
+            net_display = "—"
+        else:
+            net_display = f"{'✅' if net_edge > 0 else '❌'} {net_edge:+.3f}%"
+
+        # Baseline is what "always predict the more common direction" scores.
+        # An accuracy below it is worse than a constant guess.
+        baseline = meta.get("baseline_accuracy")
+        if accuracy is None:
+            acc_display = "—"
+        elif baseline:
+            acc_display = f"{accuracy * 100:.1f}% (base {baseline * 100:.0f}%)"
+        else:
+            acc_display = f"{accuracy * 100:.1f}%"
+
         rows.append({
             "Interval": interval, "Status": "Saved prediction",
             "Direction": f"{icon} {direction.upper()}",
             "Confidence": (latest["confidence"] or "—").title() if latest["confidence"] else "—",
-            "Probability": f"{latest['probability'] * 100:.0f}%" if pd.notna(latest["probability"]) else "—",
-            "Model Accuracy": f"{accuracy * 100:.1f}%" if accuracy is not None else "—",
+            "P(call)": prob_display,
+            "Model Accuracy": acc_display,
+            "Net edge": net_display,
             "Generated": generated.tz_convert(MARKET_TZ).strftime("%m/%d %I:%M %p ET") if pd.notna(generated) else "—",
         })
 
@@ -701,9 +738,20 @@ def _render_orbc_backtest(ticker: str, config: ORBCConfig, interval: str):
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Trades", result["num_trades"])
-    c2.metric("Win Rate", f"{result['win_rate']:.1f}%")
-    c3.metric("Avg R:R", f"{result['avg_rr']:.2f}")
-    c4.metric("Total Return", f"{result['total_return_pct']:+.2f}%")
+    c2.metric("Win Rate", f"{result['win_rate']:.1f}%",
+              delta=f"{result['net_win_rate']:.1f}% net of costs")
+    if result.get("avg_rr_is_configured"):
+        c3.metric("Target R:R", f"{result['avg_rr']:.2f}",
+                  help="Your configured target, not a measured outcome — under the "
+                       "risk_reward target method every target is placed at exactly "
+                       "this multiple of risk, so it is identical for every trade.")
+    else:
+        c3.metric("Avg R:R", f"{result['avg_rr']:.2f}", help="Measured across trades.")
+    c4.metric("Total Return", f"{result['total_return_pct']:+.2f}%",
+              delta=f"{result['net_total_return_pct']:+.2f}% net",
+              help=f"Net figure charges {result['round_trip_cost_pct']:.2f}% round-trip "
+                   "cost per closed trade. Gross returns overstate any strategy whose "
+                   "average winner is a fraction of a percent.")
 
     if result["num_trades"] == 0:
         st.info("No qualifying ORBC signals fired in the available history. Try loosening the filters.")

@@ -144,8 +144,13 @@ def test_confirm_outside_the_tolerance_window_is_unconfirmed(storage):
 
 def test_tolerance_is_configurable(storage):
     times = _times(MIN_PAIRS_PER_BUCKET, start_hour=10, step_minutes=60)
+    # Confirmations land 20 minutes BEFORE each base signal. The shift used to be
+    # +20 (i.e. after), which only counted as agreement because the join was
+    # direction="nearest" — a confirmation from inside the base signal's own
+    # forward window. Tolerance still has to be configurable, but only over
+    # confirmations that already existed when the base signal fired.
     shifted = [
-        (pd.Timestamp(t) + pd.Timedelta(minutes=20)).strftime("%Y-%m-%d %H:%M")
+        (pd.Timestamp(t) - pd.Timedelta(minutes=20)).strftime("%Y-%m-%d %H:%M")
         for t in times
     ]
     _install(storage, "SPY", "15m", [_rec(t, "bullish", correct=True) for t in times])
@@ -155,6 +160,38 @@ def test_tolerance_is_configurable(storage):
     loose = backtest_agreement("SPY", tolerance_minutes=30)
     assert tight["buckets"]["unconfirmed"]["n"] == MIN_PAIRS_PER_BUCKET
     assert loose["buckets"]["agree"]["n"] == MIN_PAIRS_PER_BUCKET
+
+
+def test_a_later_confirmation_never_counts_however_wide_the_tolerance(storage):
+    """
+    A confirmation generated after the base signal is information the base signal
+    could not have had. Counting it inflates the agreement win rate with
+    hindsight, which defeats the point of measuring agreement at all.
+
+    Regression guard for the merge_asof direction: "nearest" matched either way,
+    so a 30m prediction made 20 minutes *later* — inside the 15m signal's own
+    75-minute holding window — was scored as confirming it.
+
+    Base signals are packed one minute apart so that every confirmation (+20 min)
+    falls after every base signal. That isolates the direction of the join from
+    its width: widening the tolerance must never reach forward. (A wide tolerance
+    legitimately *can* match an earlier confirmation belonging to a previous
+    signal — that is correct backward behaviour, and not what this test pins.)
+    """
+    times = _times(MIN_PAIRS_PER_BUCKET, start_hour=10, step_minutes=1)
+    later = [
+        (pd.Timestamp(t) + pd.Timedelta(minutes=20)).strftime("%Y-%m-%d %H:%M")
+        for t in times
+    ]
+    _install(storage, "SPY", "15m", [_rec(t, "bullish", correct=True) for t in times])
+    _install(storage, "SPY", "30m", [_rec(t, "bullish") for t in later])
+
+    for tol in (5, 30, 120, 600):
+        out = backtest_agreement("SPY", tolerance_minutes=tol)
+        assert out["buckets"]["agree"]["n"] == 0, (
+            f"a confirmation 20 min in the future was counted at tolerance={tol}"
+        )
+        assert out["buckets"]["unconfirmed"]["n"] == MIN_PAIRS_PER_BUCKET
 
 
 # ── thin samples ──────────────────────────────────────────────────────────────

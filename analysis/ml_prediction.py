@@ -8,7 +8,14 @@ Two-model ensemble:
   - RandomForestClassifier (secondary calibration / ensemble member)
 
 Ensemble bull probability:
-  P_bull = 0.65 * xgb_prob + 0.35 * rf_prob
+  P_bull = w_xgb * xgb_prob + w_rf * rf_prob
+
+The weights are learned per model by softmax over per-model fold accuracy and
+persisted in {ticker}_accuracy.json; 0.65/0.35 is only the fallback for a model
+trained before they were recorded. At _ENSEMBLE_SOFTMAX_TEMPERATURE=0.05 the
+learned weights can be far more lopsided than 0.65/0.35 (a 12-point accuracy gap
+gives ~0.92/0.08), which is why the reported accuracy is re-scored under them
+rather than under the fixed blend.
 
 Both models predict binary direction on a ternary-labelled dataset:
   y label mapping for training:
@@ -52,9 +59,28 @@ exact configuration a model was trained with. Models trained before this
 existed have no such keys — every reader defaults to horizon_days=5,
 neutral_threshold=0.005, hyperparam_overrides={} for backward compatibility.
 
-A model is considered reliable when:
+A model is considered reliable when all three hold:
   - mean directional accuracy >= 0.52
   - std-dev of accuracy across folds <= 0.08
+  - accuracy exceeds the majority-class baseline by >= MIN_EDGE_OVER_BASELINE
+
+That third condition is the load-bearing one. The 0.52 floor is not a real bar:
+once the neutral band drops small moves, bull-market drift leaves the majority
+class at 54-60% on a trending ticker, so "always predict up" clears 0.52 on its
+own. `_majority_class_baseline()` computes what a constant guess scores on the
+same labels, and a model that cannot beat it is reported unreliable no matter how
+its raw accuracy reads.
+
+Reported accuracy is measured under the ensemble weights that are actually
+deployed (see _score_ensemble_weights) — not the fixed 0.65/0.35 blend used to
+run the folds, which can differ sharply from the softmax weights inference uses.
+
+One caveat this module does not correct for: train_model runs three sequential
+argmax searches (label scheme, XGB hyperparameters, RF hyperparameters) all
+scored on the same history with no holdout, so the winner's accuracy is the
+maximum of many tries and is optimistic — worth roughly 7 points on data with no
+signal at all. `selection_lift` is persisted alongside the accuracy so the
+component attributable to picking the best label scheme is at least visible.
 
 Dependencies
 -----------
@@ -70,13 +96,17 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import warnings
+import fcntl
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from config.tz import now_et_iso
+from config.settings import MIN_EDGE_OVER_BASELINE
 import joblib
 import numpy as np
 import pandas as pd
@@ -149,9 +179,15 @@ _VERSION_HISTORY_COLUMNS = [
 ]
 
 
-def _versions_dir(ticker: str) -> Path:
+def _versions_dir(ticker: str, create: bool = False) -> Path:
+    """Path accessor. Pass create=True only from a writer.
+
+    This used to mkdir unconditionally, so merely *reading* version history for a
+    mistyped ticker permanently created storage/versions/<TYPO>/.
+    """
     d = _STORAGE_DIR / "versions" / ticker.upper()
-    d.mkdir(parents=True, exist_ok=True)
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
     return d
 
 
@@ -194,7 +230,7 @@ def _archive_current_version(ticker: str, acc_record: Dict[str, Any]) -> int:
         return 0
 
     version = _next_version_number(ticker)
-    versions_dir = _versions_dir(ticker)
+    versions_dir = _versions_dir(ticker, create=True)
     try:
         shutil.copy2(xgb_path, versions_dir / f"v{version}_xgb.pkl")
         shutil.copy2(rf_path, versions_dir / f"v{version}_rf.pkl")
@@ -276,7 +312,7 @@ def rollback_to_version(ticker: str, version: int) -> Dict[str, Any]:
         "new_current_version_archived": None, "error": None,
     }
 
-    versions_dir = _versions_dir(ticker)
+    versions_dir = _versions_dir(ticker, create=True)
     src_xgb = versions_dir / f"v{version}_xgb.pkl"
     src_rf = versions_dir / f"v{version}_rf.pkl"
     src_acc = versions_dir / f"v{version}_accuracy.json"
@@ -558,9 +594,23 @@ def _fit_predict_proba(
     raise ValueError(f"Unknown model kind: {kind!r}")
 
 
-def _summarize_fold_scores(fold_accs: List[float], fold_aucs: List[float], n_validation_samples: int) -> Dict[str, Any]:
+def _summarize_fold_scores(
+    fold_accs: List[float],
+    fold_aucs: List[float],
+    n_validation_samples: int,
+    baseline_accuracy: Optional[float] = None,
+) -> Dict[str, Any]:
     """Shared by every per-model and ensemble summary in _run_walk_forward_multi
-    — identical math/thresholds to the original _run_walk_forward's summary."""
+    — identical math/thresholds to the original _run_walk_forward's summary.
+
+    `baseline_accuracy` is the majority-class rate on the directional rows: what
+    "always predict the more common direction" scores without a model. After the
+    neutral band drops the small moves, bull-market drift leaves that at 54-60%
+    on a trending ticker — well above the flat 52% floor, so a model could clear
+    52% while being strictly worse than a constant guess. When supplied, the gate
+    additionally requires beating it. Left None (the per-model summaries, the
+    hyperparameter searches) the behaviour is unchanged.
+    """
     if not fold_accs:
         return {
             "n_folds": 0,
@@ -571,27 +621,46 @@ def _summarize_fold_scores(fold_accs: List[float], fold_aucs: List[float], n_val
             "is_reliable": False,
             "reliability_reason": "Walk-forward produced no valid folds — need more data",
             "fold_accuracies": [],
+            "baseline_accuracy": baseline_accuracy,
+            "edge_over_baseline": None,
         }
 
     mean_acc = float(np.mean(fold_accs))
     std_acc = float(np.std(fold_accs))
     mean_auc = float(np.mean(fold_aucs))
-    is_reliable = mean_acc >= 0.52 and std_acc <= 0.08
+
+    edge_over_baseline = None
+    beats_baseline = True
+    if baseline_accuracy is not None:
+        edge_over_baseline = mean_acc - baseline_accuracy
+        beats_baseline = edge_over_baseline >= MIN_EDGE_OVER_BASELINE
+
+    is_reliable = mean_acc >= 0.52 and std_acc <= 0.08 and beats_baseline
 
     if is_reliable:
         reason = (
             f"Consistent across {len(fold_accs)} folds — "
             f"mean accuracy {mean_acc:.1%} ± {std_acc:.1%}"
         )
+        if baseline_accuracy is not None:
+            reason += f", {edge_over_baseline:+.1%} vs the {baseline_accuracy:.1%} always-one-way baseline"
     elif mean_acc < 0.52:
         reason = (
             f"Below minimum threshold — mean accuracy {mean_acc:.1%} "
             f"(need >=52%). Treat signal as weak."
         )
+    elif not beats_baseline:
+        reason = (
+            f"No edge over the naive baseline — mean accuracy {mean_acc:.1%} vs "
+            f"{baseline_accuracy:.1%} for always predicting the more common "
+            f"direction ({edge_over_baseline:+.1%}, need >="
+            f"{MIN_EDGE_OVER_BASELINE:.0%}). The model is not beating a constant guess."
+        )
     else:
         reason = (
-            f"High variance across folds — std {std_acc:.1%} (need <=8%). "
-            f"Model is unstable across market regimes."
+            f"High variance across folds — std {std_acc:.1%} (need <=8%) over "
+            f"{n_validation_samples} validation samples. Note that with small "
+            f"folds this is largely sampling noise, not regime instability."
         )
 
     return {
@@ -603,7 +672,26 @@ def _summarize_fold_scores(fold_accs: List[float], fold_aucs: List[float], n_val
         "is_reliable": is_reliable,
         "reliability_reason": reason,
         "fold_accuracies": [round(a, 4) for a in fold_accs],
+        "baseline_accuracy": (
+            round(baseline_accuracy, 4) if baseline_accuracy is not None else None
+        ),
+        "edge_over_baseline": (
+            round(edge_over_baseline, 4) if edge_over_baseline is not None else None
+        ),
     }
+
+
+def _majority_class_baseline(y_dir: pd.Series) -> float:
+    """
+    What "always predict the more common direction" scores on these labels — the
+    reference any model has to beat to be worth running. Neutral rows are
+    excluded, matching the population the model is validated on.
+    """
+    directional = y_dir[y_dir != 0]
+    if len(directional) == 0:
+        return 0.5
+    bull_share = float((directional == 1).mean())
+    return max(bull_share, 1.0 - bull_share)
 
 
 def _run_walk_forward_multi(
@@ -645,6 +733,9 @@ def _run_walk_forward_multi(
     ensemble_fold_accs: List[float] = []
     ensemble_fold_aucs: List[float] = []
     total_val_samples = 0
+    # (y_val, {model: probs}) per fold, kept so a caller can re-score the blend
+    # under different weights without refitting — see _score_ensemble_weights.
+    fold_records: List[Tuple[np.ndarray, Dict[str, np.ndarray]]] = []
 
     for train_idx, val_idx in tscv.split(X_arr):
         if len(val_idx) < 10:
@@ -682,19 +773,63 @@ def _run_walk_forward_multi(
         except ValueError:
             ensemble_fold_aucs.append(0.5)
         total_val_samples += len(y_val)
+        fold_records.append((y_val, fold_probs))
 
     per_model_summary = {
         name: _summarize_fold_scores(per_model_fold_accs[name], per_model_fold_aucs[name], total_val_samples)
         for name in names
     }
-    ensemble_summary = _summarize_fold_scores(ensemble_fold_accs, ensemble_fold_aucs, total_val_samples)
+    ensemble_summary = _summarize_fold_scores(
+        ensemble_fold_accs, ensemble_fold_aucs, total_val_samples,
+        baseline_accuracy=_majority_class_baseline(y_dir),
+    )
 
     return {
         "n_folds": ensemble_summary["n_folds"],
         "per_model": per_model_summary,
         "ensemble_weights": ensemble_weights,
         "ensemble": ensemble_summary,
+        "_fold_records": fold_records,
+        "_total_val_samples": total_val_samples,
+        "_baseline_accuracy": _majority_class_baseline(y_dir),
     }
+
+
+def _score_ensemble_weights(
+    wf_multi: Dict[str, Any],
+    weights: Dict[str, float],
+) -> Dict[str, Any]:
+    """
+    Re-score an already-run walk-forward under a different blend, reusing each
+    fold's stored per-model probabilities. No refitting.
+
+    Needed because train_model derives its deployed ensemble weights by softmax
+    over per-model fold accuracy *after* validating, and used to keep reporting
+    the fixed-0.65/0.35 score — describing a blend inference never uses. At
+    _ENSEMBLE_SOFTMAX_TEMPERATURE=0.05 those diverge hard (a 12-point model gap
+    gives ~0.92/0.08), so the two were not interchangeable.
+
+    Caveat kept deliberately visible: `weights` fitted on these same folds makes
+    the result optimistic. It is still the right number to report, because it is
+    the one describing the model that actually runs.
+    """
+    fold_records = wf_multi.get("_fold_records") or []
+    if not fold_records:
+        return wf_multi["ensemble"]
+
+    accs: List[float] = []
+    aucs: List[float] = []
+    for y_val, fold_probs in fold_records:
+        blended = sum(weights[name] * fold_probs[name] for name in weights)
+        accs.append(_directional_accuracy(y_val, blended))
+        try:
+            aucs.append(float(roc_auc_score(y_val, blended)))
+        except ValueError:
+            aucs.append(0.5)
+    return _summarize_fold_scores(
+        accs, aucs, wf_multi.get("_total_val_samples", 0),
+        baseline_accuracy=wf_multi.get("_baseline_accuracy"),
+    )
 
 
 def _run_walk_forward(
@@ -1085,6 +1220,33 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
     ensemble_weights = _softmax_ensemble_weights({
         name: m["mean_directional_accuracy"] for name, m in wf_multi["per_model"].items()
     })
+    # Re-score under the weights that will actually be deployed. Without this,
+    # directional_accuracy/is_reliable describe the fixed 0.65/0.35 blend above
+    # while predict() runs the softmax blend — two different models.
+    wf = _score_ensemble_weights(wf_multi, ensemble_weights)
+
+    # How much of the reported accuracy came from picking the best of the label
+    # grid rather than from signal. select_label_scheme scores every candidate on
+    # the same history and keeps the argmax with no holdout, which on random
+    # walks alone is worth ~7 points — so the winner's score is not a clean
+    # estimate. Recording the gap against the grid's default entry makes the
+    # selection component visible instead of silently baked into the headline.
+    selection_lift = None
+    try:
+        default_scheme = LABEL_SEARCH_GRID[0]
+        default_score = next(
+            (
+                c["mean_accuracy"] for c in label_choice.get("candidates", [])
+                if c.get("horizon_days") == default_scheme[0]
+                and c.get("neutral_threshold") == default_scheme[1]
+            ),
+            None,
+        )
+        if default_score is not None:
+            selection_lift = round(wf["mean_directional_accuracy"] - default_score, 4)
+    except Exception as exc:
+        logger.debug("train_model: selection_lift unavailable for %s: %s", ticker, exc)
+
     logger.info(
         "train_model: validation complete — mean_acc=%.3f std=%.3f reliable=%s ensemble_weights=%s",
         wf["mean_directional_accuracy"],
@@ -1128,6 +1290,9 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
             "hyperparam_overrides": hp_overrides,
             "rf_hyperparam_overrides": rf_hp_overrides,
             "ensemble_weights": ensemble_weights,
+            "baseline_accuracy": wf.get("baseline_accuracy"),
+            "edge_over_baseline": wf.get("edge_over_baseline"),
+            "selection_lift": selection_lift,
         }
         with open(_STORAGE_DIR / f"{ticker}_accuracy.json", "w") as f_acc:
             json.dump(acc_record, f_acc)
@@ -1150,6 +1315,9 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
         "trained_at": now_iso,
         "is_reliable": wf["is_reliable"],
         "reliability_reason": wf["reliability_reason"],
+        "baseline_accuracy": wf.get("baseline_accuracy"),
+        "edge_over_baseline": wf.get("edge_over_baseline"),
+        "selection_lift": selection_lift,
         "class_balance": balance,
         "horizon_days": horizon_days,
         "neutral_threshold_pct": round(neutral_threshold * 100, 2),
@@ -1332,6 +1500,7 @@ def predict(
     horizon_days = metadata["horizon_days"]
     neutral_threshold = metadata["neutral_threshold"]
     result["horizon_days"] = horizon_days
+    result["neutral_threshold"] = neutral_threshold
     result["neutral_threshold_pct"] = round(neutral_threshold * 100, 2)
     result["hyperparam_overrides"] = metadata["hyperparam_overrides"]
     result["rf_hyperparam_overrides"] = metadata["rf_hyperparam_overrides"]
@@ -1493,7 +1662,51 @@ def predict(
     return result
 
 
-def get_prediction_history(ticker: str) -> pd.DataFrame:
+def _rewrite_jsonl_atomic(path: Path, records: List[Dict[str, Any]]) -> None:
+    """
+    Replace a JSONL file's contents without a window in which it is truncated.
+
+    `open(path, "w")` zeroes the file before the first record lands, so a crash
+    or a full disk mid-write leaves an empty prediction log — and `storage/` is
+    gitignored with no backup. Writing to a sibling temp file and renaming makes
+    the swap atomic at the filesystem level: readers see either the old contents
+    or the new ones, never nothing.
+
+    The lock is held across the read-modify-write in resolve_predictions, so a
+    concurrent Streamlit render and cron sweep cannot interleave and lose the
+    appends that landed between one's read and its write.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+@contextmanager
+def _jsonl_lock(path: Path):
+    """
+    Advisory exclusive lock for a read-modify-write cycle on a JSONL log.
+
+    resolve_predictions reads every record, makes a network call, then rewrites
+    the whole file. Without a lock, a save_prediction() landing inside that
+    window — seconds wide, because of the fetch — is erased on rewrite.
+    """
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_file.close()
+
+
+def get_prediction_history(ticker: str, resolve: bool = True) -> pd.DataFrame:
     """
     Return all stored predictions for a ticker as a sorted DataFrame.
 
@@ -1514,9 +1727,18 @@ def get_prediction_history(ticker: str) -> pd.DataFrame:
     indicator_snapshot : dict or None  (point-in-time context for failure
         categorization — see analysis/prediction_errors.py; None for
         predictions logged before this field existed)
+
+    Parameters
+    ----------
+    resolve : bool
+        When True (the default, preserving existing behaviour) back-fill any
+        elapsed predictions first. Read-only callers should pass False: resolving
+        fetches price history and rewrites this file, which is not what a caller
+        asking to *read* the log expects.
     """
     ticker = ticker.upper()
-    resolve_predictions(ticker)
+    if resolve:
+        resolve_predictions(ticker)
 
     path = _predictions_path(ticker)
     # model_accuracy/expected_move_pct/price_at_prediction were being read
@@ -1598,6 +1820,9 @@ def save_prediction(ticker: str, prediction: Dict[str, Any]) -> None:
             "model_accuracy": prediction.get("model_accuracy"),
             "expected_move_pct": prediction.get("expected_move_pct"),
             "horizon_days": prediction.get("horizon_days"),
+            # Band the model was trained under, so resolve_predictions() grades
+            # the same population directional_accuracy was measured on.
+            "neutral_threshold": prediction.get("neutral_threshold"),
             "price_at_prediction": prediction.get("price_at_prediction"),
             "indicator_snapshot": prediction.get("indicator_snapshot"),
             "actual_outcome": None,
@@ -1648,6 +1873,7 @@ def resolve_predictions(ticker: str) -> int:
     pending = [
         r for r in records
         if r.get("correct") is None
+        and not r.get("neutral_outcome")
         and r.get("direction") in ("bullish", "bearish")
         and r.get("price_at_prediction") is not None
     ]
@@ -1679,27 +1905,89 @@ def resolve_predictions(ticker: str) -> int:
             continue
         horizon = record.get("horizon_days") or 5
 
+        # A prediction older than the fetched window has no bar at or before it
+        # in `dates`, so `dates > predicted_at` would start at the very first
+        # bar and grade it against a close ~2 years after it was made.
+        if predicted_at < dates[0]:
+            logger.debug(
+                "resolve_predictions: %s prediction at %s predates the fetched "
+                "window — left unresolved", ticker, predicted_at,
+            )
+            continue
+
         future_closes = closes[dates > predicted_at]
         if len(future_closes) < horizon:
             continue  # horizon hasn't elapsed yet — leave unresolved for now
 
         entry_price = float(record["price_at_prediction"])
         exit_price = float(future_closes.iloc[horizon - 1])
-        actual_return_pct = round((exit_price - entry_price) / entry_price * 100, 2)
-
+        actual_raw = (exit_price - entry_price) / entry_price * 100
+        actual_return_pct = round(actual_raw, 2)
         record["actual_outcome"] = actual_return_pct
+
+        # Grade inside the neutral band the model was trained under.
+        # _filter_directional drops every neutral row before validation, so
+        # directional_accuracy is conditional on the move clearing the band;
+        # grading sub-band outcomes here made live accuracy measure a strictly
+        # harder question and opened a permanent gap that check_performance_
+        # drop_trigger reads as degradation.
+        neutral_threshold = record.get("neutral_threshold")
+        if neutral_threshold is None:
+            neutral_threshold = _load_model_metadata(ticker).get("neutral_threshold")
+        if neutral_threshold is not None and abs(actual_raw) <= float(neutral_threshold) * 100:
+            record["correct"] = None
+            record["neutral_outcome"] = True
+            resolved_count += 1
+            continue
+
+        # Sign the unrounded return. Rounding to 2dp first mapped any move under
+        # 0.005% to exactly 0.0, which satisfied neither branch and was stored as
+        # incorrect regardless of direction.
         record["correct"] = bool(
-            actual_return_pct > 0 if record["direction"] == "bullish" else actual_return_pct < 0
+            actual_raw > 0 if record["direction"] == "bullish" else actual_raw < 0
         )
         resolved_count += 1
 
-    if resolved_count:
-        with open(path, "w") as f:
-            for r in records:
-                f.write(json.dumps(r) + "\n")
-        logger.debug(f"resolve_predictions: {ticker} resolved {resolved_count} pending prediction(s)")
+    if not resolved_count:
+        return 0
 
-    return resolved_count
+    # Apply the resolutions to a fresh read taken under the lock, rather than
+    # writing back the snapshot captured before the price fetch. That snapshot is
+    # seconds stale — the fetch sits inside the window — so writing it back
+    # erased any prediction save_prediction() appended in the meantime.
+    updates = {
+        r["predicted_at"]: {
+            k: r[k] for k in ("actual_outcome", "correct", "neutral_outcome") if k in r
+        }
+        for r in pending
+        if r.get("predicted_at")
+        and (r.get("correct") is not None or r.get("neutral_outcome"))
+    }
+
+    applied = 0
+    with _jsonl_lock(path):
+        current: List[Dict[str, Any]] = []
+        with open(path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    current.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        for rec in current:
+            update = updates.get(rec.get("predicted_at"))
+            if update and rec.get("correct") is None and not rec.get("neutral_outcome"):
+                rec.update(update)
+                applied += 1
+        if applied:
+            _rewrite_jsonl_atomic(path, current)
+
+    logger.debug(
+        "resolve_predictions: %s resolved %d pending prediction(s)", ticker, applied
+    )
+    return applied
 
 
 def evaluate_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
@@ -1830,6 +2118,8 @@ def evaluate_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, 
     out["mean_auc"] = wf["mean_auc"]
     out["n_validation_samples"] = wf["n_validation_samples"]
     out["n_training_samples"] = len(X_dir)
+    out["baseline_accuracy"] = wf.get("baseline_accuracy")
+    out["edge_over_baseline"] = wf.get("edge_over_baseline")
 
 
     # ── Historical prediction log analysis ────────────────────────────────────

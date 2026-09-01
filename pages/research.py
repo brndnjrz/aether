@@ -20,6 +20,7 @@ from data.options_data import calculate_iv_rank
 from ai.stock_brief import generate_stock_brief, generate_thesis_prompt, format_ai_markdown
 from ai.client import ai_available
 from config.tz import now_et
+from config.settings import IVR_HIGH, IVR_LOW
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +146,12 @@ def render():
         if ml_cache_key not in st.session_state:
             with st.spinner("Running ML direction model..."):
                 try:
-                    ml_result = ml_predict(ticker, df)
+                    # persist=False: this is a page-load convenience signal
+                    # nobody asked for, and predict() defaults to appending to
+                    # the live prediction log that Model Lab, the retrain
+                    # triggers, and the horizon scoreboard all read as the
+                    # record of decisions actually taken.
+                    ml_result = ml_predict(ticker, df, persist=False)
                     logger.debug(f"[research] ML direction signal computed for {ticker}: {ml_result.get('direction')}")
                     st.session_state[ml_cache_key] = ml_result
                 except Exception as _ml_exc:
@@ -444,12 +450,29 @@ def _render_options_tab(ticker: str, price: float, regime: dict):
         st.warning("Insufficient price history for IV calculation")
         return
 
+    # An IV fetch failure used to fall through to iv_rank=50 / HV 0.0%, rendering
+    # confident premium-rich/cheap guidance built on a placeholder.
+    if iv_metrics.get("status") == "error" or iv_metrics.get("iv_rank") is None:
+        logger.warning(
+            f"[research] Options tab: IV metrics unavailable for {ticker}: "
+            f"{iv_metrics.get('error', 'unknown error')}"
+        )
+        st.error(
+            "IV metrics unavailable — the options data fetch failed. "
+            "No IV Rank is shown rather than a placeholder; retry in a moment."
+        )
+        return
+
     col1, col2, col3, col4 = st.columns(4)
-    ivr = iv_metrics.get("iv_rank", 50)
-    ivr_color = "🔴" if ivr > 60 else ("🟢" if ivr < 30 else "🟡")
-    col1.metric(f"{ivr_color} IV Rank", f"{ivr:.0f}th %ile", help="High IVR > 60 = premium rich = prefer selling")
-    col2.metric("IV Percentile", f"{iv_metrics.get('iv_percentile', 50):.0f}%")
-    col3.metric("HV 21-day", f"{iv_metrics.get('hv_21', 0):.1f}%", help="30-day historical volatility")
+    ivr = iv_metrics.get("iv_rank")
+    ivr_color = "🔴" if ivr > IVR_HIGH else ("🟢" if ivr < IVR_LOW else "🟡")
+    col1.metric(f"{ivr_color} IV Rank", f"{ivr:.0f}th %ile",
+                help=f"High IVR > {IVR_HIGH} = premium rich = prefer selling")
+    iv_pctile = iv_metrics.get("iv_percentile")
+    col2.metric("IV Percentile", f"{iv_pctile:.0f}%" if iv_pctile is not None else "—")
+    hv_21 = iv_metrics.get("hv_21")
+    col3.metric("HV 21-day", f"{hv_21:.1f}%" if hv_21 is not None else "—",
+                help="30-day historical volatility")
     col4.metric("Vol Regime", iv_metrics.get("vol_regime", "N/A"))
 
     col5, col6 = st.columns(2)

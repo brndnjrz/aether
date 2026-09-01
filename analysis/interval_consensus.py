@@ -567,15 +567,21 @@ def backtest_agreement(
 
     confirm = confirm[confirm["direction"].isin(["bullish", "bearish"])].copy()
 
-    # Nearest-in-time join on bar timestamp. merge_asof needs both sides sorted
+    # Backward-only join on bar timestamp. merge_asof needs both sides sorted
     # ascending; the history functions return newest-first.
+    #
+    # direction="backward", not "nearest": "nearest" matches in either direction,
+    # so a 15m signal could be marked "confirmed" by a 30m prediction generated up
+    # to `tolerance_minutes` *later* — from a bar that had not printed yet, often
+    # inside the base signal's own holding window. That is a confirmation you
+    # could not have acted on, and it inflates the agreement win rate.
     tol = pd.Timedelta(minutes=tolerance_minutes)
     base_sorted = base.sort_values("date")
     confirm_sorted = confirm.sort_values("date")[["date", "direction"]].rename(
         columns={"direction": "confirm_direction"}
     )
     joined = pd.merge_asof(
-        base_sorted, confirm_sorted, on="date", tolerance=tol, direction="nearest",
+        base_sorted, confirm_sorted, on="date", tolerance=tol, direction="backward",
     )
 
     agree_mask = joined["confirm_direction"] == joined["direction"]

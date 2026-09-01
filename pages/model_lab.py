@@ -138,8 +138,16 @@ def _render_dashboard(metrics: dict, ticker: str, model_label: str):
     st.caption(f"{metrics['n_resolved']} resolved / {metrics['n_total']} logged {model_label} prediction(s).")
 
     m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Accuracy", _pct(metrics["accuracy"]))
-    m2.metric("Win Rate", _pct(metrics["win_rate"]))
+    # "Win Rate" was here as a second tile, but prediction_performance aliases it
+    # to accuracy — the same number shown twice reads as independent
+    # corroboration. Sample size takes that slot instead, since it is what the
+    # accuracy actually needs to be interpreted.
+    m1.metric("Accuracy", _pct(metrics["accuracy"]),
+              help="Also reported as 'win rate' — they are the same number here: "
+                   "the share of resolved directional calls that were right.")
+    m2.metric("Resolved n", f"{metrics['n_resolved']:,}",
+              help="Accuracy over fewer than ~30 resolved predictions carries a "
+                   "margin of error wider than most edges you would act on.")
     m3.metric("Precision (macro)", _pct(metrics["precision"]["macro"]))
     m4.metric("Recall (macro)", _pct(metrics["recall"]["macro"]))
     m5.metric("F1 (macro)", _pct(metrics["f1"]["macro"]))
@@ -148,7 +156,11 @@ def _render_dashboard(metrics: dict, ticker: str, model_label: str):
     m6.metric("False Positive Rate", _pct(metrics["false_positive_rate"]["macro"]))
     m7.metric("False Negative Rate", _pct(metrics["false_negative_rate"]["macro"]))
     avg_profit = metrics["avg_profit_per_signal"]
-    m8.metric("Avg Profit / Signal", f"{avg_profit:+.2f}%" if avg_profit is not None else "—")
+    m8.metric("Avg Profit / Signal", f"{avg_profit:+.2f}%" if avg_profit is not None else "—",
+              help="Gross of costs: no spread, commission, delta leverage, or theta. "
+                   "For a signal whose average move is ~1%, a 6bp round-trip spread "
+                   "consumes most of the edge at accuracies near 52%. It also averages "
+                   "across mixed horizons.")
     holding = metrics["holding_time"]
     unit = holding["unit"] or ""
     m9.metric("Avg Holding Time", f"{holding['mean']:.1f} {unit}" if holding["mean"] is not None else "—")
@@ -318,7 +330,10 @@ def _render_daily_performance_dashboard(ticker: str):
     if not _daily_model_exists(ticker):
         st.info(f"No daily model trained yet for {ticker} — train it from Trading Desk → Predictions.")
         return
-    history = get_prediction_history(ticker)
+    # resolve=False: this page is read-only. Resolving fetches price history
+    # and rewrites the prediction log, which the page docstring promises it
+    # does not do. Trading Desk and the cron sweep own resolution.
+    history = get_prediction_history(ticker, resolve=False)
     metrics = compute_daily_prediction_metrics(ticker, history=history)
     _render_dashboard(metrics, ticker, "daily")
     if metrics["n_resolved"] > 0:
@@ -343,7 +358,7 @@ def _render_intraday_performance_dashboard(ticker: str, interval: str):
             "Trading Desk → Predictions → Intraday."
         )
         return
-    history = get_intraday_prediction_history(ticker, interval)
+    history = get_intraday_prediction_history(ticker, interval, resolve=False)
     metrics = compute_intraday_prediction_metrics(ticker, interval, history=history)
     _render_dashboard(metrics, ticker, f"{interval} intraday")
     if metrics["n_resolved"] > 0:

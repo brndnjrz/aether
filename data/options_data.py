@@ -151,7 +151,11 @@ def calculate_iv_rank(ticker: str, ttl: int = 600) -> Dict[str, Any]:
         return result
     except Exception as e:
         logger.error(f"IVR calculation error for {ticker}: {e}")
-        return {"iv_rank": 50, "iv_percentile": 50, "status": "error", "error": str(e)}
+        # No in-band sentinel. Returning iv_rank=50 here made a failed fetch
+        # indistinguishable from a genuinely mid-range reading — and since
+        # IVR_HIGH is 50, it also silently suppressed the alert. Callers must
+        # check `status` and render "unavailable" rather than a number.
+        return {"iv_rank": None, "iv_percentile": None, "status": "error", "error": str(e)}
 
 
 def get_atm_greeks(ticker: str, expiry: Optional[str] = None) -> Dict[str, Any]:

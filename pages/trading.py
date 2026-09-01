@@ -30,6 +30,7 @@ from analysis.flag_pennant_detection import detect_flag_pennant_patterns
 from analysis.backtest import macd_bullish_cross_signal, simulate_trades
 from analysis.price_projection import simulate_price_path
 from config.tz import now_et, utc_iso_to_et_str, MARKET_TZ
+from config.settings import IVR_HIGH, IVR_LOW, IV_RV_PREMIUM_THRESHOLD
 from portfolio.activity_log import log_activity
 
 logger = logging.getLogger(__name__)
@@ -153,16 +154,24 @@ def _render_daytrading():
     status_class = "aeth-status-open" if status == "MARKET OPEN" else "aeth-status-closed"
     try:
         vix_data = get_vix_data()
-        vix_val = vix_data.get("current", 20)
-        vix_regime = vix_data.get("regime", "Normal")
+        vix_val = vix_data.get("current")
+        # No "Normal" default. The failure dict carries no regime, so defaulting
+        # produced the status strip "VIX 20.0 (Normal)" out of a failed fetch.
+        vix_regime = vix_data.get("regime")
         sp_regime = get_sp500_regime().get("regime", "Unknown")
     except Exception:
-        vix_val, vix_regime, sp_regime = 20, "N/A", "N/A"
+        logger.warning("[trading] status strip: macro fetch failed", exc_info=True)
+        vix_val, vix_regime, sp_regime = None, None, "Unknown"
+
+    vix_display = (
+        f"VIX {vix_val:.1f} ({vix_regime or 'N/A'})" if vix_val is not None
+        else "VIX unavailable"
+    )
 
     st.markdown(
         f'<div class="aeth-status-strip">'
         f'<span class="{status_class}">{status}</span> &nbsp;|&nbsp; '
-        f'VIX {vix_val:.1f} ({vix_regime}) &nbsp;|&nbsp; '
+        f'{vix_display} &nbsp;|&nbsp; '
         f'S&P Regime: {sp_regime} &nbsp;|&nbsp; '
         f'⏰ {now_et().strftime("%I:%M %p ET")}'
         f'</div>',
@@ -884,18 +893,38 @@ def _render_options():
             "upcoming event (earnings); Contango (far-term > near-term) is the normal state."
         )
     c1, c2, c3, c4, c5 = st.columns(5)
-    ivr = iv_metrics.get("iv_rank", 50)
-    ivr_signal = "🔴 Sell Premium" if ivr > 60 else ("🟢 Buy Premium" if ivr < 30 else "🟡 Neutral")
-    c1.metric("IV Rank", f"{ivr:.0f}", ivr_signal)
-    c2.metric("IV Percentile", f"{iv_metrics.get('iv_percentile', 50):.0f}%")
-    c3.metric("ATM IV (Live)", f"{iv_metrics.get('atm_iv', 0) or 0:.1f}%")
-    c4.metric("HV 21-day", f"{iv_metrics.get('hv_21', 0):.1f}%")
-    c5.metric("Term Structure", iv_metrics.get("term_structure", "Flat"))
+    ivr = iv_metrics.get("iv_rank")
+    if ivr is None:
+        # Was iv_metrics.get("iv_rank", 50), so a failed options fetch rendered
+        # "IV Rank 50 / 🟡 Neutral" and "HV 21-day 0.0%" as though real.
+        logger.warning(
+            "[trading] Options tab: IV metrics unavailable for %s: %s",
+            ticker, iv_metrics.get("error", "unknown error"),
+        )
+        st.error(
+            "IV metrics unavailable — the options data fetch failed. Showing no "
+            "IV Rank rather than a placeholder value; retry in a moment."
+        )
+    else:
+        # IVR_HIGH/IVR_LOW, not bare literals — this used to say 60, while
+        # scripts/alert_sweep.py used IVR_HIGH=50, so an IV rank of 55 read
+        # "Neutral" here and fired a sell-premium alert from cron on the same day.
+        ivr_signal = (
+            "🔴 Sell Premium" if ivr > IVR_HIGH
+            else ("🟢 Buy Premium" if ivr < IVR_LOW else "🟡 Neutral")
+        )
+        iv_pctile = iv_metrics.get("iv_percentile")
+        hv_21 = iv_metrics.get("hv_21")
+        c1.metric("IV Rank", f"{ivr:.0f}", ivr_signal)
+        c2.metric("IV Percentile", f"{iv_pctile:.0f}%" if iv_pctile is not None else "—")
+        c3.metric("ATM IV (Live)", f"{iv_metrics.get('atm_iv', 0) or 0:.1f}%")
+        c4.metric("HV 21-day", f"{hv_21:.1f}%" if hv_21 is not None else "—")
+        c5.metric("Term Structure", iv_metrics.get("term_structure", "Flat"))
 
     iv_rv = iv_metrics.get("iv_rv_ratio")
-    if iv_rv and iv_rv > 1.15:
+    if iv_rv and iv_rv > IV_RV_PREMIUM_THRESHOLD:
         st.warning(f"IV/RV Ratio {iv_rv:.2f}x — options premium is elevated vs realized volatility. Systematic edge in selling premium.")
-    elif iv_rv and iv_rv < 0.85:
+    elif iv_rv and iv_rv < (2 - IV_RV_PREMIUM_THRESHOLD):
         st.success(f"IV/RV Ratio {iv_rv:.2f}x — options are cheap vs realized volatility. Better to buy than sell.")
 
     garch_vol = iv_metrics.get("garch_forecast_vol")
@@ -1304,7 +1333,26 @@ def _render_model_performance(eval_result: dict, ticker: str):
         st.markdown("")
 
         m1, m2 = st.columns(2)
-        m1.metric("Directional Accuracy", f"{dir_acc * 100:.1f}%", delta=f"{(dir_acc - 0.50) * 100:+.1f}% edge")
+        # Edge is measured against the naive always-one-way baseline, not a flat
+        # 50%. After the neutral band drops small moves, drift puts the majority
+        # class at 54-60% on a trending ticker, so "accuracy - 50%" reported a
+        # healthy edge for models that were losing to a constant guess.
+        baseline = eval_result.get("baseline_accuracy")
+        if baseline:
+            m1.metric(
+                "Directional Accuracy", f"{dir_acc * 100:.1f}%",
+                delta=f"{(dir_acc - baseline) * 100:+.1f}% vs baseline",
+                help=(
+                    f"Baseline {baseline * 100:.1f}% = always predicting the more common "
+                    "direction on this ticker's labels. That, not 50%, is what the model "
+                    "has to beat to be worth trading."
+                ),
+            )
+        else:
+            m1.metric(
+                "Directional Accuracy", f"{dir_acc * 100:.1f}%",
+                help="Retrain this model to record its naive baseline for comparison.",
+            )
         m2.metric("ROC-AUC", f"{auc:.3f}", delta=f"{(auc - 0.5):.3f} above random")
         m3, m4 = st.columns(2)
         m3.metric("Total Predictions", f"{n_preds:,}", help="Out-of-sample events across all WF folds")
