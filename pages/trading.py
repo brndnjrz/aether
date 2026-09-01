@@ -1948,15 +1948,23 @@ def _render_horizon_cockpit():
 
     ctl1, ctl2 = st.columns([2, 1])
     with ctl1:
+        # Defaults ON. The shares cost model ignores delta leverage and has no
+        # theta term, so for anyone actually trading contracts its verdict is not
+        # conservative — it is wrong in the optimistic direction. On a 30 DTE ATM
+        # SPY option theta alone runs ~6% of premium over five days against a
+        # modelled net near -5.5%, so "tradeable" under the shares model and
+        # "loses money as an option" routinely coincide. Four chain fetches cached
+        # ten minutes is a cheap price for not being misled about that.
         price_with_options = st.checkbox(
             "Price with live options quotes",
-            value=st.session_state.get("cockpit_use_options", False),
+            value=st.session_state.get("cockpit_use_options", True),
             key="cockpit_use_options",
             help=(
-                "Off: costs come from the stored shares model (2 bps round trip), which "
-                "ignores delta leverage and has no theta term — wrong for contracts. "
-                "On: fetches an ATM expiry ladder and prices each horizon as an actual "
-                "option, sweeping 0/2/7/30 DTE. Costs four chain fetches, cached 10 min."
+                "On (default): fetches an ATM expiry ladder and prices each horizon as "
+                "an actual option, sweeping 0/2/7/30 DTE. Costs four chain fetches, "
+                "cached 10 min. Off: costs come from the stored shares model (2 bps "
+                "round trip), which ignores delta leverage and has no theta term — "
+                "optimistic for contracts, not conservative."
             ),
         )
     with ctl2:

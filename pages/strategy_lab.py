@@ -307,6 +307,12 @@ def _render_intraday_predictions_reference(ticker: str):
         # Accuracy alone doesn't say whether a signal survives spread. The model's
         # own cost check is already stored at train time; surface its verdict here
         # rather than leaving a 53%-accurate, cost-negative signal looking green.
+        #
+        # This is assess_tradeability, which models cost in *underlying* percentage
+        # points: no delta leverage, no theta. It is the right check for shares and
+        # optimistic for contracts. The options-aware sweep needs live chain quotes,
+        # which would mean a network fetch per interval on every rerun — so it lives
+        # on Trading Desk's Horizon Cockpit, and the column is labelled accordingly.
         tradeability = meta.get("tradeability") or {}
         net_edge = tradeability.get("net_edge_pct")
         if net_edge is None:
@@ -335,6 +341,15 @@ def _render_intraday_predictions_reference(ticker: str):
         })
 
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    st.caption(
+        "**Net edge** prices the signal as *shares* — a 2 bps round-trip spread, no "
+        "delta leverage and no time decay. For contracts it is optimistic, not "
+        "conservative: on a 30 DTE ATM option theta alone can run ~6% of premium over "
+        "five days. For the options-priced verdict across the expiry ladder, use "
+        "Trading Desk → Predictions → Horizon Cockpit. **Model Accuracy** shows the "
+        "naive always-one-way baseline beside it; accuracy at or below that baseline "
+        "is not an edge regardless of how high it reads."
+    )
 
     if untrained:
         st.info(
