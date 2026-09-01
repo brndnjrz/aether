@@ -106,7 +106,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from config.tz import now_et_iso
-from config.settings import MIN_EDGE_OVER_BASELINE
+from config.settings import (
+    HOLDOUT_FRACTION,
+    MIN_EDGE_OVER_BASELINE,
+    MIN_HOLDOUT_SAMPLES,
+)
 import joblib
 import numpy as np
 import pandas as pd
@@ -1070,6 +1074,109 @@ def select_rf_hyperparams(
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+def _evaluate_on_holdout(
+    df: pd.DataFrame,
+    ticker: str,
+    horizon_days: int,
+    neutral_threshold: float,
+    xgb_cfg: Dict[str, Any],
+    rf_cfg: Dict[str, Any],
+    ensemble_weights: Dict[str, float],
+    search_end: pd.Timestamp,
+) -> Dict[str, Any]:
+    """
+    Fit on everything up to `search_end` and score the untouched tail.
+
+    This is the only number in train_model that no search stage influenced.
+    Everything else — the label scheme, both hyperparameter grids, the ensemble
+    weights — was chosen by maximizing over data that the walk-forward then
+    reported on, so those figures are upper bounds. Here the configuration is
+    fixed first and the data is seen once.
+
+    A `horizon_days` gap is dropped after `search_end`: the last training rows'
+    label windows extend forward, so without it the first holdout rows overlap
+    outcomes the model was fitted on.
+
+    Returns {"accuracy", "n", "baseline_accuracy", "edge_over_baseline",
+    "ci95_halfwidth", "reason"} — accuracy None when the tail is too small to say
+    anything, with `reason` explaining why.
+    """
+    out: Dict[str, Any] = {
+        "accuracy": None, "n": 0, "baseline_accuracy": None,
+        "edge_over_baseline": None, "ci95_halfwidth": None, "reason": None,
+        "holdout_start": None,
+    }
+    try:
+        X_all, y_all = build_features(
+            df, ticker=ticker,
+            forward_bars=horizon_days, neutral_threshold=neutral_threshold,
+        )
+    except (ValueError, KeyError) as exc:
+        out["reason"] = f"Could not build holdout features: {exc}"
+        return out
+
+    X_dir, y_dir = _filter_directional(X_all, y_all)
+    if X_dir.empty:
+        out["reason"] = "No directional rows available."
+        return out
+
+    # Features are built over the whole frame so rolling windows keep their
+    # warm-up; the split is applied afterwards, by timestamp.
+    gap_end = search_end + pd.Timedelta(days=horizon_days)
+    train_mask = X_dir.index <= search_end
+    test_mask = X_dir.index > gap_end
+
+    n_train, n_test = int(train_mask.sum()), int(test_mask.sum())
+    out["n"] = n_test
+    if n_test:
+        out["holdout_start"] = X_dir.index[test_mask][0].isoformat()
+    if n_train < 50:
+        out["reason"] = f"Only {n_train} rows before the holdout split — need >=50."
+        return out
+    if n_test < MIN_HOLDOUT_SAMPLES:
+        out["reason"] = (
+            f"Only {n_test} holdout rows (need >={MIN_HOLDOUT_SAMPLES}) — too few to "
+            "estimate accuracy from. Reliability falls back to walk-forward."
+        )
+        return out
+
+    X_tr = X_dir.loc[train_mask, FEATURE_NAMES].values.astype("float32")
+    y_tr = _to_binary_labels(y_dir.loc[train_mask])
+    X_te = X_dir.loc[test_mask, FEATURE_NAMES].values.astype("float32")
+    y_te = _to_binary_labels(y_dir.loc[test_mask])
+
+    if len(np.unique(y_tr)) < 2 or len(np.unique(y_te)) < 2:
+        out["reason"] = "Holdout or training split is single-class."
+        return out
+
+    try:
+        xgb_probs = _fit_predict_proba("xgb", xgb_cfg, X_tr, y_tr, X_te, y_te)
+        rf_probs = _fit_predict_proba("rf", rf_cfg, X_tr, y_tr, X_te, y_te)
+    except Exception as exc:
+        out["reason"] = f"Holdout fit failed: {exc}"
+        return out
+
+    blended = (
+        ensemble_weights.get("xgb", 0.65) * xgb_probs
+        + ensemble_weights.get("rf", 0.35) * rf_probs
+    )
+    accuracy = _directional_accuracy(y_te, blended)
+    baseline = _majority_class_baseline(y_dir.loc[test_mask])
+
+    out.update({
+        "accuracy": round(float(accuracy), 4),
+        "baseline_accuracy": round(float(baseline), 4),
+        "edge_over_baseline": round(float(accuracy - baseline), 4),
+        # Binomial standard error at the observed rate. Reported so a 70% over 45
+        # rows is not read as though it were 70% over 4500.
+        "ci95_halfwidth": round(
+            float(1.96 * np.sqrt(max(accuracy * (1 - accuracy), 1e-9) / n_test)), 4
+        ),
+        "reason": f"Fitted on {n_train} rows through {search_end.date()}, scored on {n_test} later rows.",
+    })
+    return out
+
+
 def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     """
     Train the XGBoost + RandomForest ensemble on price data for a given ticker.
@@ -1150,6 +1257,28 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
 
     logger.info("train_model: starting for %s (%d bars)", ticker, len(df) if df is not None else 0)
 
+    # ── Carve the holdout out BEFORE any search sees the data ─────────────────
+    # Every search stage below maximizes over what it is scored on, so a number
+    # produced from the same rows is an upper bound. df_search is what the
+    # searches get; the tail after it is scored once, at the end, by
+    # _evaluate_on_holdout. If there isn't enough history to spare, the holdout
+    # is skipped and reporting falls back to walk-forward with that stated.
+    df_search = df
+    search_end = None
+    if len(df) >= 300:
+        split_idx = int(len(df) * (1 - HOLDOUT_FRACTION))
+        df_search = df.iloc[:split_idx]
+        search_end = df_search.index[-1]
+        logger.info(
+            "train_model: %s holding out %d of %d bars (searches see through %s)",
+            ticker, len(df) - split_idx, len(df), search_end.date(),
+        )
+    else:
+        logger.info(
+            "train_model: %s only %d bars — no holdout, walk-forward only",
+            ticker, len(df),
+        )
+
     # ── Search for the best label horizon/threshold for this ticker ───────────
     # Catches both ValueError (raised deliberately by build_features() for
     # too-few-rows) and KeyError (raised by pandas when df is missing expected
@@ -1158,7 +1287,7 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
     # bugs in the search itself, so both should degrade to a structured error
     # dict rather than propagate as an uncaught exception.
     try:
-        label_choice = select_label_scheme(df, ticker)
+        label_choice = select_label_scheme(df_search, ticker)
     except (ValueError, KeyError) as exc:
         logger.warning(f"train_model: label scheme search failed for {ticker}: {exc}")
         if isinstance(exc, KeyError):
@@ -1247,6 +1376,78 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
     except Exception as exc:
         logger.debug("train_model: selection_lift unavailable for %s: %s", ticker, exc)
 
+    # ── Out-of-sample check on the withheld tail ──────────────────────────────
+    # The configuration is fixed at this point, so this is the one number no
+    # search stage influenced. When it has enough rows it, not the walk-forward,
+    # decides is_reliable — the walk-forward figure carries the selection bias
+    # that selection_lift only makes visible.
+    holdout = {"accuracy": None, "n": 0, "reason": "No holdout — insufficient history."}
+    if search_end is not None:
+        holdout = _evaluate_on_holdout(
+            df, ticker, horizon_days, neutral_threshold,
+            xgb_cfg, rf_cfg, ensemble_weights, search_end,
+        )
+        if holdout["accuracy"] is None:
+            logger.warning("train_model: %s holdout unusable — %s", ticker, holdout["reason"])
+        else:
+            logger.info(
+                "train_model: %s holdout accuracy=%.3f (n=%d, +/-%.1f%% at 95%%) "
+                "vs walk-forward %.3f — gap %+.3f",
+                ticker, holdout["accuracy"], holdout["n"],
+                holdout["ci95_halfwidth"] * 100,
+                wf["mean_directional_accuracy"],
+                holdout["accuracy"] - wf["mean_directional_accuracy"],
+            )
+
+    # Prefer the honest estimate for the gate when it is usable.
+    if holdout["accuracy"] is not None:
+        edge = holdout["edge_over_baseline"]
+        # The edge must clear both a floor and the sampling noise of the holdout
+        # itself. A fixed 2-point bar is meaningless at n=75, where the 95%
+        # interval on the accuracy is around +/-11 points — a model with no edge
+        # at all lands several points above baseline by luck routinely. Measured
+        # on drift-free random walks, the fixed bar alone passed 2 of 5; adding
+        # this term rejects the ones whose apparent edge is inside their own
+        # error bar.
+        #
+        # This uses the interval on the accuracy as a stand-in for the interval on
+        # the difference. Baseline is estimated from the same rows, so the two are
+        # correlated and this is a heuristic rather than an exact test — but it is
+        # scaled to the sample, which the fixed threshold was not.
+        required_edge = max(MIN_EDGE_OVER_BASELINE, holdout["ci95_halfwidth"] or 0.0)
+        is_reliable = bool(
+            holdout["accuracy"] >= 0.52
+            and edge is not None
+            and edge >= required_edge
+        )
+        if is_reliable:
+            reliability_reason = (
+                f"Holdout accuracy {holdout['accuracy']:.1%} on {holdout['n']} unseen rows "
+                f"(+/-{holdout['ci95_halfwidth']:.1%}), {edge:+.1%} vs the "
+                f"{holdout['baseline_accuracy']:.1%} always-one-way baseline — "
+                "an edge larger than the holdout's own error bar."
+            )
+        elif holdout["accuracy"] < 0.52:
+            reliability_reason = (
+                f"Holdout accuracy {holdout['accuracy']:.1%} on {holdout['n']} unseen rows "
+                f"is below the 52% floor, despite {wf['mean_directional_accuracy']:.1%} "
+                "in-search. Treat the in-search figure as selection, not signal."
+            )
+        elif edge is not None and edge < MIN_EDGE_OVER_BASELINE:
+            reliability_reason = (
+                f"Holdout accuracy {holdout['accuracy']:.1%} does not beat the "
+                f"{holdout['baseline_accuracy']:.1%} always-one-way baseline by "
+                f"{MIN_EDGE_OVER_BASELINE:.0%} ({edge:+.1%}). Not better than a constant guess."
+            )
+        else:
+            reliability_reason = (
+                f"Holdout edge {edge:+.1%} over the {holdout['baseline_accuracy']:.1%} "
+                f"baseline is inside the sampling noise of {holdout['n']} rows "
+                f"(+/-{holdout['ci95_halfwidth']:.1%}). Indistinguishable from luck — "
+                "needs more history, not a retrain."
+            )
+        wf = {**wf, "is_reliable": is_reliable, "reliability_reason": reliability_reason}
+
     logger.info(
         "train_model: validation complete — mean_acc=%.3f std=%.3f reliable=%s ensemble_weights=%s",
         wf["mean_directional_accuracy"],
@@ -1256,8 +1457,33 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
     )
 
     # ── Final model trained on ALL directional data (18 core features only) ───
-    X_arr = X_dir_18.values.astype("float32")
-    y_binary = _to_binary_labels(y_dir)
+    # Including the holdout. The holdout exists to produce an unbiased *estimate*;
+    # once that estimate is recorded there is no reason to ship a model fitted on
+    # 80% of the history. Standard practice: measure on unseen data, then refit on
+    # everything for deployment. X_dir_18 above came from df_search only, so
+    # rebuild over the full frame using the already-chosen label scheme.
+    X_fit, y_fit = X_dir_18, y_dir
+    if search_end is not None:
+        try:
+            X_full, y_full = build_features(
+                df, ticker=ticker,
+                forward_bars=horizon_days, neutral_threshold=neutral_threshold,
+            )
+            X_full_dir, y_full_dir = _filter_directional(X_full, y_full)
+            if len(X_full_dir) > len(X_dir_18):
+                X_fit, y_fit = X_full_dir[FEATURE_NAMES], y_full_dir
+                logger.info(
+                    "train_model: %s final fit on %d rows (search set was %d)",
+                    ticker, len(X_fit), len(X_dir_18),
+                )
+        except (ValueError, KeyError) as exc:
+            logger.warning(
+                "train_model: %s could not rebuild full training set (%s) — "
+                "final model fits the search set only", ticker, exc,
+            )
+
+    X_arr = X_fit.values.astype("float32")
+    y_binary = _to_binary_labels(y_fit)
 
     if _XGBOOST_AVAILABLE:
         xgb_final = XGBClassifier(**xgb_cfg)
@@ -1293,6 +1519,14 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
             "baseline_accuracy": wf.get("baseline_accuracy"),
             "edge_over_baseline": wf.get("edge_over_baseline"),
             "selection_lift": selection_lift,
+            # The unbiased estimate. directional_accuracy above is an upper
+            # bound; this is what the model scored on rows no search stage saw.
+            "holdout_accuracy": holdout["accuracy"],
+            "holdout_n": holdout["n"],
+            "holdout_baseline_accuracy": holdout.get("baseline_accuracy"),
+            "holdout_edge_over_baseline": holdout.get("edge_over_baseline"),
+            "holdout_ci95_halfwidth": holdout.get("ci95_halfwidth"),
+            "holdout_note": holdout.get("reason"),
         }
         with open(_STORAGE_DIR / f"{ticker}_accuracy.json", "w") as f_acc:
             json.dump(acc_record, f_acc)
@@ -1310,7 +1544,7 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
         "directional_accuracy": wf["mean_directional_accuracy"],
         "accuracy_std": wf["std_directional_accuracy"],
         "mean_auc": wf["mean_auc"],
-        "n_train": len(X_dir_18),
+        "n_train": len(X_fit),
         "n_test": wf["n_validation_samples"],
         "trained_at": now_iso,
         "is_reliable": wf["is_reliable"],
@@ -1318,6 +1552,12 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
         "baseline_accuracy": wf.get("baseline_accuracy"),
         "edge_over_baseline": wf.get("edge_over_baseline"),
         "selection_lift": selection_lift,
+        "holdout_accuracy": holdout["accuracy"],
+        "holdout_n": holdout["n"],
+        "holdout_baseline_accuracy": holdout.get("baseline_accuracy"),
+        "holdout_edge_over_baseline": holdout.get("edge_over_baseline"),
+        "holdout_ci95_halfwidth": holdout.get("ci95_halfwidth"),
+        "holdout_note": holdout.get("reason"),
         "class_balance": balance,
         "horizon_days": horizon_days,
         "neutral_threshold_pct": round(neutral_threshold * 100, 2),

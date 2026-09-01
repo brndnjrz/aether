@@ -2575,11 +2575,49 @@ def _render_daily_predictions():
             acc_std = train_result.get("accuracy_std") or 0.0
             reliable = train_result.get("is_reliable", False)
             reliable_icon = "✅" if reliable else "⚠️"
+            holdout_acc = train_result.get("holdout_accuracy")
+            holdout_n = train_result.get("holdout_n") or 0
             logger.info(
-                f"[trading] ML model trained for {ticker}: accuracy={mean_acc * 100:.1f}% "
-                f"± {acc_std * 100:.1f}% reliable={reliable}"
+                f"[trading] ML model trained for {ticker}: in-search={mean_acc * 100:.1f}% "
+                f"± {acc_std * 100:.1f}% holdout={holdout_acc} (n={holdout_n}) reliable={reliable}"
             )
-            st.success(f"Model trained successfully for **{ticker}**. {reliable_icon} Walk-forward accuracy: **{mean_acc * 100:.1f}% ± {acc_std * 100:.1f}%**")
+
+            # Lead with the holdout figure. The walk-forward number is the winner
+            # of three stacked searches scored on their own data, so it is an
+            # upper bound; the holdout is the only number no search stage touched.
+            if holdout_acc is not None:
+                ci = train_result.get("holdout_ci95_halfwidth") or 0.0
+                base = train_result.get("holdout_baseline_accuracy")
+                msg = (
+                    f"Model trained for **{ticker}**. {reliable_icon} "
+                    f"**Out-of-sample accuracy: {holdout_acc * 100:.1f}%** "
+                    f"(±{ci * 100:.1f}%, n={holdout_n})"
+                )
+                if base:
+                    msg += f" vs a {base * 100:.1f}% always-one-way baseline"
+                if reliable:
+                    st.success(msg)
+                else:
+                    st.warning(msg)
+                st.caption(
+                    f"In-search walk-forward reads {mean_acc * 100:.1f}% ± {acc_std * 100:.1f}%. "
+                    "That figure is the best of three searches scored on the same history, so "
+                    "treat it as a ceiling — the out-of-sample number above is the estimate to "
+                    "size on. Its error bar is wide because the holdout is small."
+                )
+            else:
+                st.success(
+                    f"Model trained for **{ticker}**. {reliable_icon} Walk-forward accuracy: "
+                    f"**{mean_acc * 100:.1f}% ± {acc_std * 100:.1f}%**"
+                )
+                note = train_result.get("holdout_note")
+                st.caption(
+                    "No out-of-sample estimate available"
+                    + (f" — {note}" if note else "")
+                    + " In-search accuracy is selection-biased upward; treat it as a ceiling."
+                )
+            if train_result.get("reliability_reason"):
+                st.caption(train_result["reliability_reason"])
 
             st.session_state.pop(_cache_key(ticker), None)
             st.session_state.pop(_eval_cache_key(ticker), None)

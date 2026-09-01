@@ -326,10 +326,81 @@ def _render_retrain_triggers(ticker: str, interval: str = None):
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
 
+def _render_training_provenance(ticker: str, interval: str = None):
+    """
+    What the model claimed about itself at train time, as opposed to what its live
+    predictions have since done. Kept next to the live metrics because the two
+    disagreeing is the single most useful thing this page can show — and because
+    the in-search figure alone reads as far more settled than it is.
+    """
+    if interval is None:
+        from analysis.ml_prediction import _load_model_metadata
+        meta = _load_model_metadata(ticker)
+    else:
+        from analysis.intraday_prediction import load_metadata
+        meta = load_metadata(ticker, interval) or {}
+
+    in_search = meta.get("directional_accuracy")
+    if in_search is None:
+        return
+
+    st.markdown("**At training time**")
+    holdout = meta.get("holdout_accuracy")
+    c1, c2, c3 = st.columns(3)
+
+    if holdout is not None:
+        ci = meta.get("holdout_ci95_halfwidth") or 0.0
+        n = meta.get("holdout_n") or 0
+        c1.metric(
+            "Out-of-sample", f"{holdout * 100:.1f}%",
+            delta=f"±{ci * 100:.1f}% (n={n})", delta_color="off",
+            help="Scored on the most recent slice of history that no search stage "
+                 "was allowed to see. This is the estimate to size on.",
+        )
+    else:
+        c1.metric("Out-of-sample", "—",
+                  help=meta.get("holdout_note") or
+                       "Not recorded — retrain to produce an out-of-sample estimate.")
+
+    c2.metric(
+        "In-search", f"{in_search * 100:.1f}%",
+        help="Walk-forward accuracy of the winning configuration, measured on the "
+             "same history the label and hyperparameter searches picked it from. "
+             "A ceiling, not a forecast.",
+    )
+
+    lift = meta.get("selection_lift")
+    if lift is not None:
+        c3.metric(
+            "From search", f"{lift * 100:+.1f}%",
+            help="How much of the in-search figure came from choosing the best "
+                 "label scheme rather than from signal. On data with no signal "
+                 "at all this averages about +7 points.",
+        )
+    else:
+        base = meta.get("baseline_accuracy")
+        c3.metric(
+            "Naive baseline", f"{base * 100:.1f}%" if base else "—",
+            help="What always predicting the more common direction scores.",
+        )
+
+    if holdout is not None and in_search is not None:
+        gap = in_search - holdout
+        if abs(gap) >= 0.10:
+            st.caption(
+                f"In-search and out-of-sample differ by {gap * 100:+.1f} points. "
+                "On a holdout this small that is mostly sampling noise rather than "
+                "evidence of overfitting — but it is why the in-search number "
+                "should not be read as precise."
+            )
+    st.markdown("---")
+
+
 def _render_daily_performance_dashboard(ticker: str):
     if not _daily_model_exists(ticker):
         st.info(f"No daily model trained yet for {ticker} — train it from Trading Desk → Predictions.")
         return
+    _render_training_provenance(ticker)
     # resolve=False: this page is read-only. Resolving fetches price history
     # and rewrites the prediction log, which the page docstring promises it
     # does not do. Trading Desk and the cron sweep own resolution.
@@ -358,6 +429,7 @@ def _render_intraday_performance_dashboard(ticker: str, interval: str):
             "Trading Desk → Predictions → Intraday."
         )
         return
+    _render_training_provenance(ticker, interval)
     history = get_intraday_prediction_history(ticker, interval, resolve=False)
     metrics = compute_intraday_prediction_metrics(ticker, interval, history=history)
     _render_dashboard(metrics, ticker, f"{interval} intraday")

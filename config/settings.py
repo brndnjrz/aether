@@ -77,6 +77,24 @@ IV_RV_PREMIUM_THRESHOLD = 1.15  # IV 15% > RV = potentially rich premium
 # ml_prediction._summarize_fold_scores.
 MIN_EDGE_OVER_BASELINE = 0.02
 
+# Fraction of the most recent history withheld from every search stage in
+# train_model, used once at the end to produce an out-of-sample accuracy.
+#
+# Needed because train_model runs three sequential argmax searches (label scheme,
+# XGB params, RF params) all scored on the same data with no holdout. The winner
+# of many tries is not an unbiased estimate — measured at ~7 points on random
+# walks with no signal at all. The walk-forward number is therefore an upper
+# bound, not a forecast; holdout_accuracy is the honest one.
+#
+# 0.2 of two years is ~100 bars, ~70 after the neutral band, so the holdout
+# estimate is unbiased but wide (roughly +/-12 points at 95%). Both the value and
+# its sample size are reported so it cannot be read as precise.
+HOLDOUT_FRACTION = 0.2
+
+# Below this many holdout samples the estimate is too noisy to gate on, so
+# is_reliable falls back to the walk-forward number and says so.
+MIN_HOLDOUT_SAMPLES = 40
+
 STORAGE_DIR = os.path.join(os.path.dirname(__file__), "..", "storage")
 
 # Model retraining triggers (Prediction Improvement Engine, Phase 8)
