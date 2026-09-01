@@ -555,6 +555,58 @@ def _softmax_ensemble_weights(
     return {n: round(float(w), 4) for n, w in zip(names, weights)}
 
 
+def _average_uniqueness(
+    retained_index: pd.Index,
+    full_index: pd.Index,
+    horizon: int,
+) -> np.ndarray:
+    """
+    Per-row weight correcting for overlapping label windows.
+
+    Row t's label is the return over bars (t, t+horizon], so consecutive rows
+    share horizon-1 bars of outcome. Fitting them as independent observations
+    lets redundant information dominate.
+
+    With a fixed horizon and *every* bar labelled this would be near-constant and
+    pointless. It is not constant here: _filter_directional drops neutral rows
+    first, so the retained rows are unevenly spaced. A row inside a dense cluster
+    — a volatile stretch where many moves cleared the band — overlaps many other
+    retained rows and currently carries as much weight as an isolated row whose
+    outcome is entirely its own. That systematically over-weights high-volatility
+    regimes in the fit.
+
+    Follows the average-uniqueness construction in Lopez de Prado, AFML ch. 4:
+    concurrency at a bar is how many retained labels span it; a row's weight is
+    the mean of 1/concurrency across its own span. Normalized to mean 1 so the
+    effective learning rate does not change with horizon.
+    """
+    positions = full_index.get_indexer(retained_index)
+    valid = positions >= 0
+    if not valid.all():
+        # Rows whose bars aren't in the reference frame can't have their overlap
+        # measured; give them neutral weight rather than dropping them.
+        positions = np.where(valid, positions, -1)
+
+    span_end = len(full_index) + horizon + 2
+    concurrency = np.zeros(span_end, dtype=np.float64)
+    for p in positions[valid]:
+        concurrency[p + 1 : p + 1 + horizon] += 1.0
+
+    weights = np.ones(len(positions), dtype=np.float64)
+    for i, p in enumerate(positions):
+        if p < 0:
+            continue
+        span = concurrency[p + 1 : p + 1 + horizon]
+        span = span[span > 0]
+        if len(span):
+            weights[i] = float(np.mean(1.0 / span))
+
+    mean_w = weights.mean()
+    if mean_w > 0:
+        weights = weights / mean_w
+    return weights
+
+
 def _fit_predict_proba(
     kind: str,
     config: Dict[str, Any],
@@ -562,6 +614,7 @@ def _fit_predict_proba(
     y_train: np.ndarray,
     X_val: np.ndarray,
     y_val: np.ndarray,
+    sample_weight: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Fit one model kind for one walk-forward fold, return predict_proba's
@@ -575,25 +628,26 @@ def _fit_predict_proba(
     if kind == "xgb":
         if _XGBOOST_AVAILABLE:
             m = XGBClassifier(**config)
-            m.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+            m.fit(X_train, y_train, sample_weight=sample_weight,
+                  eval_set=[(X_val, y_val)], verbose=False)
         else:
             m = RandomForestClassifier(**_rf_config())
-            m.fit(X_train, y_train)
+            m.fit(X_train, y_train, sample_weight=sample_weight)
         return m.predict_proba(X_val)[:, 1]
     if kind == "rf":
         m = RandomForestClassifier(**config)
-        m.fit(X_train, y_train)
+        m.fit(X_train, y_train, sample_weight=sample_weight)
         return m.predict_proba(X_val)[:, 1]
     if kind == "logreg":
         scaler = StandardScaler()
         X_train_scaled = scaler.fit_transform(X_train)
         X_val_scaled = scaler.transform(X_val)
         m = LogisticRegression(**config)
-        m.fit(X_train_scaled, y_train)
+        m.fit(X_train_scaled, y_train, sample_weight=sample_weight)
         return m.predict_proba(X_val_scaled)[:, 1]
     if kind == "gbc":
         m = GradientBoostingClassifier(**config)
-        m.fit(X_train, y_train)
+        m.fit(X_train, y_train, sample_weight=sample_weight)
         return m.predict_proba(X_val)[:, 1]
     raise ValueError(f"Unknown model kind: {kind!r}")
 
@@ -1083,6 +1137,7 @@ def _evaluate_on_holdout(
     rf_cfg: Dict[str, Any],
     ensemble_weights: Dict[str, float],
     search_end: pd.Timestamp,
+    uniqueness_weights: bool = False,
 ) -> Dict[str, Any]:
     """
     Fit on everything up to `search_end` and score the untouched tail.
@@ -1150,8 +1205,12 @@ def _evaluate_on_holdout(
         return out
 
     try:
-        xgb_probs = _fit_predict_proba("xgb", xgb_cfg, X_tr, y_tr, X_te, y_te)
-        rf_probs = _fit_predict_proba("rf", rf_cfg, X_tr, y_tr, X_te, y_te)
+        fit_w = (
+            _average_uniqueness(X_dir.index[train_mask], df.index, horizon_days)
+            if uniqueness_weights else None
+        )
+        xgb_probs = _fit_predict_proba("xgb", xgb_cfg, X_tr, y_tr, X_te, y_te, fit_w)
+        rf_probs = _fit_predict_proba("rf", rf_cfg, X_tr, y_tr, X_te, y_te, fit_w)
     except Exception as exc:
         out["reason"] = f"Holdout fit failed: {exc}"
         return out
@@ -1177,7 +1236,11 @@ def _evaluate_on_holdout(
     return out
 
 
-def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+def train_model(
+    ticker: str,
+    df: Optional[pd.DataFrame] = None,
+    uniqueness_weights: bool = False,
+) -> Dict[str, Any]:
     """
     Train the XGBoost + RandomForest ensemble on price data for a given ticker.
 
@@ -1197,6 +1260,23 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
     df : pd.DataFrame, optional
         Pre-fetched DataFrame that has already been passed through
         calculate_indicators(). If None, data is fetched automatically.
+    uniqueness_weights : bool, default False
+        Weight each training row by the average uniqueness of its label window
+        (see _average_uniqueness), correcting for the fact that retained rows in
+        volatile clusters overlap each other far more than isolated rows do.
+
+        **Off by default because it was measured and did not help.** An A/B over
+        eight synthetic series — same split, same configuration, only the fit
+        weights differing — gave a mean holdout delta of -0.5 points, a median of
+        0.0, and 3 wins in 8, against a run-to-run spread of 2.5 points. The
+        weights themselves were active (0.82 to 3.7), so the mechanism worked; it
+        simply produced no edge.
+
+        That test is weak evidence rather than a refutation: synthetic random
+        walks contain no signal, and no improvement to *how* a model fits can
+        recover signal that is not there. Re-run scripts/ab_uniqueness_weights.py
+        against real tickers before deciding. Kept wired rather than deleted so
+        that test costs one flag instead of a reimplementation.
 
     Returns
     -------
@@ -1386,6 +1466,7 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
         holdout = _evaluate_on_holdout(
             df, ticker, horizon_days, neutral_threshold,
             xgb_cfg, rf_cfg, ensemble_weights, search_end,
+            uniqueness_weights=uniqueness_weights,
         )
         if holdout["accuracy"] is None:
             logger.warning("train_model: %s holdout unusable — %s", ticker, holdout["reason"])
@@ -1484,16 +1565,20 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
 
     X_arr = X_fit.values.astype("float32")
     y_binary = _to_binary_labels(y_fit)
+    fit_weights = (
+        _average_uniqueness(X_fit.index, df.index, horizon_days)
+        if uniqueness_weights else None
+    )
 
     if _XGBOOST_AVAILABLE:
         xgb_final = XGBClassifier(**xgb_cfg)
-        xgb_final.fit(X_arr, y_binary, verbose=False)
+        xgb_final.fit(X_arr, y_binary, sample_weight=fit_weights, verbose=False)
     else:
         xgb_final = RandomForestClassifier(**rf_cfg)
-        xgb_final.fit(X_arr, y_binary)
+        xgb_final.fit(X_arr, y_binary, sample_weight=fit_weights)
 
     rf_final = RandomForestClassifier(**rf_cfg)
-    rf_final.fit(X_arr, y_binary)
+    rf_final.fit(X_arr, y_binary, sample_weight=fit_weights)
 
     # ── Persist models ────────────────────────────────────────────────────────
     now_iso = now_et_iso()
@@ -1527,6 +1612,7 @@ def train_model(ticker: str, df: Optional[pd.DataFrame] = None) -> Dict[str, Any
             "holdout_edge_over_baseline": holdout.get("edge_over_baseline"),
             "holdout_ci95_halfwidth": holdout.get("ci95_halfwidth"),
             "holdout_note": holdout.get("reason"),
+            "uniqueness_weights": uniqueness_weights,
         }
         with open(_STORAGE_DIR / f"{ticker}_accuracy.json", "w") as f_acc:
             json.dump(acc_record, f_acc)

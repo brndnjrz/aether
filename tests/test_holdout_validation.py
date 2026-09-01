@@ -199,3 +199,62 @@ def test_reliability_reason_names_the_holdout_when_one_was_used(isolated_storage
     if result["holdout_accuracy"] is None:
         pytest.skip("no usable holdout")
     assert "holdout" in result["reliability_reason"].lower()
+
+
+# ── Uniqueness weights ───────────────────────────────────────────────────────
+# Wired but off by default: measured at a -0.5 point mean holdout delta over
+# eight synthetic series, median 0.0, 3 wins in 8, against a 2.5-point spread.
+# These tests cover the construction, not a claim that it helps.
+
+def test_uniqueness_weights_are_normalized_to_mean_one(isolated_storage):
+    """Scaling the weights would change the effective learning rate with horizon,
+    so the mean is pinned at 1 and only the relative spread carries information."""
+    df = _series(n=560)
+    X, y = ml.build_features(df, ticker="U", forward_bars=5, neutral_threshold=0.005)
+    X_dir, _ = ml._filter_directional(X, y)
+    w = ml._average_uniqueness(X_dir.index, df.index, 5)
+    assert w.mean() == pytest.approx(1.0)
+    assert (w > 0).all()
+
+
+def test_isolated_rows_outweigh_clustered_ones(isolated_storage):
+    """
+    The whole point: a row whose label window overlaps no other retained row owns
+    its outcome outright, while rows packed into a volatile cluster share theirs.
+    The isolated one must carry more weight.
+    """
+    full = pd.bdate_range("2024-01-01", periods=60)
+    # Three consecutive rows (heavily overlapping at horizon 5), then one alone.
+    retained = full[[10, 11, 12, 40]]
+    w = ml._average_uniqueness(retained, full, horizon=5)
+    assert w[3] > w[0], "the isolated row should outweigh a clustered one"
+    assert w[3] > w[1]
+
+
+def test_uniqueness_weights_are_uniform_when_every_bar_is_retained(isolated_storage):
+    """
+    With no gaps, concurrency is flat across the interior and the weights collapse
+    to a constant — which is why this only does anything once the neutral filter
+    has made the retained rows unevenly spaced.
+    """
+    full = pd.bdate_range("2024-01-01", periods=80)
+    w = ml._average_uniqueness(full[10:60], full, horizon=5)
+    interior = w[5:-5]
+    assert interior.std() < 0.05, f"expected near-uniform interior, got sd {interior.std()}"
+
+
+def test_train_model_defaults_to_unweighted_and_records_the_mode(isolated_storage):
+    result = ml.train_model("UW", df=_series())
+    assert result["error"] is None
+    meta = ml._load_model_metadata("UW")
+    assert meta["uniqueness_weights"] is False
+
+
+def test_train_model_accepts_the_weighting_flag(isolated_storage):
+    """Off by default, but the path has to work so the A/B can be re-run on real
+    tickers without reimplementing it."""
+    result = ml.train_model("UW2", df=_series(), uniqueness_weights=True)
+    assert result["error"] is None
+    assert result["directional_accuracy"] is not None
+    meta = ml._load_model_metadata("UW2")
+    assert meta["uniqueness_weights"] is True
