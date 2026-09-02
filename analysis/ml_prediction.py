@@ -2078,6 +2078,9 @@ def get_prediction_history(ticker: str, resolve: bool = True) -> pd.DataFrame:
         "date", "direction", "probability", "confidence", "actual_outcome", "correct",
         "model_accuracy", "expected_move_pct", "horizon_days", "price_at_prediction",
         "indicator_snapshot",
+        # Distinguishes "excluded, will never be graded" from "still waiting".
+        # Omitted here, the slice dropped it and both rendered as "Pending".
+        "neutral_outcome", "neutral_threshold",
     ]
 
     if not path.exists():

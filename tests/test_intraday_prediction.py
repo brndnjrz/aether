@@ -601,3 +601,68 @@ def test_save_records_the_interval_so_resolution_uses_the_right_bars(isolated_in
     assert record["interval"] == "15m"
     assert record["horizon_bars"] == 5
     assert record["actual_outcome"] is None
+
+
+# ── The neutral band is fixed, not searched ──────────────────────────────────
+
+def test_sigma_multiple_is_a_scalar_not_a_search_grid():
+    """
+    Regression guard. Searching the band made every candidate a different exam:
+    a wider band keeps only large obvious moves, which are mechanically easier to
+    call, so accuracy rose for reasons unrelated to model quality and the search
+    reliably picked the widest option. Measured on real SPY logs it had pushed the
+    15m band above the median realized move, leaving 80% of live predictions
+    permanently ungradeable.
+    """
+    from analysis import intraday_prediction as ip
+
+    assert isinstance(ip.SIGMA_MULTIPLE, float)
+    assert not hasattr(ip, "SIGMA_MULTIPLE_GRID"), (
+        "the band grid is back — accuracy is no longer comparable across candidates"
+    )
+
+
+def test_every_label_candidate_uses_the_same_band(monkeypatch, intraday_indicators_df):
+    """
+    The surviving search varies only horizon_bars. If two candidates were scored
+    under different bands their accuracies would not be comparable, which is the
+    whole reason the grid was removed.
+    """
+    from analysis import intraday_prediction as ip
+
+    seen = []
+    real = ip.build_intraday_features
+
+    def spy(df, **kwargs):
+        seen.append(kwargs.get("sigma_multiple"))
+        return real(df, **kwargs)
+
+    monkeypatch.setattr(ip, "build_intraday_features", spy)
+    try:
+        ip.select_intraday_label_scheme(intraday_indicators_df, "TEST", "15m")
+    except ValueError:
+        pass  # too little synthetic history is fine; we only care what was asked for
+
+    assert seen, "no label candidates were evaluated"
+    assert set(seen) == {ip.SIGMA_MULTIPLE}, (
+        f"candidates were scored under differing bands: {sorted(set(seen))}"
+    )
+
+
+def test_fixed_band_keeps_a_usable_share_of_rows_gradeable(intraday_indicators_df):
+    """
+    The band has to sit near the typical move, not above it. Above it, most
+    predictions resolve inside the band and can never be scored — which is what
+    made 15m live accuracy unmeasurable regardless of how long you waited.
+    """
+    from analysis import intraday_prediction as ip
+
+    X, y, _info = ip.build_intraday_features(
+        intraday_indicators_df, ticker="TEST", horizon_bars=5,
+        sigma_multiple=ip.SIGMA_MULTIPLE, interval="15m",
+    )
+    retained = float((y != 0).mean())
+    assert 0.25 <= retained <= 0.75, (
+        f"{retained:.0%} of rows directional at sigma_multiple="
+        f"{ip.SIGMA_MULTIPLE} — the band is badly mis-sized for this bar size"
+    )

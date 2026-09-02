@@ -1407,17 +1407,30 @@ def _render_model_performance(eval_result: dict, ticker: str):
                 st.dataframe(conf_df, hide_index=True, width="stretch")
 
 
-def _format_correct_label(direction: str, correct, has_price: bool = True) -> str:
+def _format_correct_label(
+    direction: str,
+    correct,
+    has_price: bool = True,
+    neutral_outcome=False,
+) -> str:
     """
     `correct` is True/False/None. Rendered as a raw boolean, Streamlit shows
     it as a checkbox — and a still-pending prediction (None) has no glyph of
     its own, so it renders as an empty box indistinguishable from an
     incorrect call. Explicit text removes that ambiguity.
 
-    Five states, five distinct labels:
+    Six states, six distinct labels:
     - not graded: neutral predictions are never resolved by design
       (resolve_predictions() excludes them, matching how training excludes
       the neutral class)
+    - flat outcome: the prediction had a direction and the horizon elapsed, but
+      the realized move landed inside the model's neutral band. Training drops
+      those rows before validation, so scoring them here would measure a
+      different population than trained accuracy claims. Excluded, never
+      graded — and crucially NOT pending: no amount of waiting changes it.
+      This is the majority of intraday rows at 5m/15m, where the band is wider
+      than the typical move, so labelling them "Pending" implied 20-24 results
+      per interval were still coming when none were.
     - no baseline price: resolve_predictions() requires price_at_prediction
       to compute a real outcome — some predictions logged before that field
       existed have none, and can never resolve no matter how much time
@@ -1430,6 +1443,8 @@ def _format_correct_label(direction: str, correct, has_price: bool = True) -> st
     if pd.isna(correct):
         if str(direction).lower() == "neutral":
             return "— (not graded)"
+        if bool(neutral_outcome) is True:
+            return "➖ Flat (excluded)"
         if not has_price:
             return "— (no baseline price)"
         return "⏳ Pending"
@@ -1581,9 +1596,15 @@ def _render_prediction_history(ticker: str):
 
     if "correct" in display_df.columns:
         has_price_col = display_df["price_at_prediction"] if "price_at_prediction" in display_df.columns else pd.Series([True] * len(display_df), index=display_df.index)
+        neutral_col = (
+            display_df["neutral_outcome"] if "neutral_outcome" in display_df.columns
+            else pd.Series([False] * len(display_df), index=display_df.index)
+        )
         display_df["Correct"] = [
-            _format_correct_label(d, c, has_price=pd.notna(p))
-            for d, c, p in zip(display_df["direction"], display_df["correct"], has_price_col)
+            _format_correct_label(d, c, has_price=pd.notna(p), neutral_outcome=bool(nf) if pd.notna(nf) else False)
+            for d, c, p, nf in zip(
+                display_df["direction"], display_df["correct"], has_price_col, neutral_col,
+            )
         ]
     else:
         display_df["Correct"] = "—"
@@ -1891,10 +1912,19 @@ def _render_intraday_predictions():
         # Explicit text instead: pending, correct, and incorrect are three
         # different states and should look like three different things.
         display["actual_outcome"] = display["actual_outcome"].map(_format_outcome_label)
+        neutral_col = (
+            display["neutral_outcome"] if "neutral_outcome" in display.columns
+            else pd.Series([False] * len(display), index=display.index)
+        )
         display["correct"] = [
-            _format_correct_label(d, c, has_price=pd.notna(p))
-            for d, c, p in zip(display["direction"], display["correct"], display["price_at_prediction"])
+            _format_correct_label(d, c, has_price=pd.notna(p), neutral_outcome=bool(nf) if pd.notna(nf) else False)
+            for d, c, p, nf in zip(
+                display["direction"], display["correct"],
+                display["price_at_prediction"], neutral_col,
+            )
         ]
+        if "neutral_outcome" in display.columns:
+            display = display.drop(columns=["neutral_outcome"])
         display = display.drop(columns=["price_at_prediction"])
         display = display.rename(columns={
             "date": "Date", "direction": "Direction", "probability": "Probability",
