@@ -393,6 +393,48 @@ def test_train_returns_metrics_and_persists_a_loadable_model(intraday_indicators
     assert meta["horizon_bars"] == result["horizon_bars"]
 
 
+def test_train_intraday_model_runs_hyperparam_search_via_daily_import(intraday_indicators_df, isolated_intraday_storage, monkeypatch):
+    """Proves reuse, not reimplementation: train_intraday_model() must call
+    ml_prediction.select_hyperparams()/select_rf_hyperparams() rather than
+    forking its own search grid."""
+    import analysis.ml_prediction as ml_prediction
+
+    calls = {"select_hyperparams": 0, "select_rf_hyperparams": 0}
+    real_select_hyperparams = ml_prediction.select_hyperparams
+    real_select_rf_hyperparams = ml_prediction.select_rf_hyperparams
+
+    def spy_select_hyperparams(*args, **kwargs):
+        calls["select_hyperparams"] += 1
+        return real_select_hyperparams(*args, **kwargs)
+
+    def spy_select_rf_hyperparams(*args, **kwargs):
+        calls["select_rf_hyperparams"] += 1
+        return real_select_rf_hyperparams(*args, **kwargs)
+
+    monkeypatch.setattr("analysis.intraday_prediction.select_hyperparams", spy_select_hyperparams)
+    monkeypatch.setattr("analysis.intraday_prediction.select_rf_hyperparams", spy_select_rf_hyperparams)
+
+    result = train_intraday_model("TEST", "15m", df=intraday_indicators_df)
+
+    assert result["error"] is None
+    assert calls["select_hyperparams"] == 1
+    assert calls["select_rf_hyperparams"] == 1
+
+
+def test_train_intraday_model_persists_hyperparam_overrides(intraday_indicators_df, isolated_intraday_storage):
+    from analysis.ml_prediction import HYPERPARAM_SEARCH_GRID, RF_HYPERPARAM_SEARCH_GRID
+
+    result = train_intraday_model("TEST", "15m", df=intraday_indicators_df)
+
+    assert result["error"] is None
+    assert result["hyperparam_overrides"] in HYPERPARAM_SEARCH_GRID
+    assert result["rf_hyperparam_overrides"] in RF_HYPERPARAM_SEARCH_GRID
+
+    meta = load_metadata("TEST", "15m")
+    assert meta["hyperparam_overrides"] == result["hyperparam_overrides"]
+    assert meta["rf_hyperparam_overrides"] == result["rf_hyperparam_overrides"]
+
+
 def test_train_reports_structured_error_on_thin_history(isolated_intraday_storage):
     from analysis.indicators import calculate_indicators
 
@@ -475,6 +517,40 @@ def test_prediction_round_trips_into_history(intraday_indicators_df, isolated_in
     assert hist.iloc[0]["direction"] in ("bullish", "bearish", "neutral")
     assert pd.notna(hist.iloc[0]["date"])
     assert pd.notna(hist.iloc[0]["price_at_prediction"])
+
+
+def test_save_intraday_prediction_persists_indicator_snapshot(intraday_indicators_df, isolated_intraday_storage):
+    """predict_intraday() must compute an indicator_snapshot and it must
+    round-trip through save_intraday_prediction()/get_intraday_prediction_history()
+    — mirrors the daily model's equivalent regression test."""
+    result = predict_intraday("TEST", "15m", df=intraday_indicators_df)
+    assert result["error"] is None
+    assert isinstance(result["indicator_snapshot"], dict)
+    assert result["indicator_snapshot"]
+
+    hist = get_intraday_prediction_history("TEST", "15m", resolve=False)
+    assert isinstance(hist.iloc[0]["indicator_snapshot"], dict)
+    assert hist.iloc[0]["indicator_snapshot"] == result["indicator_snapshot"]
+
+
+def test_intraday_history_backfills_missing_indicator_snapshot_for_legacy_rows(isolated_intraday_storage):
+    """Rows logged before indicator_snapshot existed must backfill to None."""
+    import json
+    from analysis.intraday_prediction import _predictions_path
+
+    record = {
+        "predicted_at": "2026-06-01T10:00:00-04:00", "date": "2026-06-01T10:00:00-04:00",
+        "ticker": "TEST", "interval": "15m", "bar_timestamp": "2026-06-01T10:00:00-04:00",
+        "direction": "bullish", "probability": 0.6, "confidence": "medium",
+        "horizon_bars": 5, "horizon_minutes": 75, "model_accuracy": 0.55,
+        "price_at_prediction": 500.0, "actual_outcome": None, "correct": None,
+    }
+    path = _predictions_path("TEST", "15m")
+    with open(path, "w") as f:
+        f.write(json.dumps(record) + "\n")
+
+    hist = get_intraday_prediction_history("TEST", "15m", resolve=False)
+    assert hist.iloc[0]["indicator_snapshot"] is None
 
 
 def test_history_appends_rather_than_overwrites(intraday_indicators_df, isolated_intraday_storage):

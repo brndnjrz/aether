@@ -1,17 +1,32 @@
 """
 Black-Scholes option pricing, Greeks, and implied volatility solver.
 Closed-form / numerical math only — no fitting, no lookahead.
+
+Also hosts the options cost model (`assess_options_tradeability`,
+`sweep_expiries`) — the contract-aware counterpart to
+`intraday_prediction.assess_tradeability`, which prices costs in *underlying*
+percentage points. Deliberately kept dependency-pure (numpy/scipy only, no
+yfinance): callers assemble live quotes and pass them in. `data/options_data.py`
+owns the fetching.
 """
 import logging
-from typing import Optional, Dict
+from typing import Any, Optional, Dict, List
 
 import numpy as np
 from scipy.stats import norm
+
+from config.settings import (
+    OPTIONS_MIN_DTE_FOR_BS_THETA,
+    OPTIONS_THETA_BASIS,
+)
 
 logger = logging.getLogger(__name__)
 
 MIN_SIGMA = 1e-6
 MIN_T = 1e-6
+
+MINUTES_PER_TRADING_DAY = 390
+MINUTES_PER_CALENDAR_DAY = 1440
 
 
 def _d1_d2(S: float, K: float, T: float, r: float, sigma: float) -> tuple:
@@ -135,3 +150,352 @@ def implied_volatility(
     result = (lo + hi) / 2
     logger.debug(f"implied_volatility: bisection exhausted max_iterations={max_iterations}, returning midpoint sigma={result:.6f}.")
     return float(result)
+
+
+# ── Options cost model (Roadmap Item 3) ──────────────────────────────────────
+#
+# intraday_prediction.assess_tradeability() models the edge as
+#     (2 * accuracy - 1) * avg_underlying_move  -  round_trip_cost
+# with every term in UNDERLYING percentage points and a 2 bps cost. That is
+# correct for trading shares and wrong in three ways for trading contracts:
+#
+#   1. The payoff is leveraged by elasticity  L = |delta| * S / P  (roughly 100x
+#      for an ATM 0DTE SPY contract, ~19x at 30 days) -- the gross edge is
+#      understated by one to two orders of magnitude.
+#   2. A 1-2 cent spread on a $2 contract is a 0.5-1.0% round trip, not 0.02%.
+#   3. Time is a cost, and there was no theta term at all.
+#
+# (1) works in your favour and (2)+(3) against, so the sign of the answer is not
+# obvious from raising a constant -- it has to be modelled. Because elasticity
+# and theta BOTH scale inversely with time to expiry they partly cancel, which
+# is why sweep_expiries() exists: the verdict genuinely flips across the ladder.
+
+def _theta_drag_pct(
+    *,
+    option_mid: float,
+    horizon_minutes: float,
+    days_to_expiry: float,
+    theta_per_day: Optional[float],
+    theta_basis: str,
+) -> Dict[str, Any]:
+    """
+    Cost of holding through the horizon, as a percent of the contract's mid.
+
+    Two methods, chosen by time to expiry:
+
+    - **black_scholes** — pro-rates the closed-form per-day theta over the
+      horizon. `theta_basis="trading"` spreads a day's decay across the
+      390-minute session (most decay is realized while the market is open);
+      `"calendar"` spreads it across 1440 minutes and is the gentler read.
+
+    - **sqrt_extrinsic** — used below `OPTIONS_MIN_DTE_FOR_BS_THETA`, because
+      Black-Scholes theta diverges as `T -> 0` and a near-dated contract cannot
+      be costed from it. An ATM option's extrinsic value scales as `sqrt(T)`, so
+      the fraction retained over the horizon is `sqrt(T_after / T_now)` and the
+      drag is the remainder. This captures the acceleration a linear pro-rata
+      would miss, which for 0DTE is the difference between a few percent and
+      tens of percent.
+    """
+    if days_to_expiry <= OPTIONS_MIN_DTE_FOR_BS_THETA or theta_per_day is None:
+        minutes_to_expiry = days_to_expiry * MINUTES_PER_CALENDAR_DAY
+        if minutes_to_expiry <= 0:
+            # Already expired, or expiring inside this bar: all extrinsic goes.
+            return {"theta_drag_pct": 100.0, "theta_method": "sqrt_extrinsic"}
+        after = max(minutes_to_expiry - horizon_minutes, 0.0)
+        retained = float(np.sqrt(after / minutes_to_expiry))
+        return {
+            "theta_drag_pct": round((1.0 - retained) * 100.0, 4),
+            "theta_method": "sqrt_extrinsic",
+        }
+
+    minutes_per_day = (
+        MINUTES_PER_TRADING_DAY if theta_basis == "trading" else MINUTES_PER_CALENDAR_DAY
+    )
+    day_fraction = horizon_minutes / minutes_per_day
+    drag = abs(float(theta_per_day)) * day_fraction / option_mid * 100.0
+    return {"theta_drag_pct": round(drag, 4), "theta_method": "black_scholes"}
+
+
+def _degraded_options_verdict(reason: str, **passthrough: Any) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "cost_model": "options",
+        "avg_move_pct": None,
+        "elasticity": None,
+        "gross_edge_pct": None,
+        "spread_cost_pct": None,
+        "spread_source": None,
+        "theta_drag_pct": None,
+        "theta_method": None,
+        "net_edge_pct": None,
+        "breakeven_accuracy": None,
+        "dominant_cost": None,
+        "is_tradeable": None,
+        "days_to_expiry": None,
+        "expiry_date": None,
+        "quote_source": None,
+        "iv_points_to_erase_edge": None,
+        "reason": reason,
+    }
+    out.update(passthrough)
+    return out
+
+
+def assess_options_tradeability(
+    mean_accuracy: float,
+    horizon_sigma: float,
+    *,
+    underlying_price: float,
+    option_mid: float,
+    delta: float,
+    horizon_minutes: float,
+    days_to_expiry: float,
+    option_bid: Optional[float] = None,
+    option_ask: Optional[float] = None,
+    theta_per_day: Optional[float] = None,
+    vega: Optional[float] = None,
+    theta_basis: Optional[str] = None,
+    fallback_spread_pct: Optional[float] = None,
+    expiry_date: Optional[str] = None,
+    quote_source: str = "live",
+) -> Dict[str, Any]:
+    """
+    Is a directional model's edge economic once it is expressed as an OPTION
+    return rather than an underlying return?
+
+        elasticity      L = |delta| * underlying_price / option_mid
+        avg_move_pct      = horizon_sigma * 100 * 0.8      (mean |move| ~ 0.8 sigma,
+                                                            same as assess_tradeability)
+        gross_edge_pct    = (2 * accuracy - 1) * L * avg_move_pct
+        spread_cost_pct   = (ask - bid) / option_mid * 100
+        theta_drag_pct     see _theta_drag_pct()
+        net_edge_pct      = gross_edge_pct - spread_cost_pct - theta_drag_pct
+
+        breakeven_accuracy = ((spread + theta) / (L * avg_move_pct) + 1) / 2
+
+    Every term is returned separately and `dominant_cost` names the bigger of
+    the two costs, because that is the actionable part: a spread-dominated
+    failure is fixable with better fills or a higher-priced contract, while a
+    theta-dominated failure means the *expiry is wrong for the horizon* — not
+    that the model is bad.
+
+    Known omissions, stated rather than papered over:
+
+    - **Gamma ignored.** Delta is held constant across the horizon. Fine for
+      small moves; optimistic on large ones (in your favour on a winner,
+      against you on a loser).
+    - **Vega is not forecast, only inverted.** An IV crush after a correct
+      directional call can erase the gain entirely, and nothing here predicts IV.
+      What it can do without inventing a number is report the breakeven: pass
+      `vega` and `iv_points_to_erase_edge` says how many volatility points of IV
+      decline would wipe out the modelled edge. That is arithmetic, not a
+      forecast — an actual IV forecast needs its own calibration study (how far
+      does SPY ATM IV really move after a 0.35% 75-minute move?), which is the
+      remaining half of Roadmap Item 11.
+    - **Single ATM contract.** No spreads, no multi-leg structures; selling
+      premium has an entirely different cost profile.
+
+    Returns a dict; never raises. On unusable input every numeric field is None
+    and `reason` explains why — `is_tradeable` is None, never False, so
+    "could not compute" can't be misread as "computed, and it's bad."
+    """
+    theta_basis = theta_basis or OPTIONS_THETA_BASIS
+
+    try:
+        mean_accuracy = float(mean_accuracy)
+        horizon_sigma = float(horizon_sigma)
+        underlying_price = float(underlying_price)
+        option_mid = float(option_mid)
+        delta = float(delta)
+        horizon_minutes = float(horizon_minutes)
+        days_to_expiry = float(days_to_expiry)
+    except (TypeError, ValueError):
+        return _degraded_options_verdict("Non-numeric input.")
+
+    common = {
+        "days_to_expiry": round(days_to_expiry, 3),
+        "expiry_date": expiry_date,
+        "quote_source": quote_source,
+    }
+
+    if not np.isfinite(option_mid) or option_mid <= 0:
+        return _degraded_options_verdict("Contract mid price is zero or unavailable.", **common)
+    if underlying_price <= 0:
+        return _degraded_options_verdict("Underlying price unavailable.", **common)
+    if horizon_minutes <= 0:
+        return _degraded_options_verdict("Horizon must be positive.", **common)
+    if abs(delta) < 1e-9:
+        return _degraded_options_verdict(
+            "Delta is zero — this contract has no directional exposure to model.", **common,
+        )
+
+    avg_move_pct = horizon_sigma * 100.0 * 0.8
+    if avg_move_pct <= 0:
+        return _degraded_options_verdict(
+            "Horizon volatility is zero — no move to trade.", **common,
+        )
+
+    elasticity = abs(delta) * underlying_price / option_mid
+    gross_edge_pct = (2.0 * mean_accuracy - 1.0) * elasticity * avg_move_pct
+
+    # Spread from live quotes when they are sane; otherwise the pessimistic
+    # settings fallback. A zero bid, a crossed book, or a zero-width spread all
+    # occur in real chain data — never divide through them.
+    spread_cost_pct: float
+    spread_source: str
+    quotes_usable = (
+        option_bid is not None and option_ask is not None
+        and np.isfinite(float(option_bid)) and np.isfinite(float(option_ask))
+        and float(option_ask) > float(option_bid) > 0
+    )
+    if quotes_usable:
+        spread_cost_pct = (float(option_ask) - float(option_bid)) / option_mid * 100.0
+        spread_source = "live_quotes"
+    else:
+        from config.settings import OPTIONS_FALLBACK_SPREAD_PCT
+        pct = OPTIONS_FALLBACK_SPREAD_PCT if fallback_spread_pct is None else fallback_spread_pct
+        spread_cost_pct = float(pct) * 100.0
+        spread_source = "fallback_assumption"
+
+    theta = _theta_drag_pct(
+        option_mid=option_mid,
+        horizon_minutes=horizon_minutes,
+        days_to_expiry=days_to_expiry,
+        theta_per_day=theta_per_day,
+        theta_basis=theta_basis,
+    )
+    theta_drag_pct = theta["theta_drag_pct"]
+
+    total_cost_pct = spread_cost_pct + theta_drag_pct
+    net_edge_pct = gross_edge_pct - total_cost_pct
+
+    denom = elasticity * avg_move_pct
+    breakeven_accuracy = (total_cost_pct / denom + 1.0) / 2.0 if denom > 0 else None
+    if breakeven_accuracy is not None:
+        # An accuracy above 1.0 is not achievable — report it as such rather
+        # than clamping silently to 1.0, which would read as "just barely
+        # possible" when the honest answer is "impossible at this expiry."
+        breakeven_accuracy = round(min(max(breakeven_accuracy, 0.0), 2.0), 4)
+
+    return {
+        "cost_model": "options",
+        "avg_move_pct": round(avg_move_pct, 4),
+        "elasticity": round(elasticity, 3),
+        "gross_edge_pct": round(gross_edge_pct, 4),
+        "spread_cost_pct": round(spread_cost_pct, 4),
+        "spread_source": spread_source,
+        "theta_drag_pct": theta_drag_pct,
+        "theta_method": theta["theta_method"],
+        "net_edge_pct": round(net_edge_pct, 4),
+        "breakeven_accuracy": breakeven_accuracy,
+        "dominant_cost": "theta" if theta_drag_pct >= spread_cost_pct else "spread",
+        "is_tradeable": bool(net_edge_pct > 0),
+        "theta_basis": theta_basis,
+        "iv_points_to_erase_edge": _iv_points_to_erase_edge(
+            net_edge_pct=net_edge_pct, option_mid=option_mid, vega=vega,
+        ),
+        "reason": None,
+        **common,
+    }
+
+
+def _iv_points_to_erase_edge(
+    *, net_edge_pct: float, option_mid: float, vega: Optional[float],
+) -> Optional[float]:
+    """
+    How many volatility points of IV decline would wipe out the modelled edge.
+
+    `vega` from `black_scholes_greeks` is the price change per **one percentage
+    point** of IV, so:
+
+        edge_dollars = net_edge_pct / 100 * option_mid
+        iv_points    = edge_dollars / vega
+
+    Returns None when vega is unavailable or the edge is already negative — there
+    is no edge left to erase, and printing a number there would imply one.
+
+    This is the honest half of the vega question: a breakeven, computed from a
+    Greek the app already has, with no assumption about how IV will actually
+    behave. Forecasting the IV move is deferred (Roadmap Item 11).
+    """
+    if vega is None or net_edge_pct <= 0:
+        return None
+    try:
+        vega = abs(float(vega))
+    except (TypeError, ValueError):
+        return None
+    if vega <= 0:
+        return None
+    edge_dollars = net_edge_pct / 100.0 * option_mid
+    return round(edge_dollars / vega, 3)
+
+
+def sweep_expiries(
+    mean_accuracy: float,
+    horizon_sigma: float,
+    *,
+    underlying_price: float,
+    horizon_minutes: float,
+    quotes: Dict[Any, Dict[str, Any]],
+    theta_basis: Optional[str] = None,
+    fallback_spread_pct: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Run `assess_options_tradeability` across an expiry ladder for one signal
+    horizon.
+
+    Because elasticity and theta scale in opposite directions with time to
+    expiry, one verdict per horizon is not enough — each signal horizon has a
+    minimum viable expiry, and finding it is the point.
+
+    Parameters
+    ----------
+    quotes : {days_to_expiry: {"mid", "delta", "bid", "ask", "theta_per_day",
+              "expiry_date", "quote_source"}} — assembled by the caller
+              (`data/options_data.get_expiry_ladder_quotes`). Keeping the fetch
+              out of this module is what lets it stay numpy/scipy-only.
+
+    Returns
+    -------
+    {"by_dte": {dte: verdict}, "best_dte": float|None, "best": verdict|None,
+     "any_tradeable": bool, "ladder": [dte, ...]}
+
+    `best` is the highest `net_edge_pct` among computable rungs. **Ties break
+    toward the shorter expiry** — less capital committed for the same modelled
+    edge.
+    """
+    by_dte: Dict[Any, Dict[str, Any]] = {}
+    for dte, q in sorted(quotes.items(), key=lambda kv: float(kv[0])):
+        by_dte[dte] = assess_options_tradeability(
+            mean_accuracy, horizon_sigma,
+            underlying_price=underlying_price,
+            option_mid=q.get("mid"),
+            option_bid=q.get("bid"),
+            option_ask=q.get("ask"),
+            delta=q.get("delta"),
+            theta_per_day=q.get("theta_per_day"),
+            vega=q.get("vega"),
+            horizon_minutes=horizon_minutes,
+            days_to_expiry=q.get("days_to_expiry", dte),
+            theta_basis=theta_basis,
+            fallback_spread_pct=fallback_spread_pct,
+            expiry_date=q.get("expiry_date"),
+            quote_source=q.get("quote_source", "live"),
+        )
+
+    computable = [
+        (dte, v) for dte, v in by_dte.items() if v.get("net_edge_pct") is not None
+    ]
+    best_dte = None
+    best = None
+    if computable:
+        # sorted() is stable and by_dte was built in ascending-DTE order, so
+        # max() returns the first (shortest) rung on a tie.
+        best_dte, best = max(computable, key=lambda kv: kv[1]["net_edge_pct"])
+
+    return {
+        "by_dte": by_dte,
+        "best_dte": best_dte,
+        "best": best,
+        "any_tradeable": any(v.get("is_tradeable") for v in by_dte.values()),
+        "ladder": [dte for dte in by_dte],
+    }

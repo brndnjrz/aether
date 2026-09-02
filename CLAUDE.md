@@ -1,6 +1,6 @@
 # Aether — Claude Code Notes
 
-Streamlit intraday/swing trading research dashboard. Five pages, all data live
+Streamlit intraday/swing trading research dashboard. Six pages, all data live
 from yfinance, all state on local disk. See `README.md` for what the app *does*
 and how a user drives it — this file is conventions, commands, and traps.
 
@@ -15,7 +15,11 @@ and how a user drives it — this file is conventions, commands, and traps.
 
 ```bash
 streamlit run app.py          # run the dashboard (localhost:8501)
-pytest tests/ -q              # full suite, ~90s, no network needed
+pytest tests/ -q              # full suite (436 tests), ~15 min, no network needed —
+                               # the ML training stages in test_ml_prediction.py /
+                               # test_intraday_prediction.py / test_model_comparison.py
+                               # dominate the runtime; run subsets while iterating
+pytest tests/test_horizon_clock.py tests/test_options_tradeability.py -q   # ~2s
 pytest tests/test_orbc_strategy.py -q   # fast subset, ~3s
 python3 -m py_compile <files> # quick syntax check before running anything slow
 sqlite3 storage/journal.db "select * from activity_log"
@@ -113,6 +117,34 @@ sqlite3 storage/journal.db "select * from activity_log"
   sklearn/xgboost/feedparser are missing. Keep that pattern when adding heavy deps.
 - `narwhals` is pinned in `requirements.txt` on purpose — a transitive
   sklearn/plotly dep whose version drift once took down the whole Predictions tab.
+- **Model Lab (`pages/model_lab.py`) is read-only, with four exceptions.**
+  `compare_models()`/`compare_intraday_models()` fit throwaway models in-memory
+  purely to score them (nothing persisted); Version History's rollback button
+  copies archived files back into place (a file copy, never a retrain); Failure
+  Analysis's "recompute legacy" checkbox re-fetches price history; and the Horizon
+  Scoreboard's "price with live options quotes" checkbox fetches an ATM expiry
+  ladder. The last two are opt-in network reads that write nothing. Keep all four
+  named explicitly in the page's docstring/caption — don't let the "read-only"
+  claim silently go stale as more panels get added. Nothing there may train,
+  predict, or append to a prediction log: `predict()`/`predict_intraday()` persist
+  by default, so a page that generated predictions would inflate the very win rate
+  it reports.
+- **Retrain thresholds live in `config/settings.py`**
+  (`RETRAIN_STALENESS_DAYS`, `RETRAIN_ACCURACY_DROP_THRESHOLD`,
+  `RETRAIN_MIN_RESOLVED_FOR_DROP_CHECK`), read by `analysis/retrain_triggers.py`.
+  Don't hardcode a threshold in a page or script — that's exactly the bug this
+  module was extracted to fix (`pages/trading.py` used to own a bare `30`).
+- **`scripts/` holds standalone CLIs, not imported by the app.**
+  `scheduled_retrain.py` (retrain sweep) and `alert_sweep.py` (alert conditions)
+  both discover tickers from `storage/*_accuracy.json` filenames — don't wire
+  either into a page; run them via cron/launchd outside the repo. Streamlit has
+  no background loop, so anything periodic has to live here.
+- **Verify "unused" before deleting.** Several confirmed-dead functions
+  (`portfolio/journal.py::get_closed_performance`, `analysis/risk.py`'s
+  portfolio-level metrics/Kelly helpers) were leftovers from the cut
+  Positions/Risk Analytics tabs, invisible until grepped for real call sites
+  across `pages/`, `analysis/`, and `tests/` — a name appearing in an
+  `__init__.py`'s `__all__` is not evidence it's used.
 
 ## Docs
 
@@ -121,3 +153,30 @@ usage), `docs/ORBC_PLAYBOOK.md` (ORBC rules + design decisions + trading routine
 `docs/UI_DESIGN_SPEC.md` (theme tokens — global stylesheet lives only in `app.py`),
 `docs/VERIFICATION_CHECKLIST.md` (manual checks; its line numbers drift).
 `docs/DATA_STORAGE.md` and `docs/MONOREPO_EXTRACTION.md` are gitignored/local-only.
+
+`docs/ROADMAP.md` is the **design record for the Horizon Cockpit work** (all 14
+items implemented on `feat/horizon-cockpit`) — the why behind each item, decisions
+settled before building, ideas deliberately rejected, and four traps to avoid.
+Two things in it are load-bearing for anyone touching the prediction models:
+
+- `assess_tradeability()` models costs in **underlying** percentage points, which
+  is correct for shares and wrong for the options actually traded — it ignores
+  delta leverage and has no theta term. `options_pricing.assess_options_tradeability()`
+  is the contract-aware version; prefer it, and note that a verdict can flip sign
+  across the expiry ladder (`sweep_expiries()`), which is why one number per
+  horizon was never enough.
+- `predict()` / `predict_intraday()` call `save_*_prediction()` unless
+  `persist=False` is passed, so **any** automated caller (alert sweep, scanner,
+  auto-refresh) silently inflates the prediction log and corrupts the live win
+  rate that Model Lab, the retrain triggers, and the horizon scoreboard all read.
+  `scripts/alert_sweep.py` is the one automated caller and passes `persist=False`.
+
+New modules from that work, all Streamlit-free: `analysis/horizon_clock.py`
+(when a signal stops being evidence — including horizons that cross the 4 PM close
+and can therefore *never* be graded), `analysis/interval_consensus.py`
+(cross-horizon read + agreement backtest; read-only by construction),
+`analysis/signal_attribution.py` (fitted signal weights, refuses to fit under 30
+events), `analysis/trade_attribution.py` (model-vs-discretionary, gated on sample
+size). `portfolio/db.py` now runs additive column migrations via `_MIGRATIONS` —
+`CREATE TABLE IF NOT EXISTS` is a no-op on the existing `journal.db`, which holds
+real trade history.

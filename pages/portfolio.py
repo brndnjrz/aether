@@ -61,6 +61,10 @@ def render():
     _render_fill_ledger(fills)
     st.markdown("---")
 
+    st.markdown("## Model vs. Discretionary")
+    _render_trade_attribution(round_trips, fills)
+    st.markdown("---")
+
     st.markdown("## What Were You Looking At During This Trade?")
     _render_activity_lookup(round_trips)
 
@@ -343,6 +347,21 @@ def _render_add_fill_form():
         fill_time = col9.time_input("Fill time (ET)", value=now_et().time(), step=timedelta(minutes=1))
 
         notes = st.text_area("Notes (optional)")
+
+        # Roadmap Item 12 — links this fill to the signal that motivated it, which
+        # is what lets analysis/trade_attribution.py compare following the model
+        # against overriding it using REAL fills rather than reconstructed
+        # outcomes. Left blank = discretionary, and that is a meaningful answer.
+        pred_options = _recent_prediction_refs(ticker) if ticker else []
+        prediction_ref_label = st.selectbox(
+            "Motivated by which signal? (optional)",
+            ["— discretionary (no model signal)"] + [label for label, _ in pred_options],
+            help=(
+                "Tagging fills is what makes the model-vs-discretionary comparison "
+                "possible later. Leaving it discretionary is a real data point, not a "
+                "missing one."
+            ),
+        )
         submitted = st.form_submit_button("Log Fill", type="primary")
 
     if submitted:
@@ -360,10 +379,122 @@ def _render_add_fill_form():
             st.warning("Price cannot be negative.")
             return
         filled_at = datetime.combine(fill_date, fill_time, tzinfo=MARKET_TZ).isoformat()
-        add_fill(ticker, strike, option_type, expiry_date.isoformat(), side, int(qty), price, filled_at, notes)
+        prediction_ref = dict(pred_options).get(prediction_ref_label)
+        add_fill(ticker, strike, option_type, expiry_date.isoformat(), side, int(qty),
+                 price, filled_at, notes, prediction_ref=prediction_ref)
         logger.info(f"[portfolio] Fill logged: {side} {qty}x {ticker} ${strike:g} {option_type} @ ${price:.2f}")
         st.success(f"Logged {side} {qty}x {ticker} ${strike:g} {option_type} {expiry_date.isoformat()} @ ${price:.2f}.")
         st.rerun()
+
+
+def _recent_prediction_refs(ticker: str, limit: int = 12) -> list:
+    """
+    Recent logged predictions for `ticker`, as (label, prediction_ref) pairs for
+    the fill form's dropdown.
+
+    Reads the saved prediction logs only — this must never generate a prediction,
+    since every logged row counts toward the live win rate that Model Lab and the
+    retrain triggers read.
+    """
+    out = []
+    try:
+        from analysis.intraday_prediction import (
+            INTERVAL_SPECS, get_intraday_prediction_history,
+        )
+        for interval in INTERVAL_SPECS:
+            hist = get_intraday_prediction_history(ticker, interval, resolve=False)
+            for _, row in hist.head(4).iterrows():
+                when = row.get("date")
+                if pd.isna(when):
+                    continue
+                et = when.tz_convert(MARKET_TZ)
+                direction = (row.get("direction") or "—").upper()
+                out.append((
+                    f"{interval} {direction} {et.strftime('%m/%d %I:%M %p ET')}",
+                    f"{interval}|{et.isoformat()}",
+                ))
+    except Exception as exc:
+        logger.debug(f"[portfolio] could not load prediction refs for {ticker}: {exc}")
+
+    try:
+        from analysis.ml_prediction import get_prediction_history
+        hist = get_prediction_history(ticker)
+        for _, row in hist.head(4).iterrows():
+            when = row.get("date")
+            if pd.isna(when):
+                continue
+            et = pd.Timestamp(when).tz_convert(MARKET_TZ)
+            direction = (row.get("direction") or "—").upper()
+            out.append((
+                f"daily {direction} {et.strftime('%m/%d %I:%M %p ET')}",
+                f"daily|{et.isoformat()}",
+            ))
+    except Exception as exc:
+        logger.debug(f"[portfolio] could not load daily prediction refs for {ticker}: {exc}")
+
+    return out[:limit]
+
+
+def _render_trade_attribution(round_trips: list, fills: list):
+    """
+    Did following the model actually make money? (Roadmap Item 12.)
+
+    Every other performance number in this app grades the model — was the direction
+    right. This grades the *decision*: following a signal vs overriding it. Only
+    real fills can answer that.
+
+    Refuses to show a comparison until both arms are large enough. With 20-40 round
+    trips, "you lose on countertrend setups" is noise that reads as self-knowledge,
+    and acting on it is worse than acting on nothing.
+    """
+    from analysis.trade_attribution import compare_followed_vs_discretionary
+
+    st.caption(
+        "Compares round trips you opened on a model signal against discretionary ones. "
+        "Tag fills in the Fill Ledger above to build this up."
+    )
+
+    result = compare_followed_vs_discretionary(round_trips, fills)
+
+    c1, c2 = st.columns(2)
+    c1.metric("Model-driven round trips", result["followed"]["n"])
+    c2.metric("Discretionary round trips", result["discretionary"]["n"])
+
+    if not result["reportable"]:
+        st.info(result["reason"], icon="ℹ️")
+        return
+
+    rows = []
+    for label, key in (("Followed the model", "followed"), ("Discretionary", "discretionary")):
+        arm = result[key]
+        rows.append({
+            "Group": label,
+            "N": arm["n"],
+            "Win rate": f"{arm['win_rate'] * 100:.1f}%" if arm["win_rate"] is not None else "—",
+            "Avg P&L": f"{arm['avg_pnl_pct']:+.2f}%" if arm["avg_pnl_pct"] is not None else "—",
+            "Median P&L": f"{arm['median_pnl_pct']:+.2f}%" if arm["median_pnl_pct"] is not None else "—",
+            "Total P&L": f"${arm['total_pnl_dollars']:,.0f}" if arm["total_pnl_dollars"] is not None else "—",
+        })
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+    if result["by_horizon"]:
+        with st.expander("Model-driven trades by horizon", expanded=False):
+            st.dataframe(
+                pd.DataFrame([
+                    {
+                        "Horizon": h,
+                        "N": a["n"],
+                        "Win rate": f"{a['win_rate'] * 100:.1f}%" if a["win_rate"] is not None else "—",
+                        "Avg P&L": f"{a['avg_pnl_pct']:+.2f}%" if a["avg_pnl_pct"] is not None else "—",
+                    }
+                    for h, a in result["by_horizon"].items()
+                ]),
+                hide_index=True, width="stretch",
+            )
+            st.caption(
+                "Per-horizon arms are thinner than the headline split — read the N "
+                "column before drawing anything from a row."
+            )
 
 
 def _render_fill_ledger(fills: list):

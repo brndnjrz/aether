@@ -108,3 +108,35 @@ Prediction timestamps now render via `utc_iso_to_et_str(pred_ts, ...)`
 ET, so old rows stored as plain `datetime.utcnow().isoformat()` (no tzinfo) should still
 convert correctly via `tz_localize("UTC")`. Confirm old rows show a *plausible* ET time (not
 shifted by an extra offset) and the table doesn't error on the historical row format.
+
+## 7. Live options chain — the only untested path
+
+**Why this needs a human:** every other check here has automated coverage. The options
+cost model does not, because no test can fetch a real chain — `assess_options_tradeability`
+is unit-tested with injected Greeks, but `get_expiry_ladder_quotes` has never run against
+live data. Do this once, during market hours.
+
+Open **Model Lab → Horizon Scoreboard** and check **Price with live options quotes**.
+
+1. **Ladder snapped to real expiries.** The caption should list each requested rung mapped
+   to an actual listed date (`0d→2026-08-03, 2d→2026-08-05, …`). A rung with no nearby
+   listing should appear under "Skipped", not silently vanish. SPY has daily expiries, so
+   expect few or no skips; a thinner underlying is where this matters.
+2. **Quote source is honest.** During market hours it should read `live`. After the close,
+   the book empties and it should fall back to `model_price` and say so — never present a
+   Black-Scholes price as a live quote.
+3. **Theta method switches at the guard.** The 0DTE rung should use `sqrt_extrinsic`
+   (Black-Scholes theta diverges as `T → 0`); the 30 DTE rung should use `black_scholes`.
+   If 0DTE reports a suspiciously small theta drag, the guard did not fire.
+4. **The grid's diagonal.** Net edge should generally improve left-to-right (longer expiry
+   = less decay) and the sign should flip somewhere. If every cell is positive or every
+   cell is negative across all five horizons, suspect the volatility anchor
+   (`tradeability.avg_move_pct` in each model's accuracy JSON) rather than the cost model.
+5. **Cross-check one cell by hand.** Take the ATM bid/ask from Trading Desk → Options →
+   ATM Greeks and confirm `spread_cost_pct ≈ (ask − bid) / mid × 100`. This is the one
+   number a stale cache would quietly get wrong.
+
+Also confirm the cockpit (Trading Desk → Predictions) writes nothing on render: note the
+`Logged Predictions` count, switch tabs and back several times, and confirm it has not
+moved. Only **Refresh all horizons** should increment it.
+

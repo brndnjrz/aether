@@ -15,8 +15,8 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from data.price_data import get_price_history, get_current_price
-from analysis.indicators import calculate_indicators, get_signal_summary
+from data.price_data import get_price_history
+from analysis.indicators import calculate_indicators
 from data.macro_data import get_vix_data, get_sp500_regime
 from analysis.risk import position_size_from_stop, regime_kelly_multiplier
 from analysis.regime_markov import analyze_regime_markov
@@ -30,6 +30,7 @@ from analysis.flag_pennant_detection import detect_flag_pennant_patterns
 from analysis.backtest import macd_bullish_cross_signal, simulate_trades
 from analysis.price_projection import simulate_price_path
 from config.tz import now_et, utc_iso_to_et_str, MARKET_TZ
+from config.settings import IVR_HIGH, IVR_LOW, IV_RV_PREMIUM_THRESHOLD
 from portfolio.activity_log import log_activity
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ logger = logging.getLogger(__name__)
 # ML prediction — optional import so page still works if scikit-learn/xgboost/narwhals not installed
 try:
     from analysis.ml_prediction import predict, train_model, get_prediction_history, evaluate_model
+    from analysis.retrain_triggers import check_all_retrain_triggers
     _ML_AVAILABLE = True
 except Exception:
     _ML_AVAILABLE = False
@@ -152,16 +154,24 @@ def _render_daytrading():
     status_class = "aeth-status-open" if status == "MARKET OPEN" else "aeth-status-closed"
     try:
         vix_data = get_vix_data()
-        vix_val = vix_data.get("current", 20)
-        vix_regime = vix_data.get("regime", "Normal")
+        vix_val = vix_data.get("current")
+        # No "Normal" default. The failure dict carries no regime, so defaulting
+        # produced the status strip "VIX 20.0 (Normal)" out of a failed fetch.
+        vix_regime = vix_data.get("regime")
         sp_regime = get_sp500_regime().get("regime", "Unknown")
     except Exception:
-        vix_val, vix_regime, sp_regime = 20, "N/A", "N/A"
+        logger.warning("[trading] status strip: macro fetch failed", exc_info=True)
+        vix_val, vix_regime, sp_regime = None, None, "Unknown"
+
+    vix_display = (
+        f"VIX {vix_val:.1f} ({vix_regime or 'N/A'})" if vix_val is not None
+        else "VIX unavailable"
+    )
 
     st.markdown(
         f'<div class="aeth-status-strip">'
         f'<span class="{status_class}">{status}</span> &nbsp;|&nbsp; '
-        f'VIX {vix_val:.1f} ({vix_regime}) &nbsp;|&nbsp; '
+        f'{vix_display} &nbsp;|&nbsp; '
         f'S&P Regime: {sp_regime} &nbsp;|&nbsp; '
         f'⏰ {now_et().strftime("%I:%M %p ET")}'
         f'</div>',
@@ -556,6 +566,18 @@ def _render_daytrading():
         ec3.metric("Stop", f"${sug_stop:.2f}", f"-{stop_pct:.1f}%" if direction_label == "LONG" else f"+{stop_pct:.1f}%", delta_color="inverse")
         ec4.metric("Target", f"${sug_target:.2f}", f"{rr:.1f}:1 R:R")
         st.caption(f"Stop = 1.5× ATR (${atr:.2f}) from entry. Target = {target_source}. Position sizing not included — use the Quick Risk Calculator below.{flag_note}")
+        if has_intraday:
+            # The ATR here is the DAILY ATR, so this is a swing-scale stop. On a
+            # 5m/15m read it will almost never be touched inside the window the
+            # signals actually describe, which makes the R:R above optimistic.
+            # The horizon-scaled version lives on the intraday prediction, where
+            # a horizon exists to scale to. See Roadmap Item 2B.
+            st.caption(
+                f"Note: that stop is **{1.5 * atr / current_price * 100:.1f}%** away and is "
+                f"derived from the *daily* ATR — a swing-scale stop, not a {interval} one. "
+                "For a stop scaled to a specific intraday horizon, see Predictions → "
+                "Intraday → Exit plan."
+            )
 
     if analyze:
         log_key = (ticker, interval, direction_label, sug_entry, sug_stop, sug_target)
@@ -576,162 +598,187 @@ def _render_daytrading():
     regime_markov = analyze_regime_markov(daily, ticker)
 
     st.markdown("---")
-    st.markdown("### Market Regime (Markov)")
-    st.caption(f"{ticker}'s own trend history, discretized into Bear/Neutral/Bull and fit to a first-order transition matrix — a probabilistic read, not a rule-based one.")
-    if not regime_markov["available"]:
-        st.info(regime_markov["reason"])
-    else:
-        rm1, rm2, rm3 = st.columns(3)
-        rm1.metric("Current State", regime_markov["current_state"])
-        rm2.metric("Bull − Bear Signal", f"{regime_markov['signal']:+.2f}")
-        rm3.metric("Confidence", f"{regime_markov['confidence'] * 100:.0f}%", help="Scales with how many times the current state has occurred historically (30+ = full confidence).")
-        persist = regime_markov["persistence"]
-        st.caption(
-            f"Persistence — Bear: {persist['Bear'] * 100:.0f}% | Neutral: {persist['Neutral'] * 100:.0f}% | Bull: {persist['Bull'] * 100:.0f}% "
-            f"(probability each regime repeats itself the next bar, from {regime_markov['n_bars']} bars of history)."
-        )
-        next_probs = regime_markov["next_step_probs"]
-        st.caption(f"Next-bar odds from {regime_markov['current_state']}: Bear {next_probs['Bear'] * 100:.0f}% | Neutral {next_probs['Neutral'] * 100:.0f}% | Bull {next_probs['Bull'] * 100:.0f}%")
+    # Sectioned rather than one continuous scroll (Roadmap Item 9). Streamlit
+    # executes every tab body in order within this same function scope, so this
+    # is purely a rendering change -- pivot/r1/s1/or_note still flow from Key
+    # Levels above into the AI brief below exactly as before.
+    tab_regime, tab_risk, tab_osc, tab_bt, tab_weights, tab_ai = st.tabs([
+        "Market Regime", "Risk Calculator", "Oscillators", "Backtest",
+        "Signal Weights", "AI Brief",
+    ])
 
-    st.markdown("---")
-    with st.expander("Quick Risk Calculator", expanded=False):
-        if st.session_state.get("dt_risk_calc_ticker") != ticker:
-            st.session_state["dt_entry"] = round(current_price, 2)
-            st.session_state["dt_stop"] = round(current_price * 0.98, 2)
-            st.session_state["dt_risk_calc_ticker"] = ticker
-
-        rc1, rc2 = st.columns(2)
-        with rc1:
-            port_val = st.number_input("Portfolio Size ($)", value=100_000, step=5_000, min_value=1_000, key="dt_port_val")
-            entry = st.number_input("Entry Price ($)", min_value=0.01, key="dt_entry")
-            stop = st.number_input("Stop Price ($)", min_value=0.01, key="dt_stop")
-            risk_pct = st.slider("Risk per Trade (%)", min_value=0.25, max_value=3.0, value=1.0, step=0.25, key="dt_risk_pct") / 100
-            apply_regime = st.checkbox(
-                "Scale size by regime signal", value=False,
-                help="Multiplies the position size by the Bull-Bear regime signal above (0.5x-1.5x) — leans in when the regime favors the trade direction, pulls back when it doesn't.",
-                key="dt_apply_regime",
+    with tab_regime:
+        st.markdown("### Market Regime (Markov)")
+        st.caption(f"{ticker}'s own trend history, discretized into Bear/Neutral/Bull and fit to a first-order transition matrix — a probabilistic read, not a rule-based one.")
+        if not regime_markov["available"]:
+            st.info(regime_markov["reason"])
+        else:
+            rm1, rm2, rm3 = st.columns(3)
+            rm1.metric("Current State", regime_markov["current_state"])
+            rm2.metric("Bull − Bear Signal", f"{regime_markov['signal']:+.2f}")
+            rm3.metric("Confidence", f"{regime_markov['confidence'] * 100:.0f}%", help="Scales with how many times the current state has occurred historically (30+ = full confidence).")
+            persist = regime_markov["persistence"]
+            st.caption(
+                f"Persistence — Bear: {persist['Bear'] * 100:.0f}% | Neutral: {persist['Neutral'] * 100:.0f}% | Bull: {persist['Bull'] * 100:.0f}% "
+                f"(probability each regime repeats itself the next bar, from {regime_markov['n_bars']} bars of history)."
             )
+            next_probs = regime_markov["next_step_probs"]
+            st.caption(f"Next-bar odds from {regime_markov['current_state']}: Bear {next_probs['Bear'] * 100:.0f}% | Neutral {next_probs['Neutral'] * 100:.0f}% | Bull {next_probs['Bull'] * 100:.0f}%")
 
-        with rc2:
-            if stop < entry:
-                result = position_size_from_stop(port_val, entry, stop, risk_pct)
-                if "error" not in result:
-                    shares, position_value, position_pct = result["shares"], result["position_value"], result["position_pct"]
-                    if apply_regime and regime_markov["available"]:
-                        multiplier = regime_kelly_multiplier(regime_markov["signal"], regime_markov["confidence"])
-                        shares = round(shares * multiplier)
-                        position_value = round(position_value * multiplier, 2)
-                        position_pct = round(position_pct * multiplier, 2)
-                        st.caption(f"Regime multiplier: {multiplier:.2f}x (signal {regime_markov['signal']:+.2f} × confidence {regime_markov['confidence'] * 100:.0f}%)")
-                    st.metric("Shares", shares)
-                    st.metric("Position Value", f"${position_value:,.0f} ({position_pct:.1f}%)")
-                    st.metric("Dollar Risk", f"${result['dollar_risk']:,.0f}")
-                    st.markdown(f"**2:1 Target:** ${result['risk_reward_2to1_target']:.2f}")
-                    st.markdown(f"**3:1 Target:** ${result['risk_reward_3to1_target']:.2f}")
-                    rr = (result['risk_reward_3to1_target'] - entry) / (entry - stop) if entry != stop else 0
-                    if rr >= 3:
-                        st.success(f"R:R = {rr:.1f}:1 — excellent setup")
-                    elif rr >= 2:
-                        st.info(f"R:R = {rr:.1f}:1 — acceptable")
-                    else:
-                        st.warning(f"R:R = {rr:.1f}:1 — poor risk/reward, skip or widen target")
-                else:
-                    st.warning(result["error"])
-            else:
-                st.warning("Stop must be below entry price.")
+    with tab_risk:
+        with st.expander("Quick Risk Calculator", expanded=True):
+            if st.session_state.get("dt_risk_calc_ticker") != ticker:
+                st.session_state["dt_entry"] = round(current_price, 2)
+                st.session_state["dt_stop"] = round(current_price * 0.98, 2)
+                st.session_state["dt_risk_calc_ticker"] = ticker
 
-    if has_intraday and "RSI" in intraday.columns:
-        with st.expander("Intraday RSI & MACD", expanded=False):
-            fig2 = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.5, 0.5], vertical_spacing=0.05)
-            fig2.add_trace(go.Scatter(x=intraday.index, y=intraday["RSI"], name="RSI", line=dict(color="#7c4dff", width=1.5)), row=1, col=1)
-            fig2.add_hline(y=70, row=1, col=1, line=dict(color="#ef5350", width=1, dash="dot"))
-            fig2.add_hline(y=30, row=1, col=1, line=dict(color="#26a69a", width=1, dash="dot"))
-            fig2.add_hline(y=50, row=1, col=1, line=dict(color="#888", width=0.8, dash="dot"))
-
-            if "MACD_hist" in intraday.columns:
-                hist = intraday["MACD_hist"]
-                fig2.add_trace(go.Bar(x=intraday.index, y=hist, name="MACD Histogram",
-                                      marker_color=["#26a69a" if v >= 0 else "#ef5350" for v in hist.fillna(0)]), row=2, col=1)
-                fig2.add_trace(go.Scatter(x=intraday.index, y=intraday["MACD"], name="MACD", line=dict(color="#42a5f5", width=1.2)), row=2, col=1)
-                fig2.add_trace(go.Scatter(x=intraday.index, y=intraday["MACD_signal"], name="Signal", line=dict(color="#ff7043", width=1.2)), row=2, col=1)
-
-            fig2.update_layout(template="plotly_dark" if st.context.theme.type == "dark" else "plotly_white", height=350, margin=dict(l=0, r=0, t=10, b=0))
-            fig2.update_yaxes(range=[0, 100], row=1, col=1)
-            st.plotly_chart(fig2, use_container_width=True)
-
-    st.markdown("---")
-    with st.expander("Backtest: MACD Bullish Cross (2yr history)", expanded=False):
-        st.caption(
-            "Tests the momentum signal above against 2 years of history: buy when the MACD "
-            "histogram turns up while MACD & Signal are still below zero and price is above "
-            "the 200-day average, then exit on a 2% stop-loss or 3% take-profit — one trade "
-            "at a time, long only. Close-to-close approximation, not a live-fill simulation."
-        )
-        if st.button("Run Backtest", key="dt_run_backtest"):
-            logger.info(f"[trading] 'Run Backtest' button pressed for {ticker} (MACD bullish cross)")
-            with st.spinner(f"Loading 2 years of {ticker} history…"):
-                bt_df = _load_backtest_df(ticker)
-            if bt_df is None or bt_df.empty or "MACD_hist" not in bt_df.columns:
-                logger.warning(f"[trading] Backtest for {ticker} blocked: not enough history")
-                st.warning("Not enough history to backtest this ticker.")
-            else:
-                signal = macd_bullish_cross_signal(bt_df)
-                result = simulate_trades(bt_df, signal)
-                logger.info(
-                    f"[trading] Backtest for {ticker} completed: num_trades={result['num_trades']} "
-                    f"win_rate={result['win_rate']:.1f}% total_return_pct={result['total_return_pct']:+.1f}%"
+            rc1, rc2 = st.columns(2)
+            with rc1:
+                port_val = st.number_input("Portfolio Size ($)", value=100_000, step=5_000, min_value=1_000, key="dt_port_val")
+                entry = st.number_input("Entry Price ($)", min_value=0.01, key="dt_entry")
+                stop = st.number_input("Stop Price ($)", min_value=0.01, key="dt_stop")
+                risk_pct = st.slider("Risk per Trade (%)", min_value=0.25, max_value=3.0, value=1.0, step=0.25, key="dt_risk_pct") / 100
+                apply_regime = st.checkbox(
+                    "Scale size by regime signal", value=False,
+                    help="Multiplies the position size by the Bull-Bear regime signal above (0.5x-1.5x) — leans in when the regime favors the trade direction, pulls back when it doesn't.",
+                    key="dt_apply_regime",
                 )
-                st.session_state[f"dt_backtest_{ticker}"] = result
 
-        result = st.session_state.get(f"dt_backtest_{ticker}")
-        if result:
-            if result["num_trades"] == 0:
-                st.info("No MACD bullish-cross signals fired for this ticker over the last 2 years.")
-            else:
-                if result["num_trades"] < 10:
-                    st.warning(f"Only {result['num_trades']} trades in this window — too few to draw firm conclusions.")
-                bc1, bc2, bc3, bc4 = st.columns(4)
-                bc1.metric("Trades", result["num_trades"])
-                bc2.metric("Win Rate", f"{result['win_rate']:.1f}%")
-                bc3.metric("Total Return", f"{result['total_return_pct']:+.1f}%")
-                bc4.metric("Final Value", f"${result['final_value']:,.0f}", help="Starting from $1,000")
+            with rc2:
+                if stop < entry:
+                    result = position_size_from_stop(port_val, entry, stop, risk_pct)
+                    if "error" not in result:
+                        shares, position_value, position_pct = result["shares"], result["position_value"], result["position_pct"]
+                        if apply_regime and regime_markov["available"]:
+                            multiplier = regime_kelly_multiplier(regime_markov["signal"], regime_markov["confidence"])
+                            shares = round(shares * multiplier)
+                            position_value = round(position_value * multiplier, 2)
+                            position_pct = round(position_pct * multiplier, 2)
+                            st.caption(f"Regime multiplier: {multiplier:.2f}x (signal {regime_markov['signal']:+.2f} × confidence {regime_markov['confidence'] * 100:.0f}%)")
+                        st.metric("Shares", shares)
+                        st.metric("Position Value", f"${position_value:,.0f} ({position_pct:.1f}%)")
+                        st.metric("Dollar Risk", f"${result['dollar_risk']:,.0f}")
+                        st.markdown(f"**2:1 Target:** ${result['risk_reward_2to1_target']:.2f}")
+                        st.markdown(f"**3:1 Target:** ${result['risk_reward_3to1_target']:.2f}")
+                        rr = (result['risk_reward_3to1_target'] - entry) / (entry - stop) if entry != stop else 0
+                        if rr >= 3:
+                            st.success(f"R:R = {rr:.1f}:1 — excellent setup")
+                        elif rr >= 2:
+                            st.info(f"R:R = {rr:.1f}:1 — acceptable")
+                        else:
+                            st.warning(f"R:R = {rr:.1f}:1 — poor risk/reward, skip or widen target")
+                    else:
+                        st.warning(result["error"])
+                else:
+                    st.warning("Stop must be below entry price.")
 
-                eq_fig = go.Figure()
-                eq_fig.add_trace(go.Scatter(
-                    x=result["equity_curve"].index, y=result["equity_curve"].values,
-                    line=dict(color="#9370DB", width=2), name="Equity",
-                ))
-                eq_fig.update_layout(template="plotly_dark" if st.context.theme.type == "dark" else "plotly_white", height=280, margin=dict(l=0, r=0, t=10, b=0),
-                                      yaxis_title="Portfolio Value ($)")
-                st.plotly_chart(eq_fig, use_container_width=True)
+    with tab_osc:
+        if has_intraday and "RSI" in intraday.columns:
+            with st.expander("Intraday RSI & MACD", expanded=True):
+                fig2 = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.5, 0.5], vertical_spacing=0.05)
+                fig2.add_trace(go.Scatter(x=intraday.index, y=intraday["RSI"], name="RSI", line=dict(color="#7c4dff", width=1.5)), row=1, col=1)
+                fig2.add_hline(y=70, row=1, col=1, line=dict(color="#ef5350", width=1, dash="dot"))
+                fig2.add_hline(y=30, row=1, col=1, line=dict(color="#26a69a", width=1, dash="dot"))
+                fig2.add_hline(y=50, row=1, col=1, line=dict(color="#888", width=0.8, dash="dot"))
 
-                with st.expander("Trade log", expanded=False):
-                    st.dataframe(pd.DataFrame(result["trades"]), use_container_width=True, hide_index=True)
+                if "MACD_hist" in intraday.columns:
+                    hist = intraday["MACD_hist"]
+                    fig2.add_trace(go.Bar(x=intraday.index, y=hist, name="MACD Histogram",
+                                          marker_color=["#26a69a" if v >= 0 else "#ef5350" for v in hist.fillna(0)]), row=2, col=1)
+                    fig2.add_trace(go.Scatter(x=intraday.index, y=intraday["MACD"], name="MACD", line=dict(color="#42a5f5", width=1.2)), row=2, col=1)
+                    fig2.add_trace(go.Scatter(x=intraday.index, y=intraday["MACD_signal"], name="Signal", line=dict(color="#ff7043", width=1.2)), row=2, col=1)
 
-    st.markdown("---")
-    if ai_available():
-        if st.button("Generate AI Day Trading Brief", key="dt_ai_brief"):
-            logger.info(f"[trading] 'Generate AI Day Trading Brief' button pressed for {ticker}")
-            signals = {
-                "market_status": status,
-                "vix": vix_val,
-                "vix_regime": vix_regime,
-                "sp_regime": sp_regime,
-                "vwap_dev": vwap_dev,
-                "vwap_note": vwap_note,
-                "mom_note": mom_note,
-                "vol_note": vol_note,
-                "ta_note": ta_note,
-            }
-            key_levels = {"pivot": pivot, "r1": r1, "s1": s1, "or_note": or_note}
-            with st.spinner("Generating AI day trading read..."):
-                brief = generate_daytrading_brief(ticker, current_price, signals, key_levels)
-            if brief:
-                logger.info(f"[trading] AI day trading brief generated successfully for {ticker}")
-                st.markdown(format_ai_markdown(brief))
-            else:
-                logger.warning(f"[trading] AI day trading brief generation failed for {ticker}")
-                st.error("AI generation failed — check logs (Ollama model may be unreachable or unable to answer within its token budget).")
+                fig2.update_layout(template="plotly_dark" if st.context.theme.type == "dark" else "plotly_white", height=350, margin=dict(l=0, r=0, t=10, b=0))
+                fig2.update_yaxes(range=[0, 100], row=1, col=1)
+                st.plotly_chart(fig2, use_container_width=True)
+
+    with tab_bt:
+        with st.expander("Backtest: MACD Bullish Cross (2yr history)", expanded=True):
+            st.caption(
+                "Tests the momentum signal above against 2 years of history: buy when the MACD "
+                "histogram turns up while MACD & Signal are still below zero and price is above "
+                "the 200-day average, then exit on a 2% stop-loss or 3% take-profit — one trade "
+                "at a time, long only. Close-to-close approximation, not a live-fill simulation."
+            )
+            if st.button("Run Backtest", key="dt_run_backtest"):
+                logger.info(f"[trading] 'Run Backtest' button pressed for {ticker} (MACD bullish cross)")
+                with st.spinner(f"Loading 2 years of {ticker} history…"):
+                    bt_df = _load_backtest_df(ticker)
+                if bt_df is None or bt_df.empty or "MACD_hist" not in bt_df.columns:
+                    logger.warning(f"[trading] Backtest for {ticker} blocked: not enough history")
+                    st.warning("Not enough history to backtest this ticker.")
+                else:
+                    signal = macd_bullish_cross_signal(bt_df)
+                    result = simulate_trades(bt_df, signal)
+                    logger.info(
+                        f"[trading] Backtest for {ticker} completed: num_trades={result['num_trades']} "
+                        f"win_rate={result['win_rate']:.1f}% total_return_pct={result['total_return_pct']:+.1f}%"
+                    )
+                    st.session_state[f"dt_backtest_{ticker}"] = result
+
+            result = st.session_state.get(f"dt_backtest_{ticker}")
+            if result:
+                if result["num_trades"] == 0:
+                    st.info("No MACD bullish-cross signals fired for this ticker over the last 2 years.")
+                else:
+                    if result["num_trades"] < 10:
+                        st.warning(f"Only {result['num_trades']} trades in this window — too few to draw firm conclusions.")
+                    bc1, bc2, bc3, bc4 = st.columns(4)
+                    bc1.metric("Trades", result["num_trades"])
+                    bc2.metric("Win Rate", f"{result['win_rate']:.1f}%")
+                    bc3.metric("Total Return", f"{result['total_return_pct']:+.1f}%")
+                    bc4.metric("Final Value", f"${result['final_value']:,.0f}", help="Starting from $1,000")
+
+                    eq_fig = go.Figure()
+                    eq_fig.add_trace(go.Scatter(
+                        x=result["equity_curve"].index, y=result["equity_curve"].values,
+                        line=dict(color="#9370DB", width=2), name="Equity",
+                    ))
+                    eq_fig.update_layout(template="plotly_dark" if st.context.theme.type == "dark" else "plotly_white", height=280, margin=dict(l=0, r=0, t=10, b=0),
+                                          yaxis_title="Portfolio Value ($)")
+                    st.plotly_chart(eq_fig, use_container_width=True)
+
+                    with st.expander("Trade log", expanded=False):
+                        st.dataframe(pd.DataFrame(result["trades"]), use_container_width=True, hide_index=True)
+
+    with tab_weights:
+        _render_signal_weights(
+            ticker,
+            {
+                "vwap_direction": vwap_dir,
+                "momentum_direction": mom_dir,
+                "trend_direction": ta_dir,
+            },
+            bull_votes=bull_votes,
+            bear_votes=bear_votes,
+            n_signals=len(directional_signals),
+        )
+
+    with tab_ai:
+        if ai_available():
+            if st.button("Generate AI Day Trading Brief", key="dt_ai_brief"):
+                logger.info(f"[trading] 'Generate AI Day Trading Brief' button pressed for {ticker}")
+                signals = {
+                    "market_status": status,
+                    "vix": vix_val,
+                    "vix_regime": vix_regime,
+                    "sp_regime": sp_regime,
+                    "vwap_dev": vwap_dev,
+                    "vwap_note": vwap_note,
+                    "mom_note": mom_note,
+                    "vol_note": vol_note,
+                    "ta_note": ta_note,
+                }
+                key_levels = {"pivot": pivot, "r1": r1, "s1": s1, "or_note": or_note}
+                with st.spinner("Generating AI day trading read..."):
+                    brief = generate_daytrading_brief(ticker, current_price, signals, key_levels)
+                if brief:
+                    logger.info(f"[trading] AI day trading brief generated successfully for {ticker}")
+                    st.markdown(format_ai_markdown(brief))
+                else:
+                    logger.warning(f"[trading] AI day trading brief generation failed for {ticker}")
+                    st.error("AI generation failed — check logs (Ollama model may be unreachable or unable to answer within its token budget).")
+
 
     st.caption("Data from yfinance · Refreshes every 60s · Not financial advice.")
 
@@ -831,19 +878,53 @@ def _render_options():
         st.session_state["_last_logged_opt_ticker"] = ticker
 
     st.markdown("#### Implied Volatility Dashboard")
+    with st.expander("How to read this", expanded=False):
+        st.markdown(
+            "- **IV Rank** — where current IV sits vs. its own 52-week range (0=lowest, "
+            "100=highest). High (>60) means options are rich for *this* stock's own history — "
+            "favors selling premium. Low (<30) means cheap — favors buying.\n"
+            "- **IV/RV Ratio** — IV vs. realized (actual) volatility. >1.15x = rich, <0.85x = "
+            "cheap. This and IV Rank can disagree (rich vs. its own history but still fair vs. "
+            "recent realized moves) — that's a real signal, not a bug.\n"
+            "- **IV/GARCH Ratio** — the same rich/cheap framing, but forward-looking: GARCH "
+            "forecasts where volatility is *going*, not where it's already been. Agreement "
+            "between IV/RV and IV/GARCH is a higher-conviction read than either alone.\n"
+            "- **Term Structure** — Backwardation (near-term IV > far-term) often reflects an "
+            "upcoming event (earnings); Contango (far-term > near-term) is the normal state."
+        )
     c1, c2, c3, c4, c5 = st.columns(5)
-    ivr = iv_metrics.get("iv_rank", 50)
-    ivr_signal = "🔴 Sell Premium" if ivr > 60 else ("🟢 Buy Premium" if ivr < 30 else "🟡 Neutral")
-    c1.metric("IV Rank", f"{ivr:.0f}", ivr_signal)
-    c2.metric("IV Percentile", f"{iv_metrics.get('iv_percentile', 50):.0f}%")
-    c3.metric("ATM IV (Live)", f"{iv_metrics.get('atm_iv', 0) or 0:.1f}%")
-    c4.metric("HV 21-day", f"{iv_metrics.get('hv_21', 0):.1f}%")
-    c5.metric("Term Structure", iv_metrics.get("term_structure", "Flat"))
+    ivr = iv_metrics.get("iv_rank")
+    if ivr is None:
+        # Was iv_metrics.get("iv_rank", 50), so a failed options fetch rendered
+        # "IV Rank 50 / 🟡 Neutral" and "HV 21-day 0.0%" as though real.
+        logger.warning(
+            "[trading] Options tab: IV metrics unavailable for %s: %s",
+            ticker, iv_metrics.get("error", "unknown error"),
+        )
+        st.error(
+            "IV metrics unavailable — the options data fetch failed. Showing no "
+            "IV Rank rather than a placeholder value; retry in a moment."
+        )
+    else:
+        # IVR_HIGH/IVR_LOW, not bare literals — this used to say 60, while
+        # scripts/alert_sweep.py used IVR_HIGH=50, so an IV rank of 55 read
+        # "Neutral" here and fired a sell-premium alert from cron on the same day.
+        ivr_signal = (
+            "🔴 Sell Premium" if ivr > IVR_HIGH
+            else ("🟢 Buy Premium" if ivr < IVR_LOW else "🟡 Neutral")
+        )
+        iv_pctile = iv_metrics.get("iv_percentile")
+        hv_21 = iv_metrics.get("hv_21")
+        c1.metric("IV Rank", f"{ivr:.0f}", ivr_signal)
+        c2.metric("IV Percentile", f"{iv_pctile:.0f}%" if iv_pctile is not None else "—")
+        c3.metric("ATM IV (Live)", f"{iv_metrics.get('atm_iv', 0) or 0:.1f}%")
+        c4.metric("HV 21-day", f"{hv_21:.1f}%" if hv_21 is not None else "—")
+        c5.metric("Term Structure", iv_metrics.get("term_structure", "Flat"))
 
     iv_rv = iv_metrics.get("iv_rv_ratio")
-    if iv_rv and iv_rv > 1.15:
+    if iv_rv and iv_rv > IV_RV_PREMIUM_THRESHOLD:
         st.warning(f"IV/RV Ratio {iv_rv:.2f}x — options premium is elevated vs realized volatility. Systematic edge in selling premium.")
-    elif iv_rv and iv_rv < 0.85:
+    elif iv_rv and iv_rv < (2 - IV_RV_PREMIUM_THRESHOLD):
         st.success(f"IV/RV Ratio {iv_rv:.2f}x — options are cheap vs realized volatility. Better to buy than sell.")
 
     garch_vol = iv_metrics.get("garch_forecast_vol")
@@ -995,21 +1076,6 @@ def _trained_at_str(ticker: str) -> str | None:
     return None
 
 
-def _retrain_overdue(ticker: str) -> bool:
-    acc_path = STORAGE_DIR / f"{ticker.upper()}_accuracy.json"
-    xgb_path = STORAGE_DIR / f"{ticker.upper()}_xgb.pkl"
-    check_path = acc_path if acc_path.exists() else xgb_path
-    if not check_path.exists():
-        return False
-    try:
-        import time as _time
-        mtime = check_path.stat().st_mtime
-        age_days = (_time.time() - mtime) / 86400
-        return age_days > 30
-    except Exception:
-        return False
-
-
 def _load_pred_df(ticker: str, period: str = "2y") -> pd.DataFrame | None:
     raw = get_price_history(ticker, period=period)
     if raw is None or raw.empty:
@@ -1057,18 +1123,22 @@ def _render_prediction_card(result: dict):
         gauge={
             "axis": {
                 "range": [35, 65],
-                "tickvals": [35, 40, 47, 50, 53, 60, 65],
-                "ticktext": ["35%", "40%", "47%", "50%", "53%", "60%", "65%"],
+                "tickvals": [35, 40, 45, 50, 55, 60, 65],
+                "ticktext": ["35%", "40%", "45%", "50%", "55%", "60%", "65%"],
                 "tickfont": {"size": 11, "color": "#aaa"},
             },
             "bar": {"color": cfg["gauge_color"], "thickness": 0.25},
             "bgcolor": "rgba(0,0,0,0)",
             "borderwidth": 0,
+            # Shaded bands must match predict()'s actual dead-band of
+            # [0.45, 0.55] (ml_prediction.py). They previously showed 47-53,
+            # so a 46% reading rendered inside a red "bearish" band while the
+            # model itself was calling it NEUTRAL.
             "steps": [
                 {"range": [35, 40], "color": "rgba(239,83,80,0.35)"},
-                {"range": [40, 47], "color": "rgba(239,83,80,0.15)"},
-                {"range": [47, 53], "color": "rgba(158,158,158,0.15)"},
-                {"range": [53, 60], "color": "rgba(38,166,154,0.15)"},
+                {"range": [40, 45], "color": "rgba(239,83,80,0.15)"},
+                {"range": [45, 55], "color": "rgba(158,158,158,0.15)"},
+                {"range": [55, 60], "color": "rgba(38,166,154,0.15)"},
                 {"range": [60, 65], "color": "rgba(38,166,154,0.35)"},
             ],
             "threshold": {"line": {"color": "#ffffff", "width": 3}, "thickness": 0.75, "value": gauge_pct},
@@ -1085,10 +1155,10 @@ def _render_prediction_card(result: dict):
 
     with col_gauge:
         st.plotly_chart(fig_gauge, use_container_width=True)
-        st.caption("Neutral zone: 47–53% — no directional call issued. Display range capped at 35–65% to prevent false precision.")
+        st.caption("Neutral zone: 45–55% — no directional call issued. Shown on a 35–65% axis so the display never implies more precision than the model supports.")
 
     with col_stats:
-        st.markdown(f"#### Signal Details")
+        st.markdown("#### Signal Details")
         conf_badge_class = {"HIGH": "aeth-badge--bull", "MODERATE": "aeth-badge--warn", "LOW": "aeth-badge--neutral"}.get(confidence, "aeth-badge--neutral")
         st.markdown(
             f'<span class="aeth-badge {conf_badge_class}">Confidence: {confidence}</span>',
@@ -1263,7 +1333,26 @@ def _render_model_performance(eval_result: dict, ticker: str):
         st.markdown("")
 
         m1, m2 = st.columns(2)
-        m1.metric("Directional Accuracy", f"{dir_acc * 100:.1f}%", delta=f"{(dir_acc - 0.50) * 100:+.1f}% edge")
+        # Edge is measured against the naive always-one-way baseline, not a flat
+        # 50%. After the neutral band drops small moves, drift puts the majority
+        # class at 54-60% on a trending ticker, so "accuracy - 50%" reported a
+        # healthy edge for models that were losing to a constant guess.
+        baseline = eval_result.get("baseline_accuracy")
+        if baseline:
+            m1.metric(
+                "Directional Accuracy", f"{dir_acc * 100:.1f}%",
+                delta=f"{(dir_acc - baseline) * 100:+.1f}% vs baseline",
+                help=(
+                    f"Baseline {baseline * 100:.1f}% = always predicting the more common "
+                    "direction on this ticker's labels. That, not 50%, is what the model "
+                    "has to beat to be worth trading."
+                ),
+            )
+        else:
+            m1.metric(
+                "Directional Accuracy", f"{dir_acc * 100:.1f}%",
+                help="Retrain this model to record its naive baseline for comparison.",
+            )
         m2.metric("ROC-AUC", f"{auc:.3f}", delta=f"{(auc - 0.5):.3f} above random")
         m3, m4 = st.columns(2)
         m3.metric("Total Predictions", f"{n_preds:,}", help="Out-of-sample events across all WF folds")
@@ -1537,8 +1626,10 @@ def _render_predictions_disclaimer():
         modest edge (typically 52–58% accuracy).
         It cannot predict news events, earnings surprises, or macro regime changes.
         Past walk-forward accuracy is <b>not</b> a guarantee of future performance.
-        Probability values are capped at 35–65% — any raw model output beyond these bounds
-        is clipped to prevent conveying false precision.<br><br>
+        The probability gauge is drawn on a 35–65% axis so the display never implies
+        more precision than the model supports — the underlying probability itself is
+        not clipped, and a reading outside that range is what the HIGH confidence
+        tier is defined by.<br><br>
         <b>This output is for research purposes only.</b>
         Position sizing decisions should use the Risk page — not this signal alone.
         </div>
@@ -1771,6 +1862,8 @@ def _render_intraday_predictions():
             f"Signal from the {result['bar_timestamp']} bar at "
             f"{result['price_at_prediction']:.2f} · neutral band ±{result['threshold_pct']:.3f}%"
         )
+
+        _render_intraday_exit_plan(result, interval)
         log_activity("intraday_prediction_generated", ticker, result)
 
     st.markdown("---")
@@ -1811,18 +1904,562 @@ def _render_intraday_predictions():
         st.dataframe(display, hide_index=True, width="stretch")
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# ── Horizon Cockpit (Roadmap Item 1) ─────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+
+_DIRECTION_ICONS = {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪"}
+
+
+@st.cache_data(ttl=600)
+def _load_ladder_quotes(ticker: str):
+    """
+    Expiry-ladder ATM quotes for the options cost model.
+
+    TTL matches OPTIONS_CACHE_TTL (600s) and `get_expiry_ladder_quotes` fetches
+    one chain per distinct expiry — four rungs is four fetches that then serve
+    every horizon, so this must be called once per render, never once per row.
+    """
+    from data.options_data import get_expiry_ladder_quotes
+
+    return get_expiry_ladder_quotes(ticker)
+
+
+def _render_horizon_cockpit():
+    """
+    Every horizon's current read in one table: direction, live accuracy, when the
+    signal expires, and whether it can pay for itself.
+
+    Read-only. `build_consensus()` never predicts or writes — see its module
+    docstring on why auto-generating predictions would corrupt the live win rate
+    that Model Lab and the retrain triggers depend on. Refreshing is the explicit
+    button below.
+    """
+    from analysis.interval_consensus import build_consensus
+
+    ticker = (st.session_state.get("predictions_ticker") or "SPY").upper().strip()
+
+    st.markdown("#### Horizon Cockpit")
+    st.caption(
+        f"Every model's current read on **{ticker}**, side by side — reads saved "
+        "predictions only, and never generates one on its own. Change the ticker in "
+        "either mode below and this follows."
+    )
+
+    ctl1, ctl2 = st.columns([2, 1])
+    with ctl1:
+        # Defaults ON. The shares cost model ignores delta leverage and has no
+        # theta term, so for anyone actually trading contracts its verdict is not
+        # conservative — it is wrong in the optimistic direction. On a 30 DTE ATM
+        # SPY option theta alone runs ~6% of premium over five days against a
+        # modelled net near -5.5%, so "tradeable" under the shares model and
+        # "loses money as an option" routinely coincide. Four chain fetches cached
+        # ten minutes is a cheap price for not being misled about that.
+        price_with_options = st.checkbox(
+            "Price with live options quotes",
+            value=st.session_state.get("cockpit_use_options", True),
+            key="cockpit_use_options",
+            help=(
+                "On (default): fetches an ATM expiry ladder and prices each horizon as "
+                "an actual option, sweeping 0/2/7/30 DTE. Costs four chain fetches, "
+                "cached 10 min. Off: costs come from the stored shares model (2 bps "
+                "round trip), which ignores delta leverage and has no theta term — "
+                "optimistic for contracts, not conservative."
+            ),
+        )
+    with ctl2:
+        refresh = st.button(
+            "Refresh all horizons", key="cockpit_refresh", width="stretch",
+            help=(
+                "Regenerates the intraday prediction for every interval and logs each "
+                "one. Deliberately manual: an automatic refresh would append to the "
+                "prediction log on every page view and distort the live win rate."
+            ),
+        )
+
+    if refresh:
+        logger.info(f"[trading] cockpit 'Refresh all horizons' pressed for {ticker}")
+        from analysis.intraday_prediction import INTERVAL_SPECS, predict_intraday
+
+        progress = st.progress(0.0)
+        for i, iv in enumerate(INTERVAL_SPECS):
+            with st.spinner(f"Predicting {iv} direction for {ticker}…"):
+                result = predict_intraday(ticker, iv)
+            if result.get("error"):
+                st.caption(f"{iv}: {result['error']}")
+            else:
+                log_activity("intraday_prediction_generated", ticker, result)
+            progress.progress((i + 1) / len(INTERVAL_SPECS))
+        progress.empty()
+
+    ladder_quotes = None
+    underlying_price = None
+    if price_with_options:
+        with st.spinner("Fetching ATM expiry ladder…"):
+            ladder = _load_ladder_quotes(ticker)
+        if ladder.get("error"):
+            st.warning(f"Options quotes unavailable ({ladder['error']}) — falling back to the shares cost model.")
+        else:
+            ladder_quotes = ladder.get("quotes") or None
+            underlying_price = ladder.get("underlying_price")
+            if ladder_quotes:
+                rungs = ", ".join(
+                    f"{q['requested_dte']:g}d→{q['expiry_date']}" for q in ladder_quotes.values()
+                )
+                sources = {q["quote_source"] for q in ladder_quotes.values()}
+                st.caption(
+                    f"Ladder: {rungs}. Quote source: {', '.join(sorted(sources))}."
+                    + ("  Model prices used where the book was empty." if "model_price" in sources else "")
+                )
+            for skip in ladder.get("skipped", []):
+                st.caption(f"Skipped {skip['requested_dte']:g}d rung — {skip['reason']}")
+
+    consensus = build_consensus(
+        ticker, ladder_quotes=ladder_quotes, underlying_price=underlying_price,
+    )
+
+    from analysis.horizon_clock import describe_remaining
+
+    rows = []
+    for h in consensus["horizons"]:
+        if not h["has_model"]:
+            rows.append({
+                "Horizon": h["horizon"], "Signal": "— not trained", "Prob": "—",
+                "Conf": "—", "Live acc (n)": "—", "Expires": "—",
+                "Net edge": "—", "Cost": "—", "Age": "—",
+            })
+            continue
+        if not h["has_prediction"]:
+            rows.append({
+                "Horizon": h["horizon"], "Signal": "— no prediction", "Prob": "—",
+                "Conf": "—",
+                "Live acc (n)": _acc_with_n(h), "Expires": "—",
+                "Net edge": "—", "Cost": "—", "Age": "—",
+            })
+            continue
+
+        direction = (h["direction"] or "neutral").lower()
+        icon = _DIRECTION_ICONS.get(direction, "⚪")
+        signal = f"{icon} {direction.upper()}"
+        if h["is_expired"]:
+            signal = f"⌛ {direction.upper()} (expired)"
+        elif h["crosses_session_close"]:
+            signal = f"{icon} {direction.upper()} (never graded)"
+
+        if h["crosses_session_close"]:
+            expires = "past the close"
+        elif h["expires_at_str"]:
+            expires = f"{h['expires_at_str'].split(' ', 1)[1] if h['horizon'] != 'daily' else h['expires_at_str']}"
+        else:
+            expires = "—"
+
+        net = h["net_edge_pct"]
+        rows.append({
+            "Horizon": h["horizon"],
+            "Signal": signal,
+            "Prob": f"{h['probability'] * 100:.0f}%" if h["probability"] is not None else "—",
+            "Conf": (h["confidence"] or "—").title(),
+            "Live acc (n)": _acc_with_n(h),
+            "Expires": expires,
+            "Net edge": f"{net:+.3f}%" if net is not None else "—",
+            "Cost": (
+                ("options" if h["cost_model"] == "options" else "shares")
+                + (f" · {h['dominant_cost']}" if h["dominant_cost"] else "")
+                + (f" · best {h['best_dte']:g}d" if h["best_dte"] is not None else "")
+                if h["cost_model"] else "—"
+            ),
+            "Age": describe_remaining(-(h["prediction_age_minutes"] or 0)).replace("expired ", "").replace(" ago", "")
+                   if h["prediction_age_minutes"] is not None else "—",
+        })
+
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+    a = consensus["alignment"]
+    live_total = a["n_bullish"] + a["n_bearish"] + a["n_neutral"]
+    if live_total == 0:
+        st.info("No live predictions across any horizon — press **Refresh all horizons** to generate them.")
+    else:
+        verdict = {
+            "bullish": "All live horizons point bullish",
+            "bearish": "All live horizons point bearish",
+            "mixed": "Horizons disagree",
+            "none": "No directional call on any live horizon",
+        }[a["net_direction"]]
+        st.markdown(
+            f"**{verdict}** — {a['n_bullish']} bullish / {a['n_bearish']} bearish / "
+            f"{a['n_neutral']} neutral across {live_total} live horizon(s)."
+        )
+        if a["tightest_tradeable"]:
+            tight = next(h for h in consensus["horizons"] if h["horizon"] == a["tightest_tradeable"])
+            st.success(
+                f"Tightest tradeable horizon: **{a['tightest_tradeable']}** — expires "
+                f"{tight['expires_at_str']} ({describe_remaining(tight['minutes_remaining'])})."
+            )
+        elif a["net_direction"] in ("bullish", "bearish"):
+            st.warning(
+                "No horizon both agrees with the net direction and clears its costs.",
+                icon="⚠️",
+            )
+        if a["agree_but_uneconomic"]:
+            # The point of the whole panel: the horizon you are most likely to
+            # act on is often the one least able to pay for itself.
+            st.error(
+                f"Agree directionally but do **not** clear costs: "
+                f"**{', '.join(a['agree_but_uneconomic'])}**. Treat these as information, "
+                f"not trades — a statistically real edge can still lose money.",
+                icon="💸",
+            )
+
+    if consensus["warnings"]:
+        with st.expander(f"{len(consensus['warnings'])} note(s)", expanded=False):
+            for w in consensus["warnings"]:
+                st.caption(f"— {w}")
+
+    _render_consensus_chat(ticker, consensus)
+
+
+def _render_consensus_chat(ticker: str, consensus: dict):
+    """
+    Ask questions about the horizon readings (Roadmap Item 13).
+
+    Grounded strictly on the consensus dict already rendered above — the model gets
+    that payload and nothing else. No chart, no news, no price history. That
+    constraint is the whole design: ungrounded, an LLM will narrate a VWAP reclaim
+    that never happened, which is worse than no answer at all.
+    """
+    if not ai_available():
+        return
+
+    from ai.stock_brief import generate_consensus_answer
+
+    with st.expander("Ask about these readings", expanded=False):
+        st.caption(
+            "Answers come only from the table above — the model is given the consensus "
+            "numbers and explicitly told to say what is missing rather than fill gaps. "
+            "It has no chart and no news feed."
+        )
+        question = st.text_input(
+            "Question",
+            placeholder="e.g. Why is 15m bullish but not tradeable?",
+            key="cockpit_chat_q",
+        )
+        if st.button("Ask", key="cockpit_chat_btn") and question.strip():
+            logger.info(f"[trading] cockpit chat asked for {ticker}: {question[:80]}")
+            with st.spinner("Reading the consensus…"):
+                answer = generate_consensus_answer(ticker, question.strip(), consensus)
+            if answer:
+                st.markdown(format_ai_markdown(answer))
+            else:
+                st.error(
+                    "AI generation failed — check logs (the provider may be unreachable "
+                    "or unable to answer within its token budget)."
+                )
+
+
+def _acc_with_n(h: dict) -> str:
+    """Live accuracy is meaningless without its sample size, so they render together."""
+    acc, n = h["live_accuracy"], h["n_resolved"] or 0
+    if acc is None:
+        return f"— ({n})"
+    return f"{acc * 100:.1f}% ({n})"
+
+
+_SIGNAL_LABELS = {
+    "vwap_direction": "VWAP",
+    "momentum_direction": "Momentum",
+    "trend_direction": "Trend Alignment",
+}
+
+
+def _render_signal_weights(ticker: str, signal_state: dict, *,
+                           bull_votes: int, bear_votes: int, n_signals: int):
+    """
+    Which signals have actually predicted direction, fitted from logged history
+    (Roadmap Item 10).
+
+    Deliberately refuses to show anything weight-shaped until there are enough
+    resolved events to fit — below that it shows the vote count the trade card
+    already computes, and says why. Inventing a weighting like
+    "Trend 35% / Momentum 20%" would read as measured when nothing produced it.
+    """
+    from analysis.signal_attribution import (
+        MIN_EVENTS_TO_FIT,
+        SIGNAL_EVENT_TYPE,
+        fit_signal_weights,
+        parse_signal_events,
+        resolve_signal_events,
+        signal_contributions,
+    )
+    from portfolio.activity_log import get_events_by_type
+
+    st.markdown("### Signal Weights")
+    st.caption(
+        "Fitted from your own logged Day Trading history — which signals actually "
+        "led price, not a hand-assigned weighting."
+    )
+
+    vote_total = max(bull_votes, bear_votes)
+    st.markdown(
+        f"**Current vote:** {bull_votes} bullish / {bear_votes} bearish of "
+        f"{n_signals} directional signals."
+    )
+
+    horizon_days = st.selectbox(
+        "Label horizon (trading days)", [1, 2, 3], index=0, key="dt_weights_horizon",
+        help=(
+            "The activity log records what the signals said but never what happened, "
+            "so the outcome is reconstructed from price action this many days out. "
+            "Changing it changes what the weights mean."
+        ),
+    )
+
+    if not st.button("Fit weights from logged history", key="dt_fit_weights"):
+        st.caption(
+            f"Needs at least {MIN_EVENTS_TO_FIT} logged **Analyze** clicks that have since "
+            "resolved. Fitting reads the activity log and fetches price history to derive "
+            "outcomes, so it runs on demand."
+        )
+        return
+
+    with st.spinner("Reading logged signals and deriving outcomes…"):
+        rows = get_events_by_type(SIGNAL_EVENT_TYPE, ticker=ticker)
+        events = parse_signal_events(rows)
+        resolved = resolve_signal_events(
+            events,
+            lambda t: _load_pred_df(t, period="2y"),
+            horizon_days=int(horizon_days),
+        )
+        weights = fit_signal_weights(resolved)
+
+    st.caption(
+        f"{len(events)} logged Analyze click(s) for {ticker}; {len(resolved)} with an "
+        f"elapsed {horizon_days}-day outcome."
+    )
+
+    if not weights["fitted"]:
+        st.info(weights["reason"], icon="ℹ️")
+        st.caption(
+            "Until then the trade card's vote count above is the honest version — it is a "
+            "count, and it does not pretend to be a weighting."
+        )
+        return
+
+    coef_rows = [
+        {
+            "Signal": _SIGNAL_LABELS.get(f, f),
+            "Fitted weight": f"{c:+.3f}",
+            "Reads as": (
+                "predicts direction" if c > 0.05
+                else ("predicts the opposite" if c < -0.05 else "no information")
+            ),
+        }
+        for f, c in sorted(
+            weights["coefficients"].items(), key=lambda kv: abs(kv[1]), reverse=True,
+        )
+    ]
+    st.dataframe(pd.DataFrame(coef_rows), hide_index=True, width="stretch")
+
+    contrib = signal_contributions(weights, signal_state)
+    if contrib and contrib["total_abs"] > 0:
+        st.markdown("**What is driving the current read**")
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "Signal": _SIGNAL_LABELS.get(f, f),
+                    "Now": (signal_state.get(f) or "neutral").title(),
+                    "Contribution": f"{v:+.3f}",
+                    "Share": f"{contrib['shares_pct'][f]:.0f}%",
+                }
+                for f, v in sorted(
+                    contrib["contributions"].items(), key=lambda kv: abs(kv[1]), reverse=True,
+                )
+            ]),
+            hide_index=True, width="stretch",
+        )
+        st.caption(
+            "Contributions are in log-odds; Share is each signal's fraction of the total "
+            "**absolute** movement, so a signal pointing the other way shows a real share "
+            "instead of silently cancelling out."
+        )
+    elif contrib:
+        st.caption("Every signal currently reads neutral, so there is no contribution to split.")
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Events fitted", weights["n"])
+    m2.metric("Base rate (up days)", f"{(weights['base_rate'] or 0) * 100:.0f}%")
+    m3.metric("In-sample accuracy", f"{(weights['train_accuracy'] or 0) * 100:.0f}%")
+    st.caption(
+        f"**In-sample, and small.** {weights['n']} events over 3 features — treat the "
+        "ordering of these weights as directional, not their magnitudes as precise. The "
+        "outcome is reconstructed from price action rather than from trades you actually "
+        "took, so this measures which signals led price on the days you happened to look. "
+        "Linking real fills (Roadmap Item 12) is what would fix that."
+    )
+
+
+def _render_similar_setups(setups: dict, horizon_days: int, direction: str):
+    """
+    Every historical bar where this model made the same call, and what happened
+    next (Roadmap Item 6).
+
+    The search itself was already running inside `predict()` — `predicted_mask`
+    finds exactly these bars in order to compute `expected_move_pct`, then
+    discarded everything except the median. This shows the rest.
+
+    In-sample: the model is scoring bars from its own training history, so the
+    win rate is optimistic in the same way "Signal Sharpe (IS)" is. Said plainly
+    below rather than buried.
+    """
+    st.markdown("## Similar Historical Setups")
+    n = setups["n"]
+    st.caption(
+        f"{n} past bar(s) where this model also called **{direction.upper()}**, and the "
+        f"{horizon_days}-day return that followed each one."
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    if setups["win_rate"] is not None:
+        c1.metric("Win Rate", f"{setups['win_rate'] * 100:.1f}%", f"{n} setups")
+    else:
+        c1.metric("Win Rate", "—", f"only {n} setups")
+    c2.metric("Median Return", f"{setups['median_pct']:+.2f}%")
+    c3.metric("Mean Return", f"{setups['mean_pct']:+.2f}%")
+    c4.metric("Middle 50%", f"{setups['p25_pct']:+.2f}% … {setups['p75_pct']:+.2f}%")
+
+    w1, w2 = st.columns(2)
+    w1.metric("Worst", f"{setups['worst_pct']:+.2f}%")
+    w2.metric("Best", f"{setups['best_pct']:+.2f}%")
+
+    returns = setups.get("returns_pct") or []
+    if len(returns) >= 5:
+        fig = go.Figure(go.Histogram(
+            x=returns, nbinsx=min(30, max(8, len(returns) // 3)),
+            marker_color="#42a5f5", opacity=0.85,
+        ))
+        fig.add_vline(x=0, line_color="#9e9e9e", line_dash="dash", line_width=1)
+        fig.add_vline(
+            x=setups["median_pct"], line_color="#26a69a", line_dash="dot",
+            annotation_text=f"median {setups['median_pct']:+.2f}%",
+        )
+        fig.update_layout(
+            template="plotly_dark" if st.context.theme.type == "dark" else "plotly_white",
+            height=260, margin=dict(l=10, r=10, t=10, b=10), showlegend=False,
+            xaxis_title=f"{horizon_days}-day forward return (%)", yaxis_title="Setups",
+            paper_bgcolor="rgba(0,0,0,0)",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    if setups["is_thin"]:
+        st.warning(
+            f"Only {n} comparable setups — too few for a win rate to mean anything. "
+            f"The distribution is shown for shape, not as a probability.",
+            icon="⚠️",
+        )
+    st.caption(
+        "**In-sample.** These bars come from the model's own training history, so this "
+        "win rate is optimistic — the same caveat as the in-sample Signal Sharpe above. "
+        "For an out-of-sample track record use Model Lab, which grades only predictions "
+        "that were logged live and then resolved."
+    )
+
+
+def _render_intraday_exit_plan(result: dict, interval: str):
+    """
+    The exit half of an intraday signal (Roadmap Items 2A + 2B).
+
+    Two things the app used to leave implicit:
+
+    1. **When the signal expires.** resolve_intraday_predictions() grades this
+       call against the close exactly `horizon_bars` bars later. The model has
+       validated evidence about that window and none about the bar after it, so
+       the horizon is not a suggestion — it is the edge of the evidence.
+    2. **A stop scaled to that window.** The Day Trading card's 1.5 x daily ATR
+       stop is a swing-scale stop; against a 75-minute horizon it would never be
+       touched, making any R:R computed from it meaningless.
+    """
+    from analysis.horizon_clock import describe_remaining, intraday_expiry
+    from analysis.intraday_prediction import INTERVAL_SPECS
+    from analysis.risk import horizon_stop
+
+    st.markdown("##### Exit plan")
+
+    interval_minutes = INTERVAL_SPECS[interval]["minutes"]
+    clock = intraday_expiry(
+        result.get("bar_timestamp"), result.get("horizon_minutes") or 0, interval_minutes,
+    )
+
+    price = result.get("price_at_prediction")
+    direction = result.get("direction", "neutral")
+    avg_move_pct = (result.get("tradeability") or {}).get("avg_move_pct")
+    stop = horizon_stop(price, avg_move_pct, direction=direction) if price and avg_move_pct else {}
+
+    e1, e2, e3 = st.columns(3)
+    if clock["expires_at_str"]:
+        e1.metric(
+            "Signal expires", clock["expires_at_str"].split(" ", 1)[1],
+            describe_remaining(clock["minutes_remaining"]),
+            delta_color="off",
+        )
+    else:
+        e1.metric("Signal expires", "—", "no bar timestamp")
+
+    if stop:
+        e2.metric(
+            "Horizon stop", f"${stop['stop_price']:.2f}",
+            f"{stop['stop_pct']:.2f}% away", delta_color="off",
+        )
+        # Target at 1R against the horizon stop. Deliberately not a bigger
+        # multiple: the model predicts direction over a fixed window, so there is
+        # no evidence supporting a target the horizon cannot reach.
+        target = (
+            price + stop["distance"] if direction in ("bullish",) else price - stop["distance"]
+        )
+        e3.metric("1R target", f"${target:.2f}", "1:1 within the horizon", delta_color="off")
+    else:
+        e2.metric("Horizon stop", "—", "no volatility anchor")
+
+    if clock["crosses_session_close"]:
+        st.error(
+            "This signal's horizon runs past the 4:00 PM close. It will never be graded — "
+            "forward returns that span the overnight gap were excluded from training, so "
+            "resolve_intraday_predictions() skips it permanently. Not a tradeable signal.",
+            icon="🚫",
+        )
+    elif clock["is_expired"]:
+        st.warning(
+            f"Already past its horizon ({describe_remaining(clock['minutes_remaining'])}). "
+            "Generate a fresh prediction rather than acting on this one.",
+            icon="⌛",
+        )
+
+    if stop:
+        st.caption(
+            f"Stop basis: {stop['basis']} — not the daily ATR, which is a swing-scale "
+            f"stop and would sit far outside a {result.get('horizon_minutes')}-minute window. "
+            f"Flat by {clock['expires_at_str'] or 'the horizon'} either way: past that point "
+            "the model has no validated edge."
+        )
+
+
 def _render_predictions():
     """
     Dispatcher for the Predictions tab. Defaults to Daily, which renders the
     original code path unchanged — the intraday model lives in its own module
     (analysis/intraday_prediction.py) and its own storage files, so selecting it
     cannot affect daily models or the Research page.
+
+    The Horizon Cockpit sits above the mode toggle because it spans both: it is
+    the one view that answers "which horizon should I be trading right now."
     """
     st.subheader("AI Price Predictions")
 
     if not _ML_AVAILABLE:
         st.info("ML predictions require the `scikit-learn`, `xgboost`, and `narwhals` packages. Run `pip install -r requirements.txt`.")
         return
+
+    _render_horizon_cockpit()
+
+    st.markdown("---")
 
     horizon_mode = st.radio(
         "Prediction horizon",
@@ -1879,12 +2516,13 @@ def _render_daily_predictions():
     status_col1, status_col2, status_col3 = st.columns(3)
     model_exists = _model_exists(ticker)
     trained_at = _trained_at_str(ticker) if model_exists else None
-    overdue = _retrain_overdue(ticker) if model_exists else False
+    retrain_check = check_all_retrain_triggers(ticker) if model_exists else None
+    should_retrain = bool(retrain_check and retrain_check["should_retrain"])
 
     with status_col1:
         if model_exists:
-            icon = "✅" if not overdue else "⏰"
-            st.markdown(f"{icon} **Model status:** {'Trained' if not overdue else 'Overdue for refresh'}")
+            icon = "✅" if not should_retrain else "⏰"
+            st.markdown(f"{icon} **Model status:** {'Trained' if not should_retrain else 'Overdue for refresh'}")
         else:
             st.markdown("❌ **Model status:** Not trained")
 
@@ -1903,6 +2541,14 @@ def _render_daily_predictions():
                     st.caption(f"Last prediction: **{utc_iso_to_et_str(pred_ts, '%I:%M %p ET')}** (this session)")
                 except Exception:
                     pass
+
+    if should_retrain:
+        fired = [
+            t["reason"] for t in retrain_check["triggers"].values() if t["triggered"]
+        ]
+        st.warning(
+            "Retrain recommended — " + " ".join(fired) + " Use **Train / Update Model** below.",
+        )
 
     st.markdown("---")
 
@@ -1937,11 +2583,49 @@ def _render_daily_predictions():
             acc_std = train_result.get("accuracy_std") or 0.0
             reliable = train_result.get("is_reliable", False)
             reliable_icon = "✅" if reliable else "⚠️"
+            holdout_acc = train_result.get("holdout_accuracy")
+            holdout_n = train_result.get("holdout_n") or 0
             logger.info(
-                f"[trading] ML model trained for {ticker}: accuracy={mean_acc * 100:.1f}% "
-                f"± {acc_std * 100:.1f}% reliable={reliable}"
+                f"[trading] ML model trained for {ticker}: in-search={mean_acc * 100:.1f}% "
+                f"± {acc_std * 100:.1f}% holdout={holdout_acc} (n={holdout_n}) reliable={reliable}"
             )
-            st.success(f"Model trained successfully for **{ticker}**. {reliable_icon} Walk-forward accuracy: **{mean_acc * 100:.1f}% ± {acc_std * 100:.1f}%**")
+
+            # Lead with the holdout figure. The walk-forward number is the winner
+            # of three stacked searches scored on their own data, so it is an
+            # upper bound; the holdout is the only number no search stage touched.
+            if holdout_acc is not None:
+                ci = train_result.get("holdout_ci95_halfwidth") or 0.0
+                base = train_result.get("holdout_baseline_accuracy")
+                msg = (
+                    f"Model trained for **{ticker}**. {reliable_icon} "
+                    f"**Out-of-sample accuracy: {holdout_acc * 100:.1f}%** "
+                    f"(±{ci * 100:.1f}%, n={holdout_n})"
+                )
+                if base:
+                    msg += f" vs a {base * 100:.1f}% always-one-way baseline"
+                if reliable:
+                    st.success(msg)
+                else:
+                    st.warning(msg)
+                st.caption(
+                    f"In-search walk-forward reads {mean_acc * 100:.1f}% ± {acc_std * 100:.1f}%. "
+                    "That figure is the best of three searches scored on the same history, so "
+                    "treat it as a ceiling — the out-of-sample number above is the estimate to "
+                    "size on. Its error bar is wide because the holdout is small."
+                )
+            else:
+                st.success(
+                    f"Model trained for **{ticker}**. {reliable_icon} Walk-forward accuracy: "
+                    f"**{mean_acc * 100:.1f}% ± {acc_std * 100:.1f}%**"
+                )
+                note = train_result.get("holdout_note")
+                st.caption(
+                    "No out-of-sample estimate available"
+                    + (f" — {note}" if note else "")
+                    + " In-search accuracy is selection-biased upward; treat it as a ceiling."
+                )
+            if train_result.get("reliability_reason"):
+                st.caption(train_result["reliability_reason"])
 
             st.session_state.pop(_cache_key(ticker), None)
             st.session_state.pop(_eval_cache_key(ticker), None)
@@ -2010,6 +2694,27 @@ def _render_daily_predictions():
     cached_price_path = st.session_state.get(_price_path_cache_key(ticker))
 
     if cached_result and not cached_result.get("error"):
+        with st.expander("How to read this", expanded=False):
+            st.markdown(
+                "- **Gauge** — bull probability, drawn on a 35–65% axis so it never "
+                "implies more confidence than the walk-forward accuracy supports. 45–55% is the "
+                "neutral dead-band — no directional call there.\n"
+                "- **Confidence badge** — HIGH/MODERATE/LOW reflects how far the probability sits "
+                "from neutral, not how *right* the model tends to be — check Model Lab's "
+                "confidence calibration table for whether HIGH actually means more accurate for "
+                "this ticker.\n"
+                "- **Expected Move** — a historical look-back (median past return in similar "
+                "setups), not a forecast — a rough magnitude reference only.\n"
+                "- **Feature Importance** — *why* the model leans this way (e.g. trend features "
+                "dominating vs. volatility features), not a ranking of what to trust more.\n"
+                "- **Model Performance / Walk-Forward Accuracy** — the honest, out-of-sample "
+                "estimate from training. The accuracy delta is the edge over a 50% coin flip; "
+                "52–58% is the normal, real range — don't expect much higher without suspecting "
+                "overfit.\n\n"
+                "Full writeup: `docs/ML_PREDICTION.md`. Live track record across all past "
+                "predictions (not just this one): **Model Lab**."
+            )
+
         st.markdown("## Direction Signal")
         _render_prediction_card(cached_result)
 
@@ -2027,6 +2732,15 @@ def _render_daily_predictions():
             _render_feature_importance(top_features)
         else:
             st.caption("No feature importance data available for this prediction.")
+
+        similar = cached_result.get("similar_setups")
+        if similar and similar.get("n"):
+            st.markdown("---")
+            _render_similar_setups(
+                similar,
+                cached_result.get("horizon_days") or 5,
+                cached_result.get("direction", "neutral"),
+            )
 
         st.markdown("---")
         st.markdown("## Model Performance")
@@ -2055,7 +2769,9 @@ def _render_daily_predictions():
                   into training features
                 - Reliability threshold: mean accuracy ≥ 52% AND std ≤ 8% across folds
                 - Neutral dead-band: bull probability in [0.45, 0.55] → signal = NEUTRAL
-                - Probability display range: capped to [35%, 65%]
+                - Probability display axis: [35%, 65%] — the gauge's axis only; the
+                  probability itself is never clipped (HIGH confidence is *defined* as
+                  falling outside that range)
 
                 **Feature engineering:**
                 - 18 features derived from `calculate_indicators()` output (no external data sources)

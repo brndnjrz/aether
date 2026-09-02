@@ -104,9 +104,11 @@ One page, four tabs:
   scored via reduced-fold walk-forward, rather than one fixed 5-day config for every ticker. Built
   with real discipline against overclaiming: the winning configuration still gets the full
   walk-forward validation (not a single train/test split), a neutral zone that excludes
-  flat-return days from training, and probability output deliberately clipped to 35–65% so it
-  never looks more confident than a ~52–58% historical edge actually is. Models expire after 30
-  days and need retraining. Alongside the direction call, a **Price Path** simulation
+  flat-return days from training, and a probability gauge deliberately drawn on a 35–65% axis
+  so it never looks more confident than a ~52–58% historical edge actually is. A model is flagged
+  overdue for retraining on any of three triggers — stale (30+ days old by default), a live
+  accuracy drop vs. what it trained with, or elevated market volatility (VIX) — checked on this
+  tab's status badge and, in more depth, on the **Model Lab** page (see below). Alongside the direction call, a **Price Path** simulation
   (Monte Carlo, seeded from the stock's own historical volatility and the model's own
   probability/expected-move as drift, run over the model's auto-selected horizon) reports a
   day-by-day 25th–75th percentile open/close band — a probability range, not a second
@@ -128,6 +130,23 @@ Flag/Pennant detection is unvalidated pattern geometry, same caveat as the candl
 its confidence score is an internally-consistent weighting of volume/momentum/trend/ATR/shape
 factors, not a backtested win rate; nothing in the app currently reports the historical hit rate
 of confirmed Flag/Pennant patterns the way the MACD Bullish Cross backtest does for its one rule.
+
+## 4. Model Lab — weekly model health check
+
+Once a model has been live for a while, open **Model Lab**. Read the **Horizon Scoreboard**
+at the top first — it answers *which* horizon to trade, which the per-model tabs below do not.
+A verdict of **Uneconomic** means the model works but its costs don't (usually the wrong
+expiry, and the horizon x expiry grid shows which one fixes it); **Do not trade** means there
+is no edge to salvage. Then pick the ticker's Daily or Intraday tab: the performance dashboard
+shows whether accuracy/win-rate on *actual logged predictions* still matches what the model
+trained with, Accuracy Over Time shows whether it is improving or drifting (with retrain dates
+marked), "Why the model was wrong" categorizes
+recent misses (counter-trend, choppy market, elevated VIX, earnings window, etc.) so a losing
+streak points at a reason instead of a raw number, and the Retrain Triggers table shows the same
+staleness/performance-drop/regime checks as the Predictions tab's badge, just with the detail
+behind each one. If a retrain doesn't help, Version History rolls back to the model it replaced.
+This isn't a step in a single trade's checklist — it's a periodic check (weekly is reasonable),
+separate from Steps 1-9 below.
 
 ---
 
@@ -225,11 +244,15 @@ entry-hour, by-ticker, and day-of-week analytics build up over time instead of b
 
 ### Step 6 — ML Predictions tab (confirmation only, never the trigger)
 
-6.1 Check the direction call (bullish/neutral/bearish) and bull probability (capped 35-65% — it will never show false high confidence).
+6.1 Start with the **Horizon Cockpit** at the top of the tab: all five models at once. If it flags horizons that *agree directionally but do not clear costs*, the read you were about to act on is the one that can't pay for itself — treat it as information.
 
-6.2 Check walk-forward accuracy for this specific ticker's trained model. A 52-58% edge is real but modest — a tilt, not a forecast.
+6.2 Check the direction call (bullish/neutral/bearish) and bull probability. 45-55% is the neutral dead-band; the gauge is drawn on a 35-65% axis so it never implies more precision than the model supports.
 
-6.3 **Decision point:** use this only to break a tie between two otherwise equally-supported setups. Never let a bullish ML read override a NEUTRAL or conflicting card from Step 4, and never enter a trade solely because the ML signal is bullish.
+6.3 Check walk-forward accuracy for this specific ticker's trained model. A 52-58% edge is real but modest — a tilt, not a forecast.
+
+6.4 **Note the exit clock.** The intraday exit plan gives the time this signal expires. That is not a suggestion — `resolve_intraday_predictions()` grades the call against the close exactly that far out, so past it the model has no validated edge. A horizon running past 4:00 PM is flagged as never gradeable and is not a tradeable signal at all.
+
+6.5 **Decision point:** use this only to break a tie between two otherwise equally-supported setups. Never let a bullish ML read override a NEUTRAL or conflicting card from Step 4, and never enter a trade solely because the ML signal is bullish.
 
 ### Step 7 — AI Day Trading Brief (optional)
 
@@ -307,7 +330,7 @@ entry-hour, by-ticker, and day-of-week analytics build up over time instead of b
 
 ### Step 6 — ML Predictions (confirmation only, plausibility check on strikes)
 
-6.1 Check the direction call and probability (capped 35-65%) and walk-forward accuracy, same caveats as the day trading workflow — a 52-58% edge is a tilt, not a forecast.
+6.1 Check the direction call and probability (gauge drawn on a 35-65% axis) and walk-forward accuracy, same caveats as the day trading workflow — a 52-58% edge is a tilt, not a forecast.
 
 6.2 Check the Monte Carlo price-path band (25th-75th percentile, seeded from historical vol plus the model's probability/expected-move as drift, run over the model's own horizon).
 

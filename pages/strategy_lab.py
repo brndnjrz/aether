@@ -1,6 +1,6 @@
 """
-Strategy Lab — two independent intraday strategies, each with a live scanner
-and a mechanical backtest over recent history.
+Strategy Lab — ORBC live scanner + backtest, plus a read-only Intraday
+Predictions reference panel.
 
 1. ORBC (Opening Range Breakout Confirmation) — define the opening range from
    the first N minutes after the 9:30 ET open, then require a second (or
@@ -8,11 +8,9 @@ and a mechanical backtest over recent history.
    filters the false breakouts common right after the open. Logic in
    analysis/orbc_strategy.py.
 
-2. MTF setup — identify trend on the 4-hour chart, wait for a pullback into a
-   demand zone on the 30-minute chart, confirm a market-structure shift on the
-   5-minute chart, read the tape for absorption then buyers taking control,
-   enter targeting the VAP with a stop at the swing low. Logic in
-   analysis/mtf_strategy.py.
+2. Intraday Predictions — read-only table of the latest saved Intraday
+   Prediction per interval (5m/15m/30m/1h), so it can be checked without
+   leaving this page. Training/refreshing models stays on Trading Desk.
 
 This page is display only — all detection lives in the analysis modules.
 """
@@ -35,7 +33,6 @@ from analysis.orbc_strategy import (
     ORBCConfig,
     backtest_orbc,
     latest_session_state,
-    to_market_tz,
 )
 from analysis.trendlines import detect_recent_trendlines, detect_swing_points
 from analysis.intraday_prediction import (
@@ -271,17 +268,21 @@ def _render_intraday_predictions_reference(ticker: str):
             untrained.append(interval)
             rows.append({
                 "Interval": interval, "Status": "— No model trained",
-                "Direction": "—", "Confidence": "—", "Probability": "—",
-                "Model Accuracy": "—", "Generated": "—",
+                "Direction": "—", "Confidence": "—", "P(call)": "—",
+                "Model Accuracy": "—", "Net edge": "—", "Generated": "—",
             })
             continue
 
-        history = get_intraday_prediction_history(ticker, interval)
+        # resolve=False: this panel is read-only, and resolve=True (the default)
+        # fires a fresh intraday fetch per interval on every rerun — four network
+        # round trips just to render a table — and rewrites the prediction log
+        # while doing it. Resolution belongs to Model Lab and the cron sweep.
+        history = get_intraday_prediction_history(ticker, interval, resolve=False)
         if history.empty:
             rows.append({
                 "Interval": interval, "Status": "— Trained, no prediction yet",
-                "Direction": "—", "Confidence": "—", "Probability": "—",
-                "Model Accuracy": "—", "Generated": "—",
+                "Direction": "—", "Confidence": "—", "P(call)": "—",
+                "Model Accuracy": "—", "Net edge": "—", "Generated": "—",
             })
             continue
 
@@ -291,16 +292,64 @@ def _render_intraday_predictions_reference(ticker: str):
         icon = _DIRECTION_ICONS.get(direction, "⚪")
         accuracy = meta.get("directional_accuracy")
         generated = latest["date"]
+        # The logged probability is P(bullish), so a bearish call at 0.22 is 78%
+        # confidence in the direction it actually called, not 22%. Showing the
+        # raw value renders a strong bearish signal as "BEARISH | High | 22%",
+        # which reads as weak. Same correction prediction_performance.py applies
+        # for calibration.
+        raw_prob = latest["probability"]
+        if pd.notna(raw_prob):
+            directional_prob = (1 - raw_prob) if direction == "bearish" else raw_prob
+            prob_display = f"{directional_prob * 100:.0f}%"
+        else:
+            prob_display = "—"
+
+        # Accuracy alone doesn't say whether a signal survives spread. The model's
+        # own cost check is already stored at train time; surface its verdict here
+        # rather than leaving a 53%-accurate, cost-negative signal looking green.
+        #
+        # This is assess_tradeability, which models cost in *underlying* percentage
+        # points: no delta leverage, no theta. It is the right check for shares and
+        # optimistic for contracts. The options-aware sweep needs live chain quotes,
+        # which would mean a network fetch per interval on every rerun — so it lives
+        # on Trading Desk's Horizon Cockpit, and the column is labelled accordingly.
+        tradeability = meta.get("tradeability") or {}
+        net_edge = tradeability.get("net_edge_pct")
+        if net_edge is None:
+            net_display = "—"
+        else:
+            net_display = f"{'✅' if net_edge > 0 else '❌'} {net_edge:+.3f}%"
+
+        # Baseline is what "always predict the more common direction" scores.
+        # An accuracy below it is worse than a constant guess.
+        baseline = meta.get("baseline_accuracy")
+        if accuracy is None:
+            acc_display = "—"
+        elif baseline:
+            acc_display = f"{accuracy * 100:.1f}% (base {baseline * 100:.0f}%)"
+        else:
+            acc_display = f"{accuracy * 100:.1f}%"
+
         rows.append({
             "Interval": interval, "Status": "Saved prediction",
             "Direction": f"{icon} {direction.upper()}",
             "Confidence": (latest["confidence"] or "—").title() if latest["confidence"] else "—",
-            "Probability": f"{latest['probability'] * 100:.0f}%" if pd.notna(latest["probability"]) else "—",
-            "Model Accuracy": f"{accuracy * 100:.1f}%" if accuracy is not None else "—",
+            "P(call)": prob_display,
+            "Model Accuracy": acc_display,
+            "Net edge": net_display,
             "Generated": generated.tz_convert(MARKET_TZ).strftime("%m/%d %I:%M %p ET") if pd.notna(generated) else "—",
         })
 
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    st.caption(
+        "**Net edge** prices the signal as *shares* — a 2 bps round-trip spread, no "
+        "delta leverage and no time decay. For contracts it is optimistic, not "
+        "conservative: on a 30 DTE ATM option theta alone can run ~6% of premium over "
+        "five days. For the options-priced verdict across the expiry ladder, use "
+        "Trading Desk → Predictions → Horizon Cockpit. **Model Accuracy** shows the "
+        "naive always-one-way baseline beside it; accuracy at or below that baseline "
+        "is not an edge regardless of how high it reads."
+    )
 
     if untrained:
         st.info(
@@ -704,9 +753,20 @@ def _render_orbc_backtest(ticker: str, config: ORBCConfig, interval: str):
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Trades", result["num_trades"])
-    c2.metric("Win Rate", f"{result['win_rate']:.1f}%")
-    c3.metric("Avg R:R", f"{result['avg_rr']:.2f}")
-    c4.metric("Total Return", f"{result['total_return_pct']:+.2f}%")
+    c2.metric("Win Rate", f"{result['win_rate']:.1f}%",
+              delta=f"{result['net_win_rate']:.1f}% net of costs")
+    if result.get("avg_rr_is_configured"):
+        c3.metric("Target R:R", f"{result['avg_rr']:.2f}",
+                  help="Your configured target, not a measured outcome — under the "
+                       "risk_reward target method every target is placed at exactly "
+                       "this multiple of risk, so it is identical for every trade.")
+    else:
+        c3.metric("Avg R:R", f"{result['avg_rr']:.2f}", help="Measured across trades.")
+    c4.metric("Total Return", f"{result['total_return_pct']:+.2f}%",
+              delta=f"{result['net_total_return_pct']:+.2f}% net",
+              help=f"Net figure charges {result['round_trip_cost_pct']:.2f}% round-trip "
+                   "cost per closed trade. Gross returns overstate any strategy whose "
+                   "average winner is a fraction of a percent.")
 
     if result["num_trades"] == 0:
         st.info("No qualifying ORBC signals fired in the available history. Try loosening the filters.")
@@ -785,7 +845,7 @@ def render():
         logger.info(f"[strategy_lab] Ticker changed to {ticker}; loading Strategy Lab data")
         st.session_state["_strategy_lab_last_ticker"] = ticker
 
-    tab_orbc, tab_mtf = st.tabs(["ORBC (Opening Range)", "MTF"])
+    tab_orbc, tab_mtf = st.tabs(["ORBC (Opening Range)", "Intraday Predictions"])
     with tab_orbc:
         _render_orbc(ticker)
     with tab_mtf:

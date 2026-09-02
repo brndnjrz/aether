@@ -679,6 +679,7 @@ def backtest_orbc(
     interval: str = "5m",
     period: str = "60d",
     df: Optional[pd.DataFrame] = None,
+    round_trip_cost_pct: float = 0.02,
 ) -> Dict[str, Any]:
     """
     Fetch intraday history for `ticker`, run ORBC session by session, and
@@ -689,6 +690,13 @@ def backtest_orbc(
     of 40-60 trades — `num_sessions` is returned alongside `num_trades` so the
     caller can surface the sample size rather than presenting a win rate as
     if it were statistically settled.
+
+    `round_trip_cost_pct` is charged against every closed trade to produce the
+    `net_*` figures. Gross returns overstate a strategy whose average winner is
+    a fraction of a percent: at 0.02% (2 bps, roughly spread plus commission on
+    a liquid ETF) a 40-trade run gives up 0.8 points of total return, which is
+    the difference between profitable and not for most ORBC configurations. Raise
+    it for anything less liquid, and well above it for options.
 
     Pass `df` to backtest an already-fetched/indicator-enriched frame (used by
     the tests to run without network access).
@@ -727,12 +735,25 @@ def backtest_orbc(
     avg_rr = round(float(np.mean([t["rr_ratio"] for t in trades])), 2) if trades else 0.0
     avg_return = round(float(np.mean([t["return_pct"] for t in closed])), 3) if closed else 0.0
 
+    # Net of an assumed round-trip cost, charged once per closed trade. Reported
+    # alongside the gross figures rather than replacing them so the cost's size
+    # relative to the edge stays visible.
+    net_returns = [t["return_pct"] - round_trip_cost_pct for t in closed]
+    net_wins = [r for r in net_returns if r > 0]
+    net_win_rate = round(len(net_wins) / len(net_returns) * 100, 1) if net_returns else 0.0
+    net_avg_return = round(float(np.mean(net_returns)), 3) if net_returns else 0.0
+
     equity = [1.0]
     equity_dates = [days[0]]
     for t in sorted(closed, key=lambda x: x["timestamp"]):
         equity.append(equity[-1] * (1 + t["return_pct"] / 100))
         equity_dates.append(t["exit_timestamp"] or t["timestamp"])
     total_return_pct = round((equity[-1] - 1) * 100, 2)
+
+    net_equity = 1.0
+    for t in sorted(closed, key=lambda x: x["timestamp"]):
+        net_equity *= (1 + (t["return_pct"] - round_trip_cost_pct) / 100)
+    net_total_return_pct = round((net_equity - 1) * 100, 2)
 
     by_direction = {}
     for d in ("long", "short"):
@@ -765,6 +786,15 @@ def backtest_orbc(
         "avg_rr": avg_rr,
         "avg_return_pct": avg_return,
         "total_return_pct": total_return_pct,
+        "round_trip_cost_pct": round_trip_cost_pct,
+        "net_win_rate": net_win_rate,
+        "net_avg_return_pct": net_avg_return,
+        "net_total_return_pct": net_total_return_pct,
+        # avg_rr is only a measurement when the target is not derived from it.
+        # Under target_method="risk_reward" every target sits at exactly
+        # target_rr * risk, so avg_rr is the configured setting echoed back and
+        # says nothing about what the strategy achieved.
+        "avg_rr_is_configured": config.target_method == "risk_reward",
         "equity_curve": pd.Series(equity, index=pd.DatetimeIndex(equity_dates), name="equity"),
         "by_direction": by_direction,
         "exit_breakdown": exit_breakdown,

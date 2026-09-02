@@ -5,8 +5,7 @@ import logging
 import pandas as pd
 import numpy as np
 from typing import Dict, Any
-from data.price_data import get_price_history
-from data.macro_data import get_vix_data, get_sp500_regime
+from data.macro_data import get_sp500_regime
 
 logger = logging.getLogger(__name__)
 

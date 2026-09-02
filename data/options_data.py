@@ -5,6 +5,7 @@ No mock data — all numbers come from live market data.
 """
 import time
 import logging
+from datetime import datetime, time as dtime
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -12,8 +13,8 @@ from typing import Optional, Dict, Any, List
 from data.price_data import get_price_history
 from analysis.options_pricing import black_scholes_greeks, implied_volatility
 from analysis.volatility_forecast import garch_forecast_vol
-from config.settings import RISK_FREE_RATE
-from config.tz import now_et
+from config.settings import OPTIONS_EXPIRY_LADDER_DTE, RISK_FREE_RATE
+from config.tz import MARKET_TZ, now_et
 
 logger = logging.getLogger(__name__)
 _cache: Dict[str, Dict] = {}
@@ -104,7 +105,6 @@ def calculate_iv_rank(ticker: str, ttl: int = 600) -> Dict[str, Any]:
         term_structure = "Backwardation" if vol_term_ratio > 1.05 else ("Contango" if vol_term_ratio < 0.95 else "Flat")
 
         # Try to get real IV from nearest ATM option
-        real_iv = None
         atm_iv = None
         days_to_expiry = None
         try:
@@ -116,7 +116,6 @@ def calculate_iv_rank(ticker: str, ttl: int = 600) -> Dict[str, Any]:
                 if not calls.empty:
                     idx = (calls["strike"] - price).abs().idxmin()
                     atm_iv = float(calls.loc[idx, "impliedVolatility"]) * 100
-                    real_iv = atm_iv
                 selected_expiry = chain_data.get("selected_expiry")
                 if selected_expiry:
                     days_to_expiry = (pd.Timestamp(selected_expiry) - pd.Timestamp(now_et().date())).days
@@ -152,7 +151,11 @@ def calculate_iv_rank(ticker: str, ttl: int = 600) -> Dict[str, Any]:
         return result
     except Exception as e:
         logger.error(f"IVR calculation error for {ticker}: {e}")
-        return {"iv_rank": 50, "iv_percentile": 50, "status": "error", "error": str(e)}
+        # No in-band sentinel. Returning iv_rank=50 here made a failed fetch
+        # indistinguishable from a genuinely mid-range reading — and since
+        # IVR_HIGH is 50, it also silently suppressed the alert. Callers must
+        # check `status` and render "unavailable" rather than a number.
+        return {"iv_rank": None, "iv_percentile": None, "status": "error", "error": str(e)}
 
 
 def get_atm_greeks(ticker: str, expiry: Optional[str] = None) -> Dict[str, Any]:
@@ -196,6 +199,11 @@ def get_atm_greeks(ticker: str, expiry: Optional[str] = None) -> Dict[str, Any]:
                 "theta": None,
                 "vega": None,
                 "rho": None,
+                # Black-Scholes theoretical price. Used as a mid-price fallback by
+                # get_expiry_ladder_quotes() when the book is empty (after hours,
+                # where bid/ask both come back 0) so the options cost model can
+                # still produce a labelled estimate instead of nothing.
+                "model_price": None,
                 "volume": int(row.get("volume", 0)) if pd.notna(row.get("volume")) else 0,
                 "open_interest": int(row.get("openInterest", 0)) if pd.notna(row.get("openInterest")) else 0,
             }
@@ -223,6 +231,7 @@ def get_atm_greeks(ticker: str, expiry: Optional[str] = None) -> Dict[str, Any]:
                 base["theta"] = greeks["theta"]
                 base["vega"] = greeks["vega"]
                 base["rho"] = greeks["rho"]
+                base["model_price"] = greeks["price"]
             except Exception as e:
                 logger.warning(f"Greeks computation failed for {ticker} {option_type} strike {strike}: {e}")
 
@@ -238,6 +247,152 @@ def get_atm_greeks(ticker: str, expiry: Optional[str] = None) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"ATM greeks error for {ticker}: {e}")
         return {}
+
+
+def _fractional_dte(expiry_str: str, now: Optional[Any] = None) -> Optional[float]:
+    """
+    Days until the contract actually expires, as a float, measured to the 4:00 PM
+    ET close on the expiry date.
+
+    `get_atm_greeks` uses `(expiry - today).days`, which is 0 for a same-day
+    expiry — fine for a Black-Scholes T, useless for the options cost model,
+    which needs to know whether 4 hours or 4 minutes remain. Returns None on an
+    unparseable date, 0.0 for an expiry already past.
+    """
+    try:
+        expiry_date = pd.Timestamp(expiry_str).date()
+    except (ValueError, TypeError):
+        logger.debug(f"_fractional_dte: unparseable expiry {expiry_str!r}")
+        return None
+    now_ts = pd.Timestamp(now) if now is not None else pd.Timestamp(now_et())
+    if now_ts.tz is None:
+        now_ts = now_ts.tz_localize(MARKET_TZ)
+    else:
+        now_ts = now_ts.tz_convert(MARKET_TZ)
+    close = pd.Timestamp(
+        datetime.combine(expiry_date, dtime(16, 0))
+    ).tz_localize(MARKET_TZ)
+    return max((close - now_ts).total_seconds() / 86400.0, 0.0)
+
+
+def get_expiry_ladder_quotes(
+    ticker: str,
+    ladder_dte: Optional[List[float]] = None,
+    *,
+    option_type: str = "call",
+    now: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Assemble ATM quotes across an expiry ladder, shaped for
+    `analysis.options_pricing.sweep_expiries`.
+
+    Each requested rung is snapped to the **nearest actually-listed** expiry —
+    there is no guarantee a contract exists at exactly 2 or 7 days out — and the
+    date used is reported back so the UI can show it rather than the target.
+    When two rungs snap to the same listed expiry the longer one is dropped
+    (recorded in `skipped`) so the grid never shows two identical columns.
+
+    Cost: one `get_options_chain` fetch per distinct snapped expiry, each cached
+    for `OPTIONS_CACHE_TTL`. Four rungs is four fetches that then serve every
+    signal horizon — call this once per render, not once per horizon.
+
+    Returns
+    -------
+    {
+      "ticker": str,
+      "underlying_price": float | None,
+      "quotes": {requested_dte: {"mid", "bid", "ask", "delta", "theta_per_day",
+                                 "days_to_expiry", "expiry_date", "quote_source",
+                                 "requested_dte", "iv"}},
+      "skipped": [{"requested_dte", "reason"}],
+      "error": str | None,
+    }
+
+    `quote_source` is one of "live" (a real two-sided book), "model_price"
+    (empty book — Black-Scholes theoretical used as the mid, which happens after
+    hours), or "unavailable". Never presented as live when it isn't.
+    """
+    ticker = ticker.upper().strip()
+    if ladder_dte is None:
+        ladder_dte = list(OPTIONS_EXPIRY_LADDER_DTE)
+
+    out: Dict[str, Any] = {
+        "ticker": ticker, "underlying_price": None,
+        "quotes": {}, "skipped": [], "error": None,
+    }
+
+    chain = get_options_chain(ticker)
+    if "error" in chain:
+        out["error"] = chain["error"]
+        logger.warning(f"get_expiry_ladder_quotes: no chain for {ticker}: {chain['error']}")
+        return out
+
+    expirations = chain.get("expirations") or []
+    if not expirations:
+        out["error"] = "No listed expirations."
+        return out
+    out["underlying_price"] = chain.get("current_price")
+
+    listed = [(e, _fractional_dte(e, now=now)) for e in expirations]
+    listed = [(e, d) for e, d in listed if d is not None]
+    if not listed:
+        out["error"] = "No parseable expirations."
+        return out
+
+    used_expiries: Dict[str, float] = {}
+    for target in sorted(ladder_dte):
+        expiry_str, actual_dte = min(listed, key=lambda ed: abs(ed[1] - float(target)))
+        if expiry_str in used_expiries:
+            out["skipped"].append({
+                "requested_dte": target,
+                "reason": (
+                    f"Nearest listed expiry ({expiry_str}) was already used by the "
+                    f"{used_expiries[expiry_str]:g}-day rung."
+                ),
+            })
+            continue
+        used_expiries[expiry_str] = target
+
+        greeks = get_atm_greeks(ticker, expiry_str)
+        leg = (greeks or {}).get("atm_call" if option_type == "call" else "atm_put") or {}
+        if not leg:
+            out["skipped"].append({
+                "requested_dte": target,
+                "reason": f"No ATM {option_type} data for {expiry_str}.",
+            })
+            continue
+
+        bid, ask = leg.get("bid") or 0.0, leg.get("ask") or 0.0
+        if bid > 0 and ask > 0:
+            mid, quote_source = (bid + ask) / 2.0, "live"
+        elif leg.get("model_price"):
+            mid, quote_source = float(leg["model_price"]), "model_price"
+        else:
+            out["skipped"].append({
+                "requested_dte": target,
+                "reason": f"No usable price for {expiry_str} (empty book, no model price).",
+            })
+            continue
+
+        out["quotes"][target] = {
+            "mid": mid,
+            "bid": bid if bid > 0 else None,
+            "ask": ask if ask > 0 else None,
+            "delta": leg.get("delta"),
+            "theta_per_day": leg.get("theta"),
+            "vega": leg.get("vega"),
+            "iv": leg.get("iv"),
+            "days_to_expiry": actual_dte,
+            "expiry_date": expiry_str,
+            "quote_source": quote_source,
+            "requested_dte": target,
+        }
+
+    logger.info(
+        f"get_expiry_ladder_quotes: {ticker} built {len(out['quotes'])} rung(s) "
+        f"from {len(ladder_dte)} requested ({len(out['skipped'])} skipped)"
+    )
+    return out
 
 
 def build_pnl_diagram(

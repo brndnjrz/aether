@@ -4,10 +4,8 @@ Used for regime detection and macro context overlay.
 """
 import time
 import logging
-import pandas as pd
-import yfinance as yf
-from typing import Dict, Any, Optional
-from data.price_data import get_price_history, get_ticker_info
+from typing import Dict, Any
+from data.price_data import get_price_history
 
 logger = logging.getLogger(__name__)
 _cache: Dict[str, Dict] = {}
@@ -26,7 +24,7 @@ def get_vix_data(ttl: int = 300) -> Dict[str, Any]:
         df = get_price_history("^VIX", period="1y", interval="1d")
         if df is None or df.empty:
             logger.warning("VIX data unavailable — no price history returned for ^VIX")
-            return {"current": 20.0, "status": "unavailable"}
+            return {"current": None, "regime": None, "status": "unavailable"}
 
         current = float(df["Close"].iloc[-1])
         week_ago = float(df["Close"].iloc[-6]) if len(df) > 5 else current
@@ -51,7 +49,7 @@ def get_vix_data(ttl: int = 300) -> Dict[str, Any]:
         return result
     except Exception as e:
         logger.error(f"VIX data error: {e}")
-        return {"current": 20.0, "status": "error"}
+        return {"current": None, "regime": None, "status": "error"}
 
 
 def get_market_overview(ttl: int = 300) -> Dict[str, Any]:
@@ -115,7 +113,12 @@ def get_sp500_regime(ttl: int = 600) -> Dict[str, Any]:
         above_200 = price > ma200
         ma50_rising = ma50 > ma50_prev
 
-        vix = get_vix_data().get("current", 20)
+        # A missing VIX must not be silently treated as a calm 20 — that turned
+        # "we don't know" into a confident "Uptrend"/"Bull Market" verdict.
+        vix = get_vix_data().get("current")
+        if vix is None:
+            logger.warning("SP500 regime: VIX unavailable — regime is Unknown, not inferred")
+            return {"regime": "Unknown", "status": "vix_unavailable"}
 
         if above_200 and ma50_rising and vix < 20:
             regime = "Bull Market"

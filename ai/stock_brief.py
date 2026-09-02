@@ -165,6 +165,95 @@ Be direct and concise. This is intraday context, not a multi-day thesis."""
     return result
 
 
+CONSENSUS_QA_SYSTEM = (
+    "You are a trading research assistant answering questions about ONE ticker's "
+    "model readings.\n\n"
+    "ABSOLUTE RULE: answer using ONLY the numbers in the DATA block provided. Do not "
+    "introduce any market fact, price level, indicator reading, news event, or "
+    "historical claim that is not present there. If the DATA block does not contain "
+    "what is needed to answer, say exactly what is missing instead of filling the gap.\n\n"
+    "In particular, never invent: VWAP reclaims or rejections, support/resistance "
+    "levels, volume readings, earnings dates, news, or what the market 'usually' does. "
+    "You have no chart and no news feed — only this block.\n\n"
+    "Be direct and brief. Quote the specific numbers you relied on. When horizons "
+    "disagree, say so rather than picking a side. If a horizon does not clear its "
+    "costs, treat it as information rather than a trade no matter how strong its "
+    "direction looks. Never give a position size."
+)
+
+
+def generate_consensus_answer(
+    ticker: str, question: str, consensus: Dict[str, Any],
+) -> Optional[str]:
+    """
+    Answer a question about the cross-horizon consensus, grounded strictly on the
+    already-computed dict (Roadmap Item 13).
+
+    The payload is serialized from `interval_consensus.build_consensus()` output
+    and nothing else — no chart, no news, no price history. Ungrounded, an LLM will
+    confidently narrate a VWAP reclaim that never happened, which is worse than no
+    answer; hence the system prompt's explicit ban and the "say what is missing"
+    instruction.
+
+    Returns None when the provider is unavailable or produced nothing.
+    """
+    lines = [f"TICKER: {ticker}", f"AS OF: {consensus.get('as_of')}", "", "HORIZONS:"]
+    for h in consensus.get("horizons", []):
+        if not h.get("has_model"):
+            lines.append(f"- {h['horizon']}: no model trained")
+            continue
+        if not h.get("has_prediction"):
+            lines.append(f"- {h['horizon']}: trained, no prediction logged yet")
+            continue
+        acc = h.get("live_accuracy")
+        net = h.get("net_edge_pct")
+        lines.append(
+            f"- {h['horizon']}: {(h.get('direction') or 'n/a').upper()} "
+            f"prob={_fmt_pct_val(h.get('probability'))} "
+            f"confidence={h.get('confidence') or 'n/a'} "
+            f"live_accuracy={_fmt_pct_val(acc) if acc is not None else 'not enough resolved'} "
+            f"(n={h.get('n_resolved', 0)}) "
+            f"trained_accuracy={_fmt_pct_val(h.get('trained_accuracy'))} "
+            f"expires={h.get('expires_at_str') or 'n/a'} "
+            f"expired={h.get('is_expired')} "
+            f"never_gradeable={h.get('crosses_session_close')} "
+            f"net_edge={f'{net:+.3f}%' if net is not None else 'n/a'} "
+            f"cost_model={h.get('cost_model') or 'n/a'} "
+            f"dominant_cost={h.get('dominant_cost') or 'n/a'}"
+        )
+
+    a = consensus.get("alignment", {})
+    lines += [
+        "",
+        "ALIGNMENT:",
+        f"- net_direction: {a.get('net_direction')}",
+        f"- counts: {a.get('n_bullish')} bullish / {a.get('n_bearish')} bearish / "
+        f"{a.get('n_neutral')} neutral (live horizons only; expired ones excluded)",
+        f"- unanimous: {a.get('is_unanimous')}",
+        f"- tightest_tradeable: {a.get('tightest_tradeable') or 'none'}",
+        f"- agree_but_uneconomic: {', '.join(a.get('agree_but_uneconomic') or []) or 'none'}",
+    ]
+    if consensus.get("warnings"):
+        lines += ["", "CAVEATS:"] + [f"- {w}" for w in consensus["warnings"]]
+
+    prompt = (
+        "DATA:\n" + "\n".join(lines)
+        + f"\n\nQUESTION: {question}\n\n"
+        "Answer from the DATA block only. Cite the specific numbers you used. If the "
+        "block lacks what you would need, say what is missing."
+    )
+
+    result = ask_claude(
+        prompt, system=CONSENSUS_QA_SYSTEM, max_tokens=500,
+        ollama_model=OLLAMA_MODEL_DAYTRADING_BRIEF,
+    )
+    if result:
+        logger.info(f"Consensus answer generated for {ticker} ({len(result)} chars)")
+    else:
+        logger.warning(f"Consensus answer returned no result for {ticker}")
+    return result
+
+
 def generate_thesis_prompt(ticker: str, name: str) -> Optional[str]:
     """
     Generate structured investment thesis prompts to guide user thinking.

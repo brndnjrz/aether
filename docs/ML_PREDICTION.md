@@ -4,16 +4,28 @@ The **Predictions** tab (Trading Desk page, `pages/trading.py`) runs a machine-l
 
 ## Using the Predictions Tab
 
+> **Above everything described below sits the Horizon Cockpit** — all five models
+> (5m/15m/30m/1h/daily) in one table, with live accuracy, expiry, and whether each
+> clears its costs. This document covers the *daily* model in depth; for the
+> cross-horizon view, the options cost model, and the exit clock, see `README.md`
+> (AI & ML Model Overview) and `docs/ROADMAP.md` for the design record.
+>
+> One caveat that changes how you read every number here: the tradeability verdict
+> baked into the intraday model prices costs in **underlying** percentage points,
+> which is correct for shares and wrong for options. Use
+> `options_pricing.assess_options_tradeability()` (Model Lab's scoreboard) when the
+> instrument is contracts.
+
 **Controls:**
 - **Ticker Symbol** — any symbol; defaults to `AAPL` and persists across reruns in session state.
 - **Train / Update Model** — fetches 2 years of daily bars, builds the 18-feature matrix, runs the 10-fold walk-forward validation described below, then fits the final model on all available directional history and saves it to `storage/`. Takes roughly 10-20 seconds. Requires at least 60 bars of history, and at least 50 directional (non-neutral) samples after the neutral-zone filter — tickers with too little history or an IPO within the lookback window will error out here.
 - **Generate Prediction** — loads the saved model and runs inference on the latest bar. If no model exists yet for the ticker, this auto-trains one first.
 
-**Status row** (above the buttons): model status (not trained / trained / overdue for refresh — flagged after 30 days), last-trained timestamp read from `{TICKER}_accuracy.json` (or the model file's mtime if that log is missing), and a "last prediction" timestamp for the current session.
+**Status row** (above the buttons): model status (not trained / trained / overdue for refresh — flagged when any retrain trigger fires, see [Retraining](#retraining)), last-trained timestamp read from `{TICKER}_accuracy.json` (or the model file's mtime if that log is missing), and a "last prediction" timestamp for the current session.
 
 Once you click **Generate Prediction**, five sections render in order:
 
-1. **Direction Signal** — a gauge chart of the ensemble bull probability, deliberately windowed to 35-65% rather than 0-100% so the display never implies more confidence than the walk-forward accuracy supports. The 47-53% band is shaded as the neutral dead-band — inside it no directional call is issued. Alongside the gauge: a confidence badge (HIGH/MODERATE/LOW, see thresholds below), **Expected 5-Day Move** (median historical 5-day return in past setups where the model made the same call — a look-back statistic, not a forecast), and **Walk-Forward Accuracy** with a delta against the 50% coin-flip baseline. A callout below restates the accuracy as a plain-language "edge" (e.g. "+4.2% above coin-flip") and warns not to size a position larger than your standard allocation off this signal alone.
+1. **Direction Signal** — a gauge chart of the ensemble bull probability, deliberately drawn on a 35-65% axis rather than 0-100% so the display never implies more confidence than the walk-forward accuracy supports. The 45-55% band is shaded as the neutral dead-band — inside it no directional call is issued. Alongside the gauge: a confidence badge (HIGH/MODERATE/LOW, see thresholds below), **Expected 5-Day Move** (median historical 5-day return in past setups where the model made the same call — a look-back statistic, not a forecast), and **Walk-Forward Accuracy** with a delta against the 50% coin-flip baseline. A callout below restates the accuracy as a plain-language "edge" (e.g. "+4.2% above coin-flip") and warns not to size a position larger than your standard allocation off this signal alone.
 2. **5-Day Price Path (Simulated)** — a Monte Carlo band chart and table of simulated daily open/close prices for the next 5 trading days. See [5-Day Price Path Simulation](#5-day-price-path-simulation) below for how this is computed and why it is not the same thing as a price forecast.
 3. **Feature Importance** — a horizontal bar chart of the top 8 of the 18 features by XGBoost gain (how much decision weight that feature contributed across the model's splits). This is what explains *why* the current prediction leans the way it does — e.g. `price_vs_sma20` and `rsi_norm` dominating points to a trend/momentum-driven call, while `vol_ratio` and `hl_range_pct` dominating points to a volatility-driven one. Rankings can shift between training runs; a large shift signals the model's regime sensitivity, not a bug.
 4. **Model Performance** — the walk-forward metrics in full: a reliability verdict and reason string, directional accuracy, ROC-AUC, total out-of-sample validation predictions vs. total training samples used, in-sample Sharpe of the raw signal (explicitly labeled a sanity check only — not for live position sizing), accuracy standard deviation across folds, and the training label's class balance (bullish % vs bearish %, flagged if skewed past 35/65 since `scale_pos_weight` is auto-adjusted for that).
@@ -27,7 +39,7 @@ A disclaimer banner is shown at the bottom of the tab regardless of state, resta
 
 The model is a two-member ensemble:
 
-| Model | Role | Weight |
+| Model | Role | Default Weight |
 |-------|------|--------|
 | **XGBoost** (`binary:logistic`) | Primary classifier — gradient-boosted shallow trees optimized for AUC | 65% |
 | **Random Forest** | Calibration member — provides diversity and prevents XGBoost from overconfident outputs | 35% |
@@ -35,8 +47,10 @@ The model is a two-member ensemble:
 The ensemble bull probability is:
 
 ```
-P_bull = 0.65 × XGBoost_prob + 0.35 × RF_prob
+P_bull = weight_xgb × XGBoost_prob + weight_rf × RF_prob
 ```
+
+`weight_xgb`/`weight_rf` are **learned, not fixed** — computed at training time as a softmax over each model's out-of-fold walk-forward directional accuracy (`analysis/ml_prediction.py::_softmax_ensemble_weights()`), then persisted in `{TICKER}_accuracy.json`'s `ensemble_weights` field and read back at inference. A model at or below the 50% coin-flip baseline still gets a small positive weight — the scheme blends rather than hard-selects. Models trained before this existed (or a freshly-deployed ticker with no accuracy log yet) default to the historical fixed 65/35 split, so nothing changes until a model is retrained.
 
 The combined probability is then mapped to a direction:
 
@@ -44,7 +58,11 @@ The combined probability is then mapped to a direction:
 - `P_bull < 0.45` → **BEARISH**
 - `0.45 ≤ P_bull ≤ 0.55` → **NEUTRAL** (dead-band; no directional call)
 
-The display gauge is capped at 35–65% to prevent conveying false precision. Raw model output beyond these bounds does not meaningfully distinguish between different confidence levels given the amount of noise in financial data.
+The display gauge uses a 35–65% axis to avoid conveying false precision: raw model output beyond those bounds does not meaningfully distinguish between different confidence levels given the amount of noise in financial data. This is an axis choice, not a transform — the probability returned by `predict()` and written to the prediction log is the unmodified ensemble output.
+
+### Model comparison (informational)
+
+`analysis/ml_prediction.py::compare_models()` (surfaced in the **Model Lab** page) scores XGBoost, Random Forest, and two additional sklearn-native candidates — Logistic Regression and Gradient Boosting — against each other through the same walk-forward harness training uses, and reports what an accuracy-proportional weighting of all four would look like. This is read-only: it never retrains or changes the deployed 2-model ensemble above. It exists to answer "would a 3rd or 4th model actually help this ticker" before committing to the extra training cost of deploying one.
 
 ## 5-Day Price Path Simulation
 
@@ -134,9 +152,11 @@ BEARISH — bull probability < 45%
 
 | Confidence | Bull Probability Range | Meaning |
 |-----------|----------------------|---------|
-| HIGH | < 35% or > 65% (clipped to display range) | Strong signal; model is well outside the neutral zone |
-| MODERATE | 45–55% or 55–65% boundary | Some directional lean; treat as supporting evidence only |
-| LOW | 47–53% | Near-neutral; signal is noise; do not trade on this alone |
+| HIGH | > 65% or < 35% | Strong signal; model is well outside the neutral zone |
+| MODERATE | 55–65% or 35–45% | Some directional lean; treat as supporting evidence only |
+| LOW | 45–55% | Near-neutral; signal is noise; do not trade on this alone |
+
+These are the exact boundaries `predict()` uses (`ml_prediction.py`, "Signal derivation"). Note that the LOW band and the NEUTRAL dead-band are the same range — a LOW-confidence reading and a NEUTRAL direction are two descriptions of one state.
 
 In practice, most signals will be LOW or MODERATE confidence. HIGH confidence signals are rare, and that is expected — they represent setups where multiple technical features are aligned, which happens infrequently.
 
@@ -191,7 +211,7 @@ The 50% baseline is the "coin flip" — what you would achieve by predicting bul
 **Structural limitations:**
 
 - The model is trained on technical features only; fundamentals, earnings expectations, and sector momentum are not inputs
-- Probabilities are clipped to 35–65% because the raw model output beyond these bounds does not reliably distinguish between different future outcomes given financial data's signal-to-noise ratio
+- The probability gauge is drawn on a 35–65% axis because raw model output beyond those bounds does not reliably distinguish between different future outcomes given financial data's signal-to-noise ratio. The axis is a display choice only — the probability itself is never clipped, and HIGH confidence is *defined* as a reading outside that range
 - Walk-forward accuracy from the training period may not hold in the current market regime; accuracy degrades when market conditions shift significantly from the training window
 - The 5-Day Price Path is a volatility simulation seeded from the stock's own historical volatility and the classifier's directional bias, not a separately backtested or validated forecasting model — it has no walk-forward accuracy figure of its own, and its overnight-gap modeling is a simplification, not a fitted gap distribution
 
@@ -199,7 +219,13 @@ The 50% baseline is the "coin flip" — what you would achieve by predicting bul
 
 ### When to retrain
 
-The app flags a model as **overdue** 30 days after the last training date. This is the default retrain schedule.
+The app checks three retraining triggers (`analysis/retrain_triggers.py::check_all_retrain_triggers()`), surfaced on both the Predictions tab's status badge and the Model Lab page:
+
+- **Staleness** — model is older than `config.settings.RETRAIN_STALENESS_DAYS` (30 by default).
+- **Performance drop** — the live win rate on resolved predictions has fallen `RETRAIN_ACCURACY_DROP_THRESHOLD` (5 points by default) or more below the accuracy the model was trained with, once at least `RETRAIN_MIN_RESOLVED_FOR_DROP_CHECK` (20) predictions have resolved.
+- **Elevated market volatility** — the current VIX regime is "Elevated Fear" or "Crisis". This is a coarse, current-state-only flag, not a true before/after regime-change detector — there is no persisted snapshot of what the regime was when the model was last trained to compare against.
+
+Any of the three flags the model as overdue. This is informational only — no automatic retraining happens inside the app; a human still clicks **Train / Update Model**.
 
 Retrain more frequently if:
 - The stock has been through a major regime change (e.g., earnings blowout, sector rotation, acquisition announcement)
@@ -211,9 +237,23 @@ Retrain more frequently if:
 1. Navigate to the **AI Predictions** page
 2. Enter the ticker
 3. Click **Train / Update Model**
-4. The new model replaces the old one in `storage/`; prediction history is preserved
+4. The new model replaces the old one in `storage/`; prediction history is preserved, and the model it replaces is archived under `storage/versions/{TICKER}/` (see Model Versioning below)
 
 Retraining fetches 2 years of fresh daily data each time. The walk-forward validation runs on that full 2-year window, so older data influences the early folds while more recent data dominates the later folds — which are the most predictive of near-term performance.
+
+### Scheduled retraining
+
+`scripts/scheduled_retrain.py` is a standalone CLI (not imported by the app) that sweeps every ticker/interval with an existing model, checks the three triggers above, and retrains whatever needs it:
+
+```
+python3 scripts/scheduled_retrain.py [--tickers AAPL,SPY] [--dry-run] [--force]
+```
+
+It logs one line per ticker to `storage/retrain_log.jsonl` and never lets one ticker's failure abort the sweep. It registers no schedule of its own — wire it to cron/launchd, e.g. `0 6 * * 1-5 cd /path/to/aether && python3 scripts/scheduled_retrain.py`.
+
+### Model versioning
+
+Every retrain archives the model it's about to replace under `storage/versions/{TICKER}/v{N}_{xgb,rf,accuracy}.{pkl,json}`, with an append-only `history.jsonl` event log (`analysis/ml_prediction.py::get_version_history()`/`rollback_to_version()`). A ticker's first-ever training run creates no version — v1 is the first model that got *replaced*, not the first trained. Model Lab's "Version history" section lists these and can roll back to any of them (a straight file copy, never a retrain); rolling back archives the current model first, so nothing is ever silently discarded.
 
 ### Storage
 
@@ -221,10 +261,74 @@ Trained models are stored in the `storage/` directory at the project root:
 
 ```
 storage/
-├── {TICKER}_xgb.pkl         # XGBoost model
-├── {TICKER}_rf.pkl          # Random Forest model
-├── {TICKER}_accuracy.json   # Walk-forward metrics from last training run
-└── {TICKER}_predictions.jsonl  # Timestamped prediction log (append-only)
+├── {TICKER}_xgb.pkl              # XGBoost model (current/"latest")
+├── {TICKER}_rf.pkl               # Random Forest model (current/"latest")
+├── {TICKER}_accuracy.json        # Walk-forward metrics from last training run,
+│                                  # including the learned ensemble_weights
+├── {TICKER}_predictions.jsonl    # Timestamped prediction log (append-only)
+├── retrain_log.jsonl             # scripts/scheduled_retrain.py's sweep log
+└── versions/{TICKER}/
+    ├── v{N}_xgb.pkl / v{N}_rf.pkl / v{N}_accuracy.json   # archived prior model
+    └── history.jsonl             # append-only archive/rollback event log
 ```
 
 Each ticker has its own model files. Training AAPL does not affect the NVDA model. The prediction log is append-only — predictions are never deleted, which allows you to review the model's signal history over time on the Prediction History chart.
+
+## How to Read Model Lab
+
+Model Lab (`pages/model_lab.py`) is where the Prediction Improvement Engine's numbers actually
+live. The same cheat sheet is available in-app via the **"How to read this page"** expander at
+the top of the page.
+
+**Performance dashboard**
+- **Accuracy / Win Rate** — % of graded (resolved) predictions that were correct. Compare this
+  to the accuracy the model *trained with* (shown on Trading Desk's Predictions tab) — if live
+  accuracy is meaningfully lower, the model has degraded since training and a retrain trigger
+  should be firing (check the Retrain Triggers table below).
+- **Precision (per direction)** — of every time the model called *this* direction, what fraction
+  were actually right. Low bullish precision means bullish calls are frequently wrong, even if
+  overall accuracy looks fine.
+- **Recall (per direction)** — of every real move in *this* direction, what fraction did the
+  model actually catch. Low bullish recall with high bearish recall means the model is missing
+  upside moves, not that it's biased toward being wrong.
+- **F1** — the balance of precision and recall in one number; useful for comparing directions at
+  a glance without eyeballing two numbers.
+- **False Positive / Negative Rate** — the error-rate framing of the same confusion matrix:
+  how often a call in this direction was wrong (FP), and how often a real move in this direction
+  was called something else (FN).
+- **Avg Profit / Signal, Avg Holding Time** — a tally of what already happened on graded
+  predictions, not a backtest or a target — read it as "this is what following every signal so
+  far would have returned," nothing more.
+- **Confidence calibration (table + chart)** — the most important section to check periodically.
+  It compares "Avg Predicted Prob." (what the model claimed) to "Realized Accuracy" (what
+  actually happened) per confidence bucket. If HIGH-confidence rows aren't meaningfully more
+  accurate than LOW-confidence rows, the confidence badge isn't earning its keep for this ticker
+  — weight the raw accuracy number instead, not the badge.
+
+**Why the model was wrong (failure analysis)**
+Every incorrect, graded prediction gets tagged with one or more categories (counter-trend, choppy
+market, volume anomaly, RSI divergence, elevated VIX regime, earnings window, or
+uncategorized). A pile-up in one category is a diagnosis, not just a tally — e.g. a run of
+`elevated_vol_regime` misses usually means the market got choppier than the training window, not
+that the model logic broke; retraining on fresher data (which now includes that regime) is
+usually the right fix. `uncategorized` misses are the ones with no explainable technical
+condition behind them — genuine model error, worth remembering if they cluster on one ticker.
+
+**Model comparison**
+An informational, read-only bake-off of XGBoost/Random Forest/Logistic Regression/Gradient
+Boosting via the same walk-forward validation training uses, plus a recommended softmax weight
+per model. Nothing here changes the deployed model — it exists to answer "would a 3rd/4th model
+actually help this ticker" before spending the extra training time deploying one. Run it
+occasionally out of curiosity, not before every trade.
+
+**Version history**
+Every retrain's replaced model is archived here. If a retrain makes live performance worse
+rather than better, roll back to the prior version with one click — it archives the current
+model first, so a rollback never discards anything.
+
+**Retrain triggers**
+The same three checks (staleness / performance drop / elevated VIX) surfaced on Trading Desk's
+Predictions tab status badge, with the reasoning spelled out per trigger. Treat "should retrain"
+as a nudge, not an alarm — check Failure Analysis first to understand *why* before clicking
+retrain on Trading Desk.
+

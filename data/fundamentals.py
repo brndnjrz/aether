@@ -6,7 +6,7 @@ import time
 import logging
 import pandas as pd
 import yfinance as yf
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 
 logger = logging.getLogger(__name__)
 _cache: Dict[str, Dict] = {}
@@ -136,9 +136,6 @@ def get_financials(ticker: str, ttl: int = 3600) -> Dict[str, Any]:
                 # DSO (Days Sales Outstanding) — compare 2 years
                 receivables_curr = _safe(balance.loc["Net Receivables", balance.columns[0]]) if "Net Receivables" in balance.index else None
                 receivables_prev = _safe(balance.loc["Net Receivables", balance.columns[1]]) if ("Net Receivables" in balance.index and len(balance.columns) > 1) else None
-                rev_curr_stmt = None
-                if "revenue_growth_yoy" in result:
-                    pass  # already have income
                 try:
                     if income is not None and not income.empty:
                         rc = _safe(income.loc["Total Revenue", income.columns[0]]) if "Total Revenue" in income.index else None
