@@ -449,12 +449,50 @@ def build_intraday_labels(
     sessions = _session_ids(df.index)
 
     intra_session_ret = close.pct_change().where(sessions.shift(1) == sessions)
+
+    # Volatility of an h-bar move, measured directly rather than extrapolated
+    # from the 1-bar figure by sqrt(h).
+    #
+    # sqrt(h) scaling assumes successive bar returns are independent. Intraday
+    # they are not — they mean-revert at short horizons and trend at longer ones
+    # — so the extrapolation drifts, and it drifts differently per interval.
+    # Measured against realized SPY moves, where median|move| should be ~0.6745
+    # sigma for a normal:
+    #
+    #     5m   ratio 0.58  (-13%)  band too wide
+    #     15m  ratio 0.73  ( +9%)
+    #     30m  ratio 0.72  ( +7%)
+    #     1h   ratio 0.89  (+32%)  band far too narrow
+    #
+    # The 1h error is the worst because it compounds fastest: 7 bars per session
+    # means a 5-bar horizon spans most of a session, where trending dominates and
+    # independence is least true. That is what left 1h at 74% retention while the
+    # other intervals sat near 50% at the same sigma_multiple.
+    #
+    # The h-bar return of the *same* series is the quantity the label actually
+    # thresholds, so measure it. min_periods scales with the horizon because each
+    # observation now consumes h bars.
+    horizon_ret = close.pct_change(horizon_bars)
+    # Only windows lying wholly inside one session — an h-bar return spanning the
+    # overnight gap is dominated by it and would inflate the estimate, the same
+    # reason intra_session_ret masks the first return of each session.
+    horizon_ret = horizon_ret.where(sessions.shift(horizon_bars) == sessions)
+
+    min_obs = max(30, horizon_bars * 5)
+    horizon_sigma_t = horizon_ret.rolling(vol_window, min_periods=min_obs).std()
+    horizon_sigma_t = horizon_sigma_t.fillna(
+        horizon_ret.expanding(min_periods=min_obs).std()
+    )
+
+    # Fall back to the sqrt extrapolation only where the direct estimate has too
+    # little history to exist — early bars of a short series.
     sigma_t = intra_session_ret.rolling(vol_window, min_periods=30).std()
     sigma_t = sigma_t.fillna(intra_session_ret.expanding(min_periods=30).std())
-    if not np.isfinite(sigma_t.dropna()).any() or (sigma_t.dropna() <= 0).all():
+    horizon_sigma_t = horizon_sigma_t.fillna(sigma_t * np.sqrt(horizon_bars))
+
+    if not np.isfinite(horizon_sigma_t.dropna()).any() or (horizon_sigma_t.dropna() <= 0).all():
         raise ValueError("Cannot estimate bar volatility — price series is flat or too short")
 
-    horizon_sigma_t = sigma_t * np.sqrt(horizon_bars)
     threshold_t = sigma_multiple * horizon_sigma_t
 
     # Session mask: keep only bars whose forward window stays in-session.

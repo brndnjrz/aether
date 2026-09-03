@@ -1113,6 +1113,28 @@ def _render_prediction_card(result: dict):
     if retrain:
         st.warning("Model is more than 30 days old. Click **Train / Update Model** to refresh.", icon="⏰")
 
+    # Meta filter verdict, above the gauge. It does not alter the direction or
+    # probability below — a second model judges whether this primary call is one
+    # the primary is historically reliable on, given the same market state. Only
+    # rendered when a filter is actually deployed; the common case is that the
+    # filter failed to beat take-every-signal and none exists.
+    meta_prob = result.get("meta_probability")
+    if meta_prob is not None:
+        if result.get("meta_take"):
+            st.success(
+                f"**Meta filter: take this one.** Rates it {meta_prob:.0%} likely to be "
+                "a correct call.",
+                icon="✅",
+            )
+        else:
+            st.warning(
+                f"**Meta filter: skip this one.** Rates it only {meta_prob:.0%} likely "
+                "to be a correct call — the primary model is historically unreliable in "
+                "conditions like these. The direction below is unchanged; this is a "
+                "judgement about whether to act on it.",
+                icon="🚫",
+            )
+
     gauge_pct = bull_prob * 100
 
     fig_gauge = go.Figure(go.Indicator(
@@ -2656,6 +2678,9 @@ def _render_daily_predictions():
                 )
             if train_result.get("reliability_reason"):
                 st.caption(train_result["reliability_reason"])
+            if train_result.get("meta_reason"):
+                icon = "✅" if train_result.get("meta_usable") else "○"
+                st.caption(f"{icon} Meta filter — {train_result['meta_reason']}")
 
             st.session_state.pop(_cache_key(ticker), None)
             st.session_state.pop(_eval_cache_key(ticker), None)

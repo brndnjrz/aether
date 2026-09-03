@@ -183,12 +183,34 @@ def test_threshold_scales_with_realized_volatility():
     assert wild_info["threshold"] > calm_info["threshold"] * 2
 
 
-def test_threshold_scales_with_sqrt_horizon():
+def test_threshold_grows_with_horizon_without_assuming_sqrt():
+    """
+    A longer horizon must widen the band, but not by exactly sqrt(h).
+
+    This test used to assert the sqrt ratio precisely, which pinned the
+    assumption that successive bar returns are independent. Intraday they are not
+    — they mean-revert at short horizons and trend at longer ones — so the
+    extrapolation drifted, and drifted differently per interval. On real SPY logs
+    the 1h band came out 32% too narrow, leaving 74% of rows gradeable where the
+    other intervals sat near 50% at the same sigma_multiple.
+
+    build_intraday_labels now measures the realized h-bar move instead, so the
+    ratio is whatever the data says. Monotonic growth is the real invariant: a
+    16-bar window has to have a wider spread than a 4-bar one. The loose upper
+    bound catches a genuinely broken estimator without re-pinning sqrt.
+    """
     df = _to_market_tz(make_intraday_history(n_sessions=10))
     _, h4 = build_intraday_labels(df, horizon_bars=4, sigma_multiple=0.75)
     _, h16 = build_intraday_labels(df, horizon_bars=16, sigma_multiple=0.75)
-    # sqrt(16)/sqrt(4) == 2
-    assert h16["threshold"] == pytest.approx(h4["threshold"] * 2, rel=0.01)
+
+    assert h16["threshold"] > h4["threshold"], (
+        "a 16-bar move must have a wider spread than a 4-bar move"
+    )
+    ratio = h16["threshold"] / h4["threshold"]
+    assert 1.2 < ratio < 4.0, (
+        f"band ratio {ratio:.2f} between a 16-bar and 4-bar horizon is implausible; "
+        "sqrt would give 2.0, and real intraday series land near it but not on it"
+    )
 
 
 def _fixed_band_directional(df: pd.DataFrame, horizon: int, threshold: float) -> int:
@@ -665,4 +687,98 @@ def test_fixed_band_keeps_a_usable_share_of_rows_gradeable(intraday_indicators_d
     assert 0.25 <= retained <= 0.75, (
         f"{retained:.0%} of rows directional at sigma_multiple="
         f"{ip.SIGMA_MULTIPLE} — the band is badly mis-sized for this bar size"
+    )
+
+
+def test_horizon_volatility_is_measured_not_extrapolated():
+    """
+    The band must be sized from the realized h-bar move, not from the 1-bar move
+    scaled by sqrt(h).
+
+    sqrt(h) assumes successive bar returns are independent. Intraday they are
+    not, so the extrapolation drifts — and drifts differently per interval. On
+    real SPY logs, comparing median|move| against the predicted sigma (expected
+    ~0.6745 for a normal) gave 0.58 at 5m but 0.89 at 1h: a 32% under-estimate
+    that left 1h retaining 74% of rows while the others sat near 50% at the same
+    sigma_multiple.
+
+    Constructed here with positive autocorrelation, which is what breaks sqrt(h):
+    a trending series has an h-bar move genuinely larger than sqrt(h) times its
+    1-bar move, so an extrapolated band comes out too narrow.
+    """
+    from analysis.indicators import calculate_indicators
+    from config.tz import MARKET_TZ
+
+    from analysis import intraday_prediction as ip
+
+    rng = np.random.default_rng(11)
+    rows, px, prev = [], 100.0, 0.0
+    for day in pd.bdate_range("2026-05-01", periods=45):
+        prev = 0.0
+        for b in range(26):
+            ts = pd.Timestamp(f"{day.date()} 09:30", tz=MARKET_TZ) + pd.Timedelta(minutes=15 * b)
+            r = 0.35 * prev + rng.normal(0, 0.0012)   # trending, not independent
+            prev = r
+            px *= float(np.exp(r))
+            rows.append((ts, px * 0.9995, px * 1.0015, px * 0.9985, px, 1_000_000))
+    df = pd.DataFrame(
+        rows, columns=["ts", "Open", "High", "Low", "Close", "Volume"]
+    ).set_index("ts")
+
+    horizon = 5
+    _labels, info = ip.build_intraday_labels(
+        df, horizon_bars=horizon, sigma_multiple=ip.SIGMA_MULTIPLE, vol_window=130,
+    )
+
+    # What sqrt-scaling would have predicted, from the same series.
+    sessions = ip._session_ids(df.index)
+    one_bar = df["Close"].pct_change().where(sessions.shift(1) == sessions)
+    extrapolated = float(one_bar.std() * np.sqrt(horizon))
+    measured = info["horizon_sigma"]
+
+    assert measured > extrapolated, (
+        f"on a trending series the realized {horizon}-bar sigma ({measured:.5f}) must "
+        f"exceed the sqrt-extrapolated one ({extrapolated:.5f}); got the reverse, so "
+        "the band is still being extrapolated"
+    )
+
+
+@pytest.mark.parametrize("interval", ["5m", "15m", "30m", "1h"])
+def test_retention_is_comparable_across_intervals(interval):
+    """
+    At a fixed sigma_multiple every interval should keep a similar share of rows
+    gradeable. Before the band was measured directly this ranged from 20% (15m)
+    to 74% (1h) on real models, which meant accuracy was not comparable between
+    timeframes and 15m could not be validated live at all.
+    """
+    from analysis.indicators import calculate_indicators
+    from config.tz import MARKET_TZ
+
+    from analysis import intraday_prediction as ip
+
+    spec = ip.INTERVAL_SPECS[interval]
+    bars = spec["bars_per_session"]
+    step = int(390 / bars)
+    rng = np.random.default_rng(7)
+    rows, px, prev = [], 100.0, 0.0
+    for day in pd.bdate_range("2026-05-01", periods=60):
+        prev = 0.0
+        for b in range(bars):
+            ts = pd.Timestamp(f"{day.date()} 09:30", tz=MARKET_TZ) + pd.Timedelta(minutes=step * b)
+            r = 0.35 * prev + rng.normal(0, 0.0012)
+            prev = r
+            px *= float(np.exp(r))
+            rows.append((ts, px * 0.9995, px * 1.0015, px * 0.9985, px, 1_000_000))
+    df = pd.DataFrame(
+        rows, columns=["ts", "Open", "High", "Low", "Close", "Volume"]
+    ).set_index("ts")
+
+    _X, y, _info = ip.build_intraday_features(
+        calculate_indicators(df), ticker="T", horizon_bars=5,
+        sigma_multiple=ip.SIGMA_MULTIPLE, interval=interval,
+    )
+    retained = float((y != 0).mean())
+    assert 0.35 <= retained <= 0.65, (
+        f"{interval} retained {retained:.0%} at sigma_multiple={ip.SIGMA_MULTIPLE}; "
+        "intervals should be within a comparable band of each other"
     )
