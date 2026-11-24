@@ -12,23 +12,33 @@ logger = logging.getLogger(__name__)
 
 def add_fill(ticker: str, strike: float, option_type: str, expiry_date: str,
              side: str, qty: int, price: float, filled_at: str, notes: str = "",
-             prediction_ref: Optional[str] = None):
+             prediction_ref: Optional[str] = None,
+             prediction_ref_source: Optional[str] = None):
     """
     `prediction_ref` (Roadmap Item 12) records which model signal motivated the
     fill, as "<horizon>|<prediction ISO timestamp>". None means discretionary —
     and that distinction is the point: it is what lets
     analysis/trade_attribution.py compare following the model against overriding
     it, using real fills rather than reconstructed outcomes.
+
+    `prediction_ref_source` is "user" when the link came from the fill form and
+    "inferred" when a backfill matched it after the fact. Only a user tag is
+    evidence that a signal motivated the trade; an inferred one says only that a
+    signal existed nearby. Defaults to "user" whenever a ref is supplied without
+    a source, since every interactive caller is a user tag.
     """
+    if prediction_ref and not prediction_ref_source:
+        prediction_ref_source = "user"
     init_db()
     with get_conn() as conn:
         cur = conn.execute(
             """INSERT INTO option_fills
                (ticker, strike, option_type, expiry_date, side, qty, price, filled_at,
-                notes, prediction_ref)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                notes, prediction_ref, prediction_ref_source)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (ticker.upper().strip(), strike, option_type.lower(), expiry_date,
-             side.lower(), qty, price, filled_at, notes.strip(), prediction_ref),
+             side.lower(), qty, price, filled_at, notes.strip(), prediction_ref,
+             prediction_ref_source),
         )
         conn.commit()
         logger.info(
@@ -61,17 +71,23 @@ def remove_fill(fill_id: int):
 
 def update_fill(fill_id: int, ticker: str, strike: float, option_type: str, expiry_date: str,
                  side: str, qty: int, price: float, filled_at: str, notes: str = "",
-                 prediction_ref: Optional[str] = None):
+                 prediction_ref: Optional[str] = None,
+                 prediction_ref_source: Optional[str] = None):
+    """Editing a fill through the UI is a user tag — see add_fill."""
+    if prediction_ref and not prediction_ref_source:
+        prediction_ref_source = "user"
     init_db()
     with get_conn() as conn:
         conn.execute(
             """UPDATE option_fills
                SET ticker = ?, strike = ?, option_type = ?, expiry_date = ?,
                    side = ?, qty = ?, price = ?, filled_at = ?, notes = ?,
-                   prediction_ref = ?
+                   prediction_ref = ?,
+                   prediction_ref_source = ?
                WHERE id = ?""",
             (ticker.upper().strip(), strike, option_type.lower(), expiry_date,
-             side.lower(), qty, price, filled_at, notes.strip(), prediction_ref, fill_id),
+             side.lower(), qty, price, filled_at, notes.strip(), prediction_ref,
+             prediction_ref_source, fill_id),
         )
         conn.commit()
         logger.info(f"Updated option fill id={fill_id} ticker={ticker.upper().strip()}")

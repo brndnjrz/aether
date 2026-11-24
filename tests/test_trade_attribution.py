@@ -101,7 +101,12 @@ def test_a_trip_with_no_matching_fill_is_discretionary_not_dropped():
 
 def test_split_of_empty_inputs_is_empty():
     out = split_by_attribution([], [])
-    assert out == {"followed": [], "discretionary": []}
+    assert out == {
+        "followed": [], "discretionary": [],
+        # How many backfilled links were set aside, so a caller can report the
+        # sample it declined to use rather than silently showing a smaller one.
+        "n_inferred_excluded": 0,
+    }
 
 
 # ── the refusals ──────────────────────────────────────────────────────────────
@@ -209,3 +214,78 @@ def test_trips_missing_pnl_do_not_crash_the_summary():
     out = compare_followed_vs_discretionary(t1 + t2, f1 + f2)
     assert out["followed"]["avg_pnl_pct"] is None
     assert out["followed"]["win_rate"] is not None      # win flags still present
+
+
+# ── inferred vs user-tagged links ────────────────────────────────────────────
+
+def _src_fill(fid, ticker, strike, otype, expiry, filled_at, ref=None, source=None):
+    return {
+        "id": fid, "ticker": ticker, "strike": strike, "option_type": otype,
+        "expiry_date": expiry, "side": "buy", "qty": 1, "price": 1.0,
+        "filled_at": filled_at, "prediction_ref": ref,
+        "prediction_ref_source": source,
+    }
+
+
+def _src_trip(ticker, strike, otype, expiry, entry_time, pnl_pct=5.0):
+    return {
+        "ticker": ticker, "strike": strike, "option_type": otype,
+        "expiry_date": expiry, "entry_time": entry_time,
+        "pnl_pct": pnl_pct, "pnl_dollars": 100.0,
+    }
+
+
+def test_inferred_links_are_excluded_by_default():
+    """
+    A backfilled link records that a same-direction signal existed near a trade,
+    not that it caused it. Counting it as "followed the model" by default would
+    make the followed-vs-discretionary comparison partly circular — the arm being
+    measured would fill with trades attributed to the very signals under test.
+    """
+    fills = [_src_fill(1, "SPY", 700, "call", "2026-08-01", "2026-07-01T10:00:00-04:00",
+                   ref="daily|2026-07-01T09:50:00-04:00", source="inferred")]
+    trips = [_src_trip("SPY", 700, "call", "2026-08-01", "2026-07-01T10:00:00-04:00")]
+
+    out = split_by_attribution(trips, fills)
+    assert out["followed"] == []
+    assert len(out["discretionary"]) == 1
+    assert out["n_inferred_excluded"] == 1
+
+
+def test_inferred_links_count_when_explicitly_requested():
+    fills = [_src_fill(1, "SPY", 700, "call", "2026-08-01", "2026-07-01T10:00:00-04:00",
+                   ref="daily|2026-07-01T09:50:00-04:00", source="inferred")]
+    trips = [_src_trip("SPY", 700, "call", "2026-08-01", "2026-07-01T10:00:00-04:00")]
+
+    out = split_by_attribution(trips, fills, include_inferred=True)
+    assert len(out["followed"]) == 1
+    assert out["discretionary"] == []
+
+
+def test_user_tagged_links_always_count():
+    fills = [_src_fill(1, "SPY", 700, "call", "2026-08-01", "2026-07-01T10:00:00-04:00",
+                   ref="daily|2026-07-01T09:50:00-04:00", source="user")]
+    trips = [_src_trip("SPY", 700, "call", "2026-08-01", "2026-07-01T10:00:00-04:00")]
+
+    assert len(split_by_attribution(trips, fills)["followed"]) == 1
+
+
+def test_a_legacy_tag_with_no_source_is_treated_as_user():
+    """prediction_ref predates prediction_ref_source, so rows written before the
+    column existed carry a ref and no source. Those came from the fill form."""
+    fills = [_src_fill(1, "SPY", 700, "call", "2026-08-01", "2026-07-01T10:00:00-04:00",
+                   ref="daily|2026-07-01T09:50:00-04:00", source=None)]
+    trips = [_src_trip("SPY", 700, "call", "2026-08-01", "2026-07-01T10:00:00-04:00")]
+
+    assert len(split_by_attribution(trips, fills)["followed"]) == 1
+
+
+def test_thin_sample_reason_names_the_links_it_set_aside():
+    fills = [_src_fill(1, "SPY", 700, "call", "2026-08-01", "2026-07-01T10:00:00-04:00",
+                   ref="daily|2026-07-01T09:50:00-04:00", source="inferred")]
+    trips = [_src_trip("SPY", 700, "call", "2026-08-01", "2026-07-01T10:00:00-04:00")]
+
+    out = compare_followed_vs_discretionary(trips, fills)
+    assert not out["reportable"]
+    assert out["n_inferred_excluded"] == 1
+    assert "backfilled" in out["reason"]

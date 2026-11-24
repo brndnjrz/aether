@@ -114,6 +114,19 @@ def init_db():
 _MIGRATIONS = [
     # Roadmap Item 12 — links a fill back to the prediction that motivated it.
     ("option_fills", "prediction_ref", "TEXT"),
+    # How that link was established: "user" when tagged at fill time through the
+    # form, "inferred" when a backfill matched it to a nearby prediction after
+    # the fact.
+    #
+    # Kept separate rather than folded into prediction_ref because the two are
+    # not the same evidence. A user tag records that a signal actually motivated
+    # the trade. An inferred tag records only that a signal existed nearby in
+    # time — the trade may have been discretionary and coincidental. Mixing them
+    # would make "did following the model make money?" partly circular, since
+    # the inference matches on the very signals whose value is being measured.
+    # analysis/trade_attribution.py can then report on user-tagged fills alone,
+    # or on both with the caveat attached.
+    ("option_fills", "prediction_ref_source", "TEXT"),
 ]
 
 

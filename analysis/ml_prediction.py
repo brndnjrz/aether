@@ -165,6 +165,15 @@ def _rf_path(ticker: str) -> Path:
     return _STORAGE_DIR / f"{ticker.upper()}_rf.pkl"
 
 
+def _meta_path(ticker: str) -> Path:
+    """
+    The meta filter (analysis/meta_labeling.py). Absent whenever the filter did
+    not clear its bar at the last training run, which is the common case and not
+    an error — predict() then passes every primary signal through unfiltered.
+    """
+    return _STORAGE_DIR / f"{ticker.upper()}_meta.pkl"
+
+
 def _predictions_path(ticker: str) -> Path:
     return _STORAGE_DIR / f"{ticker.upper()}_predictions.jsonl"
 
@@ -794,6 +803,11 @@ def _run_walk_forward_multi(
     # (y_val, {model: probs}) per fold, kept so a caller can re-score the blend
     # under different weights without refitting — see _score_ensemble_weights.
     fold_records: List[Tuple[np.ndarray, Dict[str, np.ndarray]]] = []
+    # Positional indices of each fold's validation rows, so a caller can align
+    # these out-of-sample probabilities back to X. Meta-labeling needs that:
+    # training it on in-sample primary predictions would show a primary model
+    # that rarely fails, and the failures it did show would be unrepresentative.
+    fold_val_positions: List[np.ndarray] = []
 
     for train_idx, val_idx in tscv.split(X_arr):
         if len(val_idx) < 10:
@@ -832,6 +846,7 @@ def _run_walk_forward_multi(
             ensemble_fold_aucs.append(0.5)
         total_val_samples += len(y_val)
         fold_records.append((y_val, fold_probs))
+        fold_val_positions.append(val_idx[val_dir_mask])
 
     per_model_summary = {
         name: _summarize_fold_scores(per_model_fold_accs[name], per_model_fold_aucs[name], total_val_samples)
@@ -848,6 +863,7 @@ def _run_walk_forward_multi(
         "ensemble_weights": ensemble_weights,
         "ensemble": ensemble_summary,
         "_fold_records": fold_records,
+        "_fold_val_positions": fold_val_positions,
         "_total_val_samples": total_val_samples,
         "_baseline_accuracy": _majority_class_baseline(y_dir),
     }
@@ -1236,6 +1252,75 @@ def _evaluate_on_holdout(
     return out
 
 
+def _build_meta_model(
+    ticker: str,
+    X_dir_18: pd.DataFrame,
+    y_dir: pd.Series,
+    wf_multi: Dict[str, Any],
+    ensemble_weights: Dict[str, float],
+    horizon_days: int,
+) -> Dict[str, Any]:
+    """
+    Fit and evaluate the meta filter on the primary model's own out-of-sample
+    walk-forward predictions.
+
+    Out-of-sample is not a detail here. Trained on in-sample primary predictions
+    the meta model would see a primary that is almost always right, learn almost
+    nothing, and then be handed live signals whose failure rate is far higher.
+    The fold validation rows are the only primary predictions in train_model that
+    were made on data the primary had not seen.
+
+    Returns the evaluation plus the fitted model, or a dict with model=None and a
+    reason. Never raises: a meta model is an enhancement, and failing to build one
+    must not fail the training run.
+    """
+    from analysis.meta_labeling import (
+        build_meta_features, build_meta_labels, evaluate_meta_model, fit_meta_model,
+    )
+
+    out: Dict[str, Any] = {"model": None, "evaluation": None, "reason": None}
+    positions = wf_multi.get("_fold_val_positions") or []
+    records = wf_multi.get("_fold_records") or []
+    if not positions or len(positions) != len(records):
+        out["reason"] = "No out-of-sample primary predictions available."
+        return out
+
+    try:
+        pos_all, prob_all, y_all = [], [], []
+        for (y_val, fold_probs), val_pos in zip(records, positions):
+            blended = sum(ensemble_weights[n] * fold_probs[n] for n in ensemble_weights)
+            pos_all.append(np.asarray(val_pos))
+            prob_all.append(np.asarray(blended))
+            y_all.append(np.asarray(y_val))
+
+        pos = np.concatenate(pos_all)
+        prob = np.concatenate(prob_all)
+        y_true = np.concatenate(y_all)
+
+        # Folds are chronological and disjoint, but sort anyway so the meta
+        # model's own TimeSeriesSplit sees time order.
+        order = np.argsort(pos, kind="stable")
+        pos, prob, y_true = pos[order], prob[order], y_true[order]
+
+        X_meta = build_meta_features(X_dir_18.iloc[pos], prob)
+        meta_labels = build_meta_labels(prob, y_true)
+
+        evaluation = evaluate_meta_model(X_meta, meta_labels, gap=horizon_days)
+        out["evaluation"] = evaluation
+
+        if evaluation["usable"]:
+            out["model"] = fit_meta_model(X_meta, meta_labels)
+            out["reason"] = evaluation["reason"]
+            logger.info("train_model: %s meta filter usable — %s", ticker, evaluation["reason"])
+        else:
+            out["reason"] = evaluation["reason"]
+            logger.info("train_model: %s meta filter not usable — %s", ticker, evaluation["reason"])
+    except Exception as exc:
+        logger.warning("train_model: %s meta model build failed: %s", ticker, exc)
+        out["reason"] = f"Meta model build failed: {exc}"
+    return out
+
+
 def train_model(
     ticker: str,
     df: Optional[pd.DataFrame] = None,
@@ -1480,6 +1565,16 @@ def train_model(
                 holdout["accuracy"] - wf["mean_directional_accuracy"],
             )
 
+    # ── Meta filter: a second model predicting when this one is wrong ─────────
+    # Fitted on the primary's out-of-sample fold predictions, so it learns from
+    # failures the primary actually made rather than ones it was allowed to see.
+    # Not gated on the holdout — this raises the accuracy of the calls you act on
+    # by declining the rest, which is a different question from how accurate the
+    # primary is overall.
+    meta = _build_meta_model(
+        ticker, X_dir_18, y_dir, wf_multi, ensemble_weights, horizon_days,
+    )
+
     # Prefer the honest estimate for the gate when it is usable.
     if holdout["accuracy"] is not None:
         edge = holdout["edge_over_baseline"]
@@ -1588,6 +1683,13 @@ def train_model(
         archived_version = _archive_current_version(ticker, _load_model_metadata(ticker))
         joblib.dump(xgb_final, _xgb_path(ticker))
         joblib.dump(rf_final, _rf_path(ticker))
+        if meta["model"] is not None:
+            joblib.dump(meta["model"], _meta_path(ticker))
+        elif _meta_path(ticker).exists():
+            # A previously-usable filter that no longer clears its bar must not
+            # linger — predict() would keep applying a filter this training run
+            # just judged worthless.
+            _meta_path(ticker).unlink()
         # Also persist the accuracy metrics so predict() can load them without retraining
         acc_record = {
             "ticker": ticker,
@@ -1613,6 +1715,15 @@ def train_model(
             "holdout_ci95_halfwidth": holdout.get("ci95_halfwidth"),
             "holdout_note": holdout.get("reason"),
             "uniqueness_weights": uniqueness_weights,
+            "meta_usable": bool(meta["model"] is not None),
+            # `or {}` on each hop, not .get(key, {}). evaluate_meta_model sets
+            # "best": None when no threshold was viable, and a default only
+            # applies to a missing key, never to a present-but-None one — so
+            # .get("best", {}) returned None and the next .get() raised. That
+            # path is the common one: most models have no usable filter.
+            "meta_threshold": ((meta["evaluation"] or {}).get("best") or {}).get("threshold"),
+            "meta_n_training": (meta["evaluation"] or {}).get("n") or 0,
+            "meta_reason": meta["reason"],
         }
         with open(_STORAGE_DIR / f"{ticker}_accuracy.json", "w") as f_acc:
             json.dump(acc_record, f_acc)
@@ -1644,6 +1755,9 @@ def train_model(
         "holdout_edge_over_baseline": holdout.get("edge_over_baseline"),
         "holdout_ci95_halfwidth": holdout.get("ci95_halfwidth"),
         "holdout_note": holdout.get("reason"),
+        "meta_usable": bool(meta["model"] is not None),
+        "meta_evaluation": meta["evaluation"],
+        "meta_reason": meta["reason"],
         "class_balance": balance,
         "horizon_days": horizon_days,
         "neutral_threshold_pct": round(neutral_threshold * 100, 2),
@@ -1960,6 +2074,42 @@ def predict(
         logger.debug(f"predict: indicator snapshot skipped for {ticker}: {exc}")
         indicator_snapshot = {}
 
+    # ── Meta filter ───────────────────────────────────────────────────────────
+    # A second model predicting whether *this* primary call is trustworthy, given
+    # the same market state plus what the primary said. It does not change the
+    # direction or the probability — those stay exactly as the primary produced
+    # them, so the logged prediction and the live accuracy it feeds are unchanged
+    # whether a filter exists or not. It only adds a take/skip recommendation.
+    #
+    # Passes everything through whenever no filter is deployed, which is the
+    # normal case: the filter is only saved when it demonstrably beat
+    # take-every-signal out of sample.
+    meta_verdict_out = {
+        "take": True, "meta_probability": None,
+        "reason": "No meta filter for this model — signal passed through.",
+    }
+    try:
+        from analysis.meta_labeling import build_meta_features, meta_verdict
+
+        meta_model = None
+        if _meta_path(ticker).exists():
+            meta_model = joblib.load(_meta_path(ticker))
+        if meta_model is not None:
+            X_meta_row = build_meta_features(
+                X_row[FEATURE_NAMES], np.array([ensemble_prob]),
+            )
+            meta_verdict_out = meta_verdict(
+                meta_model, X_meta_row,
+                threshold=float(metadata.get("meta_threshold") or 0.5),
+                n_training_samples=int(metadata.get("meta_n_training") or 0),
+            )
+    except Exception as exc:
+        logger.warning("predict: meta filter skipped for %s: %s", ticker, exc)
+        meta_verdict_out = {
+            "take": True, "meta_probability": None,
+            "reason": f"Meta filter unavailable ({exc}) — signal passed through.",
+        }
+
     # ── Assemble result ───────────────────────────────────────────────────────
     result.update({
         "direction": direction,
@@ -1970,6 +2120,9 @@ def predict(
         "top_features": top_features,
         "price_at_prediction": float(df["Close"].iloc[-1]),
         "indicator_snapshot": indicator_snapshot,
+        "meta_take": meta_verdict_out["take"],
+        "meta_probability": meta_verdict_out["meta_probability"],
+        "meta_reason": meta_verdict_out["reason"],
     })
 
     # ── Persist prediction ────────────────────────────────────────────────────
@@ -2078,6 +2231,9 @@ def get_prediction_history(ticker: str, resolve: bool = True) -> pd.DataFrame:
         "date", "direction", "probability", "confidence", "actual_outcome", "correct",
         "model_accuracy", "expected_move_pct", "horizon_days", "price_at_prediction",
         "indicator_snapshot",
+        # Distinguishes "excluded, will never be graded" from "still waiting".
+        # Omitted here, the slice dropped it and both rendered as "Pending".
+        "neutral_outcome", "neutral_threshold",
     ]
 
     if not path.exists():

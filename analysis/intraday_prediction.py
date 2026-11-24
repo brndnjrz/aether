@@ -24,6 +24,13 @@ issues rather than plumbing:
    threshold is a multiple of realized per-bar sigma scaled by sqrt(horizon), so
    the directional/neutral split stays sane at any bar size.
 
+   That multiple is **fixed, not searched** (SIGMA_MULTIPLE). Searching it
+   reintroduced the same failure in a subtler form: the search kept picking the
+   widest band, because a wider band retains only large obvious moves and so
+   scores higher for reasons that have nothing to do with the model. On real SPY
+   logs it had driven the 15m band above the median realized move, leaving 80% of
+   live predictions permanently ungradeable.
+
 2. **Session-boundary label masking.** A forward return computed with
    `pct_change(n).shift(-n)` across an intraday index silently spans the
    overnight gap for the last n bars of every session. That gap is not something
@@ -101,10 +108,37 @@ DEFAULT_INTERVAL = "15m"
 # Horizons in *bars*, not days. At 15m these are 45 / 75 / 150 minutes.
 HORIZON_SEARCH_GRID: List[int] = [3, 5, 10]
 
-# Neutral band as a multiple of the realized sigma of an h-bar move. 0.75 keeps
-# roughly 45-55% of rows directional at typical index volatility — enough signal
-# to train on without discarding most of the sample.
-SIGMA_MULTIPLE_GRID: List[float] = [0.5, 0.75, 1.0]
+# Neutral band as a multiple of the realized sigma of an h-bar move.
+#
+# FIXED, deliberately not searched. Searching it made every candidate a
+# different exam: a wider band keeps only the large, obvious moves, which are
+# mechanically easier to call, so raw accuracy rises for a reason that has
+# nothing to do with the model being better. The search reliably picked the
+# widest option — 1.0 for both 5m and 15m — and the comparison it won was
+# invalid, because accuracy at a 0.244% threshold is not commensurable with
+# accuracy at a 0.106% one.
+#
+# Three things that cost, all of them measured on real SPY logs:
+#   - Accuracy stopped being comparable across retrains, intervals, and time.
+#     A change in the number could mean a change in the grading scale.
+#   - Retention collapsed at short intervals: 32% of realized 5m moves and only
+#     20% of 15m moves cleared their band, so four of five 15m predictions could
+#     never be graded at all and live accuracy was unmeasurable no matter how
+#     long you waited.
+#   - It was a third argmax stage feeding the selection bias the holdout exists
+#     to expose.
+#
+# 0.75 is the value this module was designed around before the search was added
+# — see the docstring above on why a fixed percentage band is wrong for intraday
+# bars. Measured retention at 0.75: 49% (5m), 40% (15m), 52% (30m), 74% (1h).
+# Because the band scales as sigma * sqrt(horizon_bars), holding the multiple
+# fixed also keeps retention roughly constant as HORIZON_SEARCH_GRID varies, so
+# the surviving search stage compares like with like too.
+#
+# 1h sits high at 74%, which points at its trailing sigma running low — only 7
+# bars per session makes for a thin vol_window. That is a separate issue from
+# this one and is not a reason to reintroduce the search.
+SIGMA_MULTIPLE: float = 0.75
 
 MIN_ROWS_REQUIRED: int = 200
 MIN_DIRECTIONAL_SAMPLES: int = 150
@@ -415,12 +449,50 @@ def build_intraday_labels(
     sessions = _session_ids(df.index)
 
     intra_session_ret = close.pct_change().where(sessions.shift(1) == sessions)
+
+    # Volatility of an h-bar move, measured directly rather than extrapolated
+    # from the 1-bar figure by sqrt(h).
+    #
+    # sqrt(h) scaling assumes successive bar returns are independent. Intraday
+    # they are not — they mean-revert at short horizons and trend at longer ones
+    # — so the extrapolation drifts, and it drifts differently per interval.
+    # Measured against realized SPY moves, where median|move| should be ~0.6745
+    # sigma for a normal:
+    #
+    #     5m   ratio 0.58  (-13%)  band too wide
+    #     15m  ratio 0.73  ( +9%)
+    #     30m  ratio 0.72  ( +7%)
+    #     1h   ratio 0.89  (+32%)  band far too narrow
+    #
+    # The 1h error is the worst because it compounds fastest: 7 bars per session
+    # means a 5-bar horizon spans most of a session, where trending dominates and
+    # independence is least true. That is what left 1h at 74% retention while the
+    # other intervals sat near 50% at the same sigma_multiple.
+    #
+    # The h-bar return of the *same* series is the quantity the label actually
+    # thresholds, so measure it. min_periods scales with the horizon because each
+    # observation now consumes h bars.
+    horizon_ret = close.pct_change(horizon_bars)
+    # Only windows lying wholly inside one session — an h-bar return spanning the
+    # overnight gap is dominated by it and would inflate the estimate, the same
+    # reason intra_session_ret masks the first return of each session.
+    horizon_ret = horizon_ret.where(sessions.shift(horizon_bars) == sessions)
+
+    min_obs = max(30, horizon_bars * 5)
+    horizon_sigma_t = horizon_ret.rolling(vol_window, min_periods=min_obs).std()
+    horizon_sigma_t = horizon_sigma_t.fillna(
+        horizon_ret.expanding(min_periods=min_obs).std()
+    )
+
+    # Fall back to the sqrt extrapolation only where the direct estimate has too
+    # little history to exist — early bars of a short series.
     sigma_t = intra_session_ret.rolling(vol_window, min_periods=30).std()
     sigma_t = sigma_t.fillna(intra_session_ret.expanding(min_periods=30).std())
-    if not np.isfinite(sigma_t.dropna()).any() or (sigma_t.dropna() <= 0).all():
+    horizon_sigma_t = horizon_sigma_t.fillna(sigma_t * np.sqrt(horizon_bars))
+
+    if not np.isfinite(horizon_sigma_t.dropna()).any() or (horizon_sigma_t.dropna() <= 0).all():
         raise ValueError("Cannot estimate bar volatility — price series is flat or too short")
 
-    horizon_sigma_t = sigma_t * np.sqrt(horizon_bars)
     threshold_t = sigma_multiple * horizon_sigma_t
 
     # Session mask: keep only bars whose forward window stays in-session.
@@ -680,10 +752,22 @@ def select_intraday_label_scheme(
     interval: str,
 ) -> Dict[str, Any]:
     """
-    Search (horizon_bars, sigma_multiple) for the combination this ticker's
-    ensemble validates best on, using a reduced-fold walk-forward.
+    Search `horizon_bars` for the value this ticker's ensemble validates best on,
+    using a reduced-fold walk-forward.
 
-    Falls back to (5 bars, 0.75 sigma) if nothing clears _MIN_SEARCH_ACCURACY.
+    Only the horizon is searched. sigma_multiple is pinned at SIGMA_MULTIPLE
+    because varying it changes what "correct" means, and accuracy measured under
+    two different neutral bands is not comparable -- a wider band retains only
+    the large, obvious moves and scores higher for reasons unrelated to model
+    quality. See the SIGMA_MULTIPLE comment for the measurements.
+
+    The horizon is still searched because a 45-minute and a 150-minute forecast
+    are genuinely different products and it is worth knowing which this ticker
+    supports. That comparison stays fair because the band scales as
+    sigma * sqrt(horizon_bars), so retention holds roughly constant across the
+    grid rather than drifting with it.
+
+    Falls back to 5 bars if nothing clears _MIN_SEARCH_ACCURACY.
     """
     candidates: List[Dict[str, Any]] = []
     best: Optional[Dict[str, Any]] = None
@@ -694,53 +778,55 @@ def select_intraday_label_scheme(
     # is what keeps them comparable to inference (_normalized_feature_frame).
     normed_full = _normalized_feature_frame(df, norm_window)
 
+    # One loop, not two. sigma_multiple is fixed at SIGMA_MULTIPLE so every
+    # candidate is graded on the same exam and their accuracies are comparable.
     for horizon_bars in HORIZON_SEARCH_GRID:
-        for sigma_multiple in SIGMA_MULTIPLE_GRID:
-            try:
-                X, y, info = build_intraday_features(
-                    df, ticker=ticker, horizon_bars=horizon_bars,
-                    sigma_multiple=sigma_multiple, interval=interval,
-                )
-            except ValueError as exc:
-                logger.debug(
-                    "select_intraday_label_scheme: %s skipped h=%d m=%.2f: %s",
-                    ticker, horizon_bars, sigma_multiple, exc,
-                )
-                continue
-
-            X_dir, y_dir = _filter_directional(X, y)
-            if len(X_dir) < MIN_DIRECTIONAL_SAMPLES:
-                continue
-
-            X_norm, y_dir = _align_to_normalized(normed_full, X_dir, y_dir)
-            if len(X_norm) < MIN_DIRECTIONAL_SAMPLES:
-                continue
-            balance = class_balance_check(y_dir)
-            xgb_cfg = _xgb_config(scale_pos_weight=balance["recommended_scale_pos_weight"])
-            rf_cfg = _rf_config(n_features=len(INTRADAY_FEATURE_NAMES))
-            wf = _run_walk_forward(
-                X_norm, y_dir, xgb_cfg, rf_cfg,
-                n_splits=_SEARCH_N_SPLITS, gap=horizon_bars,
+        sigma_multiple = SIGMA_MULTIPLE
+        try:
+            X, y, info = build_intraday_features(
+                df, ticker=ticker, horizon_bars=horizon_bars,
+                sigma_multiple=sigma_multiple, interval=interval,
             )
-            if wf["n_folds"] == 0:
-                continue
+        except ValueError as exc:
+            logger.debug(
+                "select_intraday_label_scheme: %s skipped h=%d m=%.2f: %s",
+                ticker, horizon_bars, sigma_multiple, exc,
+            )
+            continue
 
-            entry = {
-                "horizon_bars": horizon_bars,
-                "sigma_multiple": sigma_multiple,
-                "threshold_pct": info["threshold_pct"],
-                "mean_accuracy": wf["mean_directional_accuracy"],
-                "std_accuracy": wf["std_directional_accuracy"],
-                "n_folds": wf["n_folds"],
-                "n_directional": len(X_norm),
-                "neutral_pct": balance["neutral_pct"],
-                "_X": X_norm,
-                "_y": y_dir,
-                "_info": info,
-            }
-            candidates.append(entry)
-            if best is None or entry["mean_accuracy"] > best["mean_accuracy"]:
-                best = entry
+        X_dir, y_dir = _filter_directional(X, y)
+        if len(X_dir) < MIN_DIRECTIONAL_SAMPLES:
+            continue
+
+        X_norm, y_dir = _align_to_normalized(normed_full, X_dir, y_dir)
+        if len(X_norm) < MIN_DIRECTIONAL_SAMPLES:
+            continue
+        balance = class_balance_check(y_dir)
+        xgb_cfg = _xgb_config(scale_pos_weight=balance["recommended_scale_pos_weight"])
+        rf_cfg = _rf_config(n_features=len(INTRADAY_FEATURE_NAMES))
+        wf = _run_walk_forward(
+            X_norm, y_dir, xgb_cfg, rf_cfg,
+            n_splits=_SEARCH_N_SPLITS, gap=horizon_bars,
+        )
+        if wf["n_folds"] == 0:
+            continue
+
+        entry = {
+            "horizon_bars": horizon_bars,
+            "sigma_multiple": sigma_multiple,
+            "threshold_pct": info["threshold_pct"],
+            "mean_accuracy": wf["mean_directional_accuracy"],
+            "std_accuracy": wf["std_directional_accuracy"],
+            "n_folds": wf["n_folds"],
+            "n_directional": len(X_norm),
+            "neutral_pct": balance["neutral_pct"],
+            "_X": X_norm,
+            "_y": y_dir,
+            "_info": info,
+        }
+        candidates.append(entry)
+        if best is None or entry["mean_accuracy"] > best["mean_accuracy"]:
+            best = entry
 
     if best is None or best["mean_accuracy"] < _MIN_SEARCH_ACCURACY:
         logger.warning(
@@ -748,7 +834,8 @@ def select_intraday_label_scheme(
             ticker, _MIN_SEARCH_ACCURACY,
         )
         X, y, info = build_intraday_features(
-            df, ticker=ticker, horizon_bars=5, sigma_multiple=0.75, interval=interval,
+            df, ticker=ticker, horizon_bars=5, sigma_multiple=SIGMA_MULTIPLE,
+            interval=interval,
         )
         X_dir, y_dir = _filter_directional(X, y)
         X_dir, y_dir = _align_to_normalized(normed_full, X_dir, y_dir)
@@ -1185,7 +1272,13 @@ _HISTORY_COLS = ["date", "direction", "probability", "confidence",
                  "bar_timestamp", "horizon_bars",
                  # Stored shares-model cost verdict. Kept so the consensus view can
                  # fall back to it when no live options chain is available.
-                 "tradeability"]
+                 "tradeability",
+                 # Set when the realized move landed inside the model's neutral
+                 # band, so the row is excluded from accuracy rather than still
+                 # waiting. Without it in this list the slice dropped the flag and
+                 # every excluded row rendered as "Pending" forever.
+                 "neutral_outcome",
+                 "threshold_pct"]
 
 
 def save_intraday_prediction(ticker: str, interval: str, prediction: Dict[str, Any]) -> None:

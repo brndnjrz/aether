@@ -418,7 +418,10 @@ def _recent_prediction_refs(ticker: str, limit: int = 12) -> list:
 
     try:
         from analysis.ml_prediction import get_prediction_history
-        hist = get_prediction_history(ticker)
+        # resolve=False for the same reason the intraday branch above passes it:
+        # this only reads the log to populate a dropdown, and resolving fetches
+        # price history and rewrites the file.
+        hist = get_prediction_history(ticker, resolve=False)
         for _, row in hist.head(4).iterrows():
             when = row.get("date")
             if pd.isna(when):

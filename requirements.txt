@@ -16,3 +16,4 @@ arch>=8.0.0,<9.0.0
 feedparser>=6.0.12,<7.0.0
 vaderSentiment>=3.3.2,<4.0.0
 tzdata>=2024.1
+pytest>=8.0.0

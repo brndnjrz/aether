@@ -79,6 +79,7 @@ def _summarize(trips: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def split_by_attribution(
     round_trips: List[Dict[str, Any]], fills: List[Dict[str, Any]],
+    *, include_inferred: bool = False,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
     Split round trips into "followed" (entry fill carried a prediction_ref) and
@@ -88,10 +89,33 @@ def split_by_attribution(
     the decision to open it was, regardless of how it was closed. Matching is by
     (ticker, contract_key, entry_time) against the fills ledger, because
     round_trips.py does not carry fill ids through.
+
+    `include_inferred` defaults False, so only fills tagged through the UI
+    (prediction_ref_source='user', or a legacy tag with no source recorded)
+    count as followed. Links written by scripts/backfill_fill_links.py are
+    stamped 'inferred' and excluded.
+
+    That default matters. An inferred link says a same-direction signal existed
+    shortly before a trade, not that it caused the trade — and this function
+    exists to answer whether following the model pays. Counting inferred links by
+    default would make that partly circular: trades near signals get attributed
+    to signals, so the followed arm fills with trades the model may have had no
+    part in. Pass include_inferred=True deliberately, to form a hypothesis, and
+    check it against user-tagged fills once enough accumulate.
+
+    The returned counts carry `n_inferred_excluded` so a caller can say how much
+    evidence was set aside rather than silently reporting a smaller sample.
     """
     refs = {}
+    n_inferred_excluded = 0
     for f in fills or []:
         if not f.get("prediction_ref"):
+            continue
+        # No recorded source means a legacy tag from before the column existed;
+        # those came from the form, so treat them as user tags.
+        source = (f.get("prediction_ref_source") or "user").lower()
+        if source == "inferred" and not include_inferred:
+            n_inferred_excluded += 1
             continue
         key = (
             (f.get("ticker") or "").upper(),
@@ -117,11 +141,16 @@ def split_by_attribution(
             followed.append(enriched)
         else:
             discretionary.append(t)
-    return {"followed": followed, "discretionary": discretionary}
+    return {
+        "followed": followed,
+        "discretionary": discretionary,
+        "n_inferred_excluded": n_inferred_excluded,
+    }
 
 
 def compare_followed_vs_discretionary(
     round_trips: List[Dict[str, Any]], fills: List[Dict[str, Any]],
+    *, include_inferred: bool = False,
 ) -> Dict[str, Any]:
     """
     Compare model-driven round trips against discretionary ones.
@@ -141,7 +170,7 @@ def compare_followed_vs_discretionary(
     minimums. Callers must not render a comparison in that case; showing one would
     dress noise as a finding, which is exactly what this gate exists to prevent.
     """
-    split = split_by_attribution(round_trips, fills)
+    split = split_by_attribution(round_trips, fills, include_inferred=include_inferred)
     followed, discretionary = split["followed"], split["discretionary"]
     n_total = len(followed) + len(discretionary)
 
@@ -152,6 +181,8 @@ def compare_followed_vs_discretionary(
         "discretionary": _summarize(discretionary),
         "by_horizon": {},
         "reason": None,
+        "include_inferred": include_inferred,
+        "n_inferred_excluded": split.get("n_inferred_excluded", 0),
     }
 
     if n_total < MIN_ROUND_TRIPS_FOR_COMPARISON:
@@ -160,6 +191,11 @@ def compare_followed_vs_discretionary(
             f"{MIN_ROUND_TRIPS_FOR_COMPARISON} before this comparison means anything. "
             f"Keep tagging fills; the answer improves with the sample."
         )
+        if out["n_inferred_excluded"]:
+            out["reason"] += (
+                f" ({out['n_inferred_excluded']} backfilled link(s) set aside — they "
+                "record that a signal existed near a trade, not that it caused it.)"
+            )
         return out
     if out["followed"]["n"] < MIN_PER_ARM or out["discretionary"]["n"] < MIN_PER_ARM:
         out["reason"] = (

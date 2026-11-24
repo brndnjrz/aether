@@ -304,6 +304,13 @@ def test_prediction_history_empty_before_any_predictions(isolated_storage):
         "date", "direction", "probability", "confidence", "actual_outcome", "correct",
         "model_accuracy", "expected_move_pct", "horizon_days", "price_at_prediction",
         "indicator_snapshot",
+        # neutral_outcome distinguishes "resolved, but the move landed inside the
+        # model's neutral band so it is excluded from accuracy" from "still
+        # waiting". Both leave correct=None, and while this column was absent the
+        # slice dropped the flag and the UI rendered every excluded row as
+        # "Pending" — implying results were still coming for rows that will never
+        # be graded. neutral_threshold carries the band it was judged against.
+        "neutral_outcome", "neutral_threshold",
     ]
 
 
